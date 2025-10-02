@@ -6,12 +6,12 @@ module Agda.TypeChecking.With where
 
 import Prelude hiding ((!!))
 
-import Control.Monad
 import Control.Monad.Writer (WriterT, runWriterT, tell)
 
 import qualified Data.List as List
 import Data.Maybe
 import Data.Foldable ( foldrM )
+import Data.Semigroup ( sconcat )
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal as I
@@ -22,33 +22,33 @@ import Agda.Syntax.Abstract.Views
 import Agda.Syntax.Info
 import Agda.Syntax.Position
 
-import Agda.TypeChecking.Monad
-import Agda.TypeChecking.Reduce
+import Agda.TypeChecking.Abstract
 import Agda.TypeChecking.Datatypes
 import Agda.TypeChecking.EtaContract
 import Agda.TypeChecking.Free
+import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Patterns.Abstract
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Primitive ( getRefl )
 import Agda.TypeChecking.Records
+import Agda.TypeChecking.Reduce
+import Agda.TypeChecking.Rules.LHS.Implicit
+import Agda.TypeChecking.Rules.LHS.Problem (ProblemEq(..))
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope
 import Agda.TypeChecking.Telescope.Path
-
-import Agda.TypeChecking.Abstract
-import Agda.TypeChecking.Rules.LHS.Implicit
-import Agda.TypeChecking.Rules.LHS.Problem (ProblemEq(..))
+import Agda.TypeChecking.Warnings ( warning )
 
 import Agda.Utils.Functor
 import Agda.Utils.List
-import Agda.Utils.List1 (List1)
+import Agda.Utils.List1 ( List1, pattern (:|) )
 import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Null (empty)
 import Agda.Utils.Permutation
 import Agda.Syntax.Common.Pretty (prettyShow)
-import qualified Agda.Syntax.Common.Pretty as P
+import Agda.Utils.Singleton
 import Agda.Utils.Size
 
 import Agda.Utils.Impossible
@@ -79,13 +79,13 @@ splitTelForWith
   -- Input:
   :: Telescope                         -- ^ __@Δ@__             context of types and with-arguments.
   -> Type                              -- ^ __@Δ ⊢ t@__         type of rhs.
-  -> [Arg (Term, EqualityView)]        -- ^ __@Δ ⊢ vs : as@__   with arguments and their types.
+  -> List1 (Arg (Term, EqualityView))  -- ^ __@Δ ⊢ vs : as@__   with arguments and their types.
   -- Output:
   -> ( Telescope                         -- @Δ₁@             part of context needed for with arguments and their types.
      , Telescope                         -- @Δ₂@             part of context not needed for with arguments and their types.
      , Permutation                       -- @π@              permutation from Δ to Δ₁Δ₂ as returned by 'splitTelescope'.
      , Type                              -- @Δ₁Δ₂ ⊢ t'@      type of rhs under @π@
-     , [Arg (Term, EqualityView)]        -- @Δ₁ ⊢ vs' : as'@ with- and rewrite-arguments and types under @π@.
+     , List1 (Arg (Term, EqualityView))  -- @Δ₁ ⊢ vs' : as'@ with- and rewrite-arguments and types under @π@.
      )              -- ^ (__@Δ₁@__,__@Δ₂@__,__@π@__,__@t'@__,__@vtys'@__) where
 --
 --   [@Δ₁@]        part of context needed for with arguments and their types.
@@ -124,17 +124,17 @@ splitTelForWith delta t vtys = let
 -- Each @EqualityType@, coming from a @rewrite@, will turn into 2 abstractions.
 
 withFunctionType
-  :: Telescope                          -- ^ @Δ₁@                        context for types of with types.
-  -> [Arg (Term, EqualityView)]         -- ^ @Δ₁,Δ₂ ⊢ vs : raise Δ₂ as@  with and rewrite-expressions and their type.
+  :: Telescope                          -- ^ @Δ₁@                        context for types of with-expressions.
+  -> List1 (Arg (Term, EqualityView))   -- ^ @Δ₁,Δ₂ ⊢ vs : raise Δ₂ as@  with and rewrite-expressions and their type.
   -> Telescope                          -- ^ @Δ₁ ⊢ Δ₂@                   context extension to type with-expressions.
   -> Type                               -- ^ @Δ₁,Δ₂ ⊢ b@                 type of rhs.
-  -> [(Int,(Term,Term))]                -- ^ @Δ₁,Δ₂ ⊢ [(i,(u0,u1))] : b  boundary.
-  -> TCM (Type, Nat)
+  -> Boundary                           -- ^ @Δ₁,Δ₂ ⊢ [(i,(u0,u1))] : b@ boundary of rhs.
+  -> TCM (Type, (Nat1, Nat))
     -- ^ @Δ₁ → wtel → Δ₂′ → b′@ such that
     --     @[vs/wtel]wtel = as@ and
     --     @[vs/wtel]Δ₂′ = Δ₂@ and
     --     @[vs/wtel]b′ = b@.
-    -- Plus the final number of with-arguments.
+    -- Plus the final number of with-arguments and the number of visible ones.
 withFunctionType delta1 vtys delta2 b bndry = addContext delta1 $ do
 
   reportSLn "tc.with.abstract" 20 $ "preparing for with-abstraction"
@@ -152,44 +152,66 @@ withFunctionType delta1 vtys delta2 b bndry = addContext delta1 $ do
 
   vtys <- etaContract =<< normalise vtys
 
-  -- wd2db = wtel → [vs : as] (Δ₂ → B)
+  -- wd2b = wtel → [vs : as] (Δ₂ → B)
   wd2b <- foldrM piAbstract d2b vtys
   dbg 30 "wΓ → Δ₂ → B" wd2b
 
-  let nwithargs = countWithArgs (map (snd . unArg) vtys)
+  let nwithargs = countWithArgs $ fmap (snd . unArg) vtys
+  let nwithpats = countWithPats vtys
 
   TelV wtel _ <- telViewUpTo nwithargs wd2b
 
   -- select the boundary for "Δ₁" abstracting over "wΓ.Δ₂"
-  let bndry' = [(i - sd2,(lams u0, lams u1)) | (i,(u0,u1)) <- bndry, i >= sd2]
+  let bndry' = Boundary [(i - sd2,(lams u0, lams u1)) | (i,(u0,u1)) <- theBoundary bndry, i >= sd2]
         where sd2 = size delta2
-              lams u = teleNoAbs wtel (abstract delta2 u)
+              lams = teleNoAbs wtel . abstract delta2
 
   d1wd2b <- telePiPath_ delta1 wd2b bndry'
 
   dbg 30 "Δ₁ → wΓ → Δ₂ → B" d1wd2b
 
-  return (d1wd2b, nwithargs)
+  return (d1wd2b, (nwithargs, nwithpats))
 
-countWithArgs :: [EqualityView] -> Nat
-countWithArgs = sum . map countArgs
+-- | Count the number of arguments introduced into the type of the with-function.
+countWithArgs :: (Functor f, Foldable f) => f EqualityView -> Nat1
+countWithArgs = sum . fmap countArgs
   where
     countArgs OtherType{}    = 1
     countArgs IdiomType{}    = 2
     countArgs EqualityType{} = 2
 
+-- | Count the number of with-patterns in the with-clause
+--   that need to be transformed to regular patterns
+--   in the **current round** of with-abstraction
+--   (important for nested with).
+countWithPats :: (Functor f, Foldable f) => f (Arg (Term, EqualityView)) -> Nat1
+countWithPats = sum . fmap \case
+    -- Andreas, 2025-04-08, see issue #7788.
+    Arg ai (_, OtherType   {}) -> if visible ai then 1 else 0
+      -- A hidden @with@ (issue #500) does not have a with-pattern in the abstract syntax.
+    Arg ai (_, IdiomType   {}) -> if visible ai then 2 else 1
+      -- The hidden version of the inspect idiom has just one with-pattern in the abstract syntax.
+    Arg ai (_, EqualityType{}) -> if visible ai then 2 else __IMPOSSIBLE__
+      -- The desugaring of @rewrite@ produces two new with-patterns in the abstract syntax.
+      -- They are always @NotHidden@.
+
+
 -- | From a list of @with@ and @rewrite@ expressions and their types,
 --   compute the list of final @with@ expressions (after expanding the @rewrite@s).
-withArguments :: [Arg (Term, EqualityView)] ->
-                 TCM [Arg Term]
+withArguments :: List1 (Arg (Term, EqualityView)) ->
+                 TCM (List1 (Arg Term))
 withArguments vtys = do
-  tss <- forM vtys $ \ (Arg info ts) -> fmap (map (Arg info)) $ case ts of
-    (v, OtherType a) -> pure [v]
-    (prf, eqt@(EqualityType s _eq _pars _t v _v')) -> pure [unArg v, prf]
-    (v, IdiomType t) -> do
-       mkRefl <- getRefl
-       pure [v, mkRefl (defaultArg v)]
-  pure (concat tss)
+  sconcat <$> do
+    forM vtys $ \ (Arg info ts) -> do
+      fmap (Arg info) <$> do
+        case ts of
+          (v, OtherType a) -> do
+            return $ singleton v
+          (prf, eqt@(EqualityType _r _s _eq _pars _t v _v')) -> do
+            return $ unArg v :| prf : []
+          (v, IdiomType t) -> do
+            mkRefl <- getRefl
+            return $ v :| mkRefl (defaultArg v) : []
 
 -- | Compute the clauses for the with-function given the original patterns.
 buildWithFunction
@@ -209,13 +231,30 @@ buildWithFunction
 buildWithFunction cxtNames f aux t delta qs npars withSub perm n1 n cs = mapM buildWithClause cs
   where
     -- Nested with-functions will iterate this function once for each parent clause.
-    buildWithClause (A.Clause (A.SpineLHS i _ allPs) inheritedPats rhs wh catchall) = do
+    buildWithClause (A.Clause lhs@(A.SpineLHS i _ allPs) inheritedPats rhs wh catchall) = do
       let (ps, wps)    = splitOffTrailingWithPatterns allPs
           (wps0, wps1) = splitAt n wps
           ps0          = map (updateNamedArg fromWithP) wps0
             where
             fromWithP (A.WithP _ p) = p
             fromWithP _ = __IMPOSSIBLE__
+
+      reportSDoc "tc.with.split" 40 $ vcat
+        [ "buildWithClause"
+        , nest 2 $ "n    =" <+> prettyTCM n
+        , nest 2 $ "wps  =" <+> prettyA wps
+        , nest 2 $ "wps0 =" <+> prettyA wps0
+        , nest 2 $ "wps1 =" <+> prettyA wps1
+        ]
+
+      -- Andreas, 2025-04-07, issue #7759
+      -- Usually the following is impossible because the with-clause collection
+      -- already looks for the correct number of with-patterns.
+      -- However, if the lhs is just an ellipsis, we can slip through the cracks.
+      -- Thus, we install another check here to enforce the correct number of with-patterns.
+      when (length wps0 < n) $
+        setCurrentRange lhs $ typeError TooFewPatternsInWithClause
+
       reportSDoc "tc.with" 50 $ "inheritedPats:" <+> vcat
         [ prettyA p <+> "=" <+> prettyTCM v <+> ":" <+> prettyTCM a
         | A.ProblemEq p v a <- inheritedPats
@@ -344,13 +383,14 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
     , nest 2 $ "ps  = " <+> fsep (punctuate comma $ map prettyA ps)
     , nest 2 $ "ps' = " <+> fsep (punctuate comma $ map prettyA ps')
     , nest 2 $ "psi = " <+> fsep (punctuate comma $ map prettyA psi)
-    , nest 2 $ "qs  = " <+> fsep (punctuate comma $ map (prettyTCM . namedArg) qs)
+    , nest 2 $ addContext delta $
+               "qs  = " <+> fsep (punctuate comma $ map (prettyTCM . namedArg) qs)
     , nest 2 $ "perm= " <+> text (show perm)
     ]
 
   -- Andreas, 2015-11-09 Issue 1710: self starts with parent-function, not with-function!
   (ps', strippedPats) <- runWriterT $ strip (Def parent []) t psi qs
-  reportSDoc "tc.with.strip" 50 $ nest 2 $
+  unless (null strippedPats) $ reportSDoc "tc.with.strip" 50 $ nest 2 $
     "strippedPats:" <+> vcat [ prettyA p <+> "=" <+> prettyTCM v <+> ":" <+> prettyTCM a | A.ProblemEq p v a <- strippedPats ]
   let psp = permute perm ps'
   reportSDoc "tc.with.strip" 10 $ vcat
@@ -391,8 +431,7 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
       -- As the type t develops, we need to insert more implicit patterns,
       -- due to copatterns / flexible arity.
       ps <- liftTCM $ insertImplicitPatternsT ExpandLast [] t
-      if null ps then
-        typeError $ GenericError $ "Too few arguments given in with-clause"
+      if null ps then typeError TooFewPatternsInWithClause
        else strip self t ps qs
 
     -- Case: out of parent-clause patterns.
@@ -402,8 +441,7 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
       let implicit (A.WildP{})     = True
           implicit (A.ConP ci _ _) = conPatOrigin ci == ConOSystem
           implicit _               = False
-      unless (all (implicit . namedArg) ps) $
-        typeError $ GenericError $ "Too many arguments given in with-clause"
+      unless (all (implicit . namedArg) ps) $ typeError TooManyPatternsInWithClause
       return []
 
     -- Case: both parent-clause pattern and with-clause pattern present.
@@ -415,7 +453,7 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
         tell [ProblemEq (A.VarP x) v a]
         strip self t (fmap (p <$) p0 : ps) qs
     strip self t ps0@(p0 : ps) qs0@(q : qs) = do
-      p <- liftTCM $ (traverse . traverse) expandLitPattern p0
+      p <- (traverse . traverse) expandLitPattern p0
       reportSDoc "tc.with.strip" 15 $ vcat
         [ "strip"
         , nest 2 $ "ps0 =" <+> fsep (punctuate comma $ map prettyA ps0)
@@ -428,12 +466,15 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
         ProjP o d -> case A.isProjP p of
           Just (o', AmbQ ds) -> do
             -- We assume here that neither @o@ nor @o'@ can be @ProjSystem@.
-            if o /= o' then liftTCM $ mismatchOrigin o o' else do
+            when (o /= o') $ setCurrentRange p0 $ addContext delta do
+              reportSLn "tc.with.strip" 90 $ "p0 = " ++ show p0
+              reportSLn "tc.with.strip" 80 $ "getRange p0 = " ++ prettyShow (getRange p0)
+              warning $ WithClauseProjectionFixityMismatch p0 o' q o
             -- Andreas, 2016-12-28, issue #2360:
             -- We disambiguate the projection in the with clause
             -- to the projection in the parent clause.
             d  <- liftTCM $ getOriginalProjection d
-            found <- anyM ds $ \ d' -> liftTCM $ (Just d ==) . fmap projOrig <$> isProjection d'
+            found <- existsM ds $ \ d' -> liftTCM $ (Just d ==) . fmap projOrig <$> isProjection d'
             if not found then mismatch else do
               (self1, t1, ps) <- liftTCM $ do
                 t <- reduce t
@@ -458,7 +499,7 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
         IApplyP _ _ _ x  ->
           (setVarArgInfo x p :) <$> recurse (var (dbPatVarIndex x))
 
-        DefP{}  -> typeError $ GenericError $ "with clauses not supported in the presence of hcomp patterns" -- TODO this should actually be impossible
+        DefP{}  -> __IMPOSSIBLE__
 
         DotP i v  -> do
           (a, _) <- mustBePi t
@@ -524,9 +565,9 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
             -- Strip the subpatterns ps' and then continue.
             stripConP d us b c ConOCon qs' ps'
 
-          A.RecP _ fs -> caseMaybeM (liftTCM $ isRecord d) mismatch $ \ def -> do
-            ps' <- liftTCM $ insertMissingFieldsFail d (const $ A.WildP empty) fs
-                                                 (map argFromDom $ recordFieldNames def)
+          A.RecP _ _ fs -> caseMaybeM (liftTCM $ isRecord d) mismatch $ \ def -> do
+            ps' <- liftTCM $ insertMissingFieldsFail ConORec d (const $ A.WildP empty) fs
+              (map argFromDom $ recordFieldNames def)
             stripConP d us b c ConORec qs' ps'
 
           p@(A.PatternSynP pi' c' ps') -> do
@@ -551,12 +592,8 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
           _ -> mismatch
       where
         recurse v = do
-          -- caseMaybeM (liftTCM $ isPath t) (return ()) $ \ _ ->
-          --   typeError $ GenericError $
-          --     "With-clauses currently not supported under Path abstraction."
-
           let piOrPathApplyM t v = do
-                (TelV tel t', bs) <- telViewUpToPathBoundaryP 1 t
+                (TelV tel t', bs) <- telViewUpToPathBoundary' 1 t
                 unless (size tel == 1) $ __IMPOSSIBLE__
                 return (teleElims tel bs, subst 0 v t')
           (e, t') <- piOrPathApplyM t v
@@ -565,17 +602,6 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
         mismatch :: forall m a. (MonadAddContext m, MonadTCError m) => m a
         mismatch = addContext delta $ typeError $
           WithClausePatternMismatch (namedArg p0) q
-        mismatchOrigin o o' = addContext delta . typeError . GenericDocError =<< fsep
-          [ "With clause pattern"
-          , prettyA p0
-          , "is not an instance of its parent pattern"
-          , P.fsep <$> prettyTCMPatterns [q]
-          , text $ "since the parent pattern is " ++ prettyProjOrigin o ++
-                   " and the with clause pattern is " ++ prettyProjOrigin o'
-          ]
-        prettyProjOrigin ProjPrefix  = "a prefix projection"
-        prettyProjOrigin ProjPostfix = "a postfix projection"
-        prettyProjOrigin ProjSystem  = __IMPOSSIBLE__
 
         -- Make a WildP, keeping arg. info.
         makeWildP :: NamedArg A.Pattern -> NamedArg A.Pattern
@@ -598,7 +624,7 @@ stripWithClausePatterns cxtNames parent f t delta qs npars perm ps = do
           -- Compute the argument telescope for the constructor
           let ct' = ct `piApply` take np us
           TelV tel' _ <- liftTCM $ telViewPath ct'
-          -- (TelV tel' _, _boundary) <- liftTCM $ telViewPathBoundaryP ct'
+          -- (TelV tel' _, _boundary) <- liftTCM $ telViewPathBoundary ct'
 
           reportSDoc "tc.with.strip" 20 $
             vcat [ "ct  = " <+> prettyTCM ct
@@ -686,8 +712,9 @@ withDisplayForm f aux delta1 delta2 n qs perm@(Perm m _) lhsPerm = do
       tqs        = applySubst rho tqs0
       -- Build the arguments to the with function.
       es         = map (Apply . fmap DTerm) topArgs ++ tqs
-      withArgs   = map var $ take n $ downFrom $ size delta2 + n
-      dt         = DWithApp (DDef f es) (map DTerm withArgs) []
+      withArgs   = List1.fromListSafe __IMPOSSIBLE__ $  -- List is non-empty since n >= 1
+                     map var $ take n $ downFrom $ size delta2 + n
+      dt         = DWithApp (DDef f es) (fmap DTerm withArgs) []
 
   -- Build the lhs of the display form and finish.
   -- @var 0@ is the pattern variable (hole).
@@ -745,6 +772,7 @@ patsToElims = map $ toElim . fmap namedThing
     toTerm p = case patOrigin $ fromMaybe __IMPOSSIBLE__ $ patternInfo p of
       PatOSystem -> toDisplayPattern p
       PatOSplit  -> toDisplayPattern p
+      PatOSplitArg{} -> toVarOrDot p
       PatOVar{}  -> toVarOrDot p
       PatODot    -> DDot $ patternToTerm p
       PatOWild   -> toVarOrDot p

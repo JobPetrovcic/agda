@@ -7,7 +7,7 @@ module Agda.Syntax.Abstract.Name
   , FreshNameMode(..)
   ) where
 
-import Prelude hiding (length)
+import Prelude hiding (length, null)
 
 import Control.DeepSeq
 
@@ -20,6 +20,7 @@ import Data.Void
 
 import Agda.Syntax.Position
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty
 import Agda.Syntax.Concrete.Name (IsNoName(..), NumHoles(..), NameInScope(..), LensInScope(..), FreshNameMode(..))
 import qualified Agda.Syntax.Concrete.Name as C
 
@@ -28,16 +29,17 @@ import Agda.Utils.Lens
 import qualified Agda.Utils.List as L
 import Agda.Utils.List1 (List1, pattern (:|), (<|))
 import qualified Agda.Utils.List1 as List1
-import Agda.Syntax.Common.Pretty
+import Agda.Utils.Null
 import Agda.Utils.Size
 
+import qualified Agda.Syntax.Common.Aspect as Asp
 import Agda.Utils.Impossible
 
 -- | A name is a unique identifier and a suggestion for a concrete name. The
 --   concrete name contains the source location (if any) of the name. The
 --   source location of the binding site is also recorded.
 data Name = Name
-  { nameId           :: !NameId
+  { nameId           :: {-# UNPACK #-} !NameId
   , nameConcrete     :: C.Name  -- ^ The concrete name used for this instance
   , nameCanonical    :: C.Name  -- ^ The concrete name in the original definition (needed by primShowQName, see #4735)
   , nameBindingSite  :: Range
@@ -73,7 +75,7 @@ data QNamed a = QNamed
 -- The 'SetRange' instance for module names sets all individual ranges
 -- to the given one.
 newtype ModuleName = MName { mnameToList :: [Name] }
-  deriving (Eq, Ord)
+  deriving (Eq, Ord, NFData, Null, Hashable)
 
 -- | Ambiguous qualified names. Used for overloaded constructors.
 --
@@ -104,6 +106,9 @@ data Suffix
   = NoSuffix
   | Suffix !Integer
   deriving (Show, Eq, Ord)
+
+instance Null Suffix where
+  empty = NoSuffix
 
 instance NFData Suffix where
   rnf NoSuffix   = ()
@@ -302,6 +307,9 @@ instance Hashable QName where
 instance IsNoName Name where
   isNoName = isNoName . nameConcrete
 
+instance IsNoName ModuleName where
+  isNoName (MName xs) = all isNoName xs
+
 instance NumHoles Name where
   numHoles = numHoles . nameConcrete
 
@@ -374,7 +382,7 @@ namedArgName x = fromMaybe (nameToArgName $ namedArg x) $ bareNameOf x
 ------------------------------------------------------------------------
 
 instance Pretty Name where
-  pretty = pretty . nameConcrete
+  pretty n = pretty (nameConcrete n) `definedAt` (nameBindingSite n)
 
 instance Pretty ModuleName where
   pretty = hcat . punctuate "." . map pretty . mnameToList
@@ -484,6 +492,3 @@ instance NFData Name where
 
 instance NFData QName where
   rnf (QName a b) = rnf a `seq` rnf b
-
-instance NFData ModuleName where
-  rnf (MName a) = rnf a

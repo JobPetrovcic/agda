@@ -2,15 +2,24 @@
 
 -- | Utility functions for lists.
 
-module Agda.Utils.List where
+module Agda.Utils.List (module Agda.Utils.List, module X) where
+
+-- Reexports
+
+import Data.List as X (uncons)
+
+-- Regular imports
 
 import Control.Monad (filterM)
+import Control.Applicative (Alternative, (<|>))
+import qualified Control.Applicative as A
 
 import Data.Array (Array, array, listArray)
 import qualified Data.Array as Array
 import Data.Bifunctor
 import Data.Function (on)
 import Data.Hashable
+import Data.List.Split (splitOn)
 import qualified Data.List as List
 import qualified Data.List.NonEmpty as List1
 import Data.List.NonEmpty (pattern (:|), (<|))
@@ -18,6 +27,7 @@ import Data.Maybe
 import qualified Data.Map as Map
 import qualified Data.HashMap.Strict as HMap
 import qualified Data.Set as Set
+import Data.Strict.These
 
 import qualified Agda.Utils.Bag as Bag
 import Agda.Utils.CallStack.Base
@@ -80,8 +90,9 @@ tailWithDefault def = fromMaybe def . tailMaybe
 -- | Last element (safe).
 --   O(n).
 lastMaybe :: [a] -> Maybe a
-lastMaybe [] = Nothing
-lastMaybe xs = Just $ last xs
+lastMaybe = \case
+  []   -> Nothing
+  x:xs -> Just $ last1 x xs
 
 -- | Last element (safe).  Returns a default list on empty lists.
 --   O(n).
@@ -110,12 +121,6 @@ last2' :: a -> a -> [a] -> (a, a)
 last2' x y = \case
   []  -> (x, y)
   z:zs -> last2' y z zs
-
--- | Opposite of cons @(:)@, safe.
---   O(1).
-uncons :: [a] -> Maybe (a, [a])
-uncons []     = Nothing
-uncons (x:xs) = Just (x,xs)
 
 -- | Maybe cons.
 --   O(1).
@@ -157,6 +162,24 @@ initMaybe = \case
 initWithDefault :: [a] -> [a] -> [a]
 initWithDefault as []     = as
 initWithDefault _  (a:as) = init1 a as
+
+---------------------------------------------------------------------------
+-- * Iterators
+---------------------------------------------------------------------------
+
+-- | A version of 'Foldable.asum' that avoids a final 'A.empty'.
+--   It is right-folding just like 'Foldable.asum'.
+--
+--   Precondition: the right-unit law holds, i.e. @m <|> A.empty = m@.
+asum :: Alternative m => [m a] -> m a
+asum []     = A.empty
+asum (x:xs) = asum1 x xs
+
+-- | A right-folding 'Foldable.asum' for nonempty lists,
+--   never producing 'A.empty'.
+asum1 :: Alternative m => m a -> [m a] -> m a
+asum1 x []     = x
+asum1 x (y:ys) = x <|> asum1 y ys
 
 ---------------------------------------------------------------------------
 -- * Lookup and indexing
@@ -219,6 +242,12 @@ downFrom n | n <= 0     = []
 -- * Update
 ---------------------------------------------------------------------------
 
+{-# INLINE map' #-}
+-- | Strict map.
+map' :: (a -> b) -> [a] -> [b]
+map' f [] = []
+map' f (a:as) = let !b = f a; !bs = map' f as in b:bs
+
 -- | Update the first element of a list, if it exists.
 --   O(1).
 updateHead :: (a -> a) -> [a] -> [a]
@@ -257,6 +286,18 @@ splitExactlyAt :: Integral n => n -> [a] -> Maybe (Prefix a, Suffix a)
 splitExactlyAt 0 xs       = return ([], xs)
 splitExactlyAt n []       = Nothing
 splitExactlyAt n (x : xs) = mapFst (x :) <$> splitExactlyAt (n-1) xs
+
+-- | @takeExactly a n as == take n (as ++ repeat a)@
+--
+{-# SPECIALIZE takeExactly :: a -> Int -> [a] -> [a] #-}
+takeExactly :: forall a n. Integral n => a -> n -> [a] -> [a]
+takeExactly a = go
+  where
+    go n
+      | n <= 0    = const []
+      | otherwise = \case
+          []   -> List.genericReplicate n a
+          x:xs -> x : go (n - 1) xs
 
 -- | Drop from the end of a list.
 --   O(length).
@@ -310,6 +351,19 @@ breakAfter p = \case
   []   -> ([], [])
   x:xs -> first List1.toList $ breakAfter1 p x xs
 
+-- | Break a list when the given predicate returns @Just b@
+--   and place @b@ as pivot between the prefix
+--  (where the predicate returns @Nothing@) and the suffix.
+--
+--  Crashes when the predicate holds nowhere.
+breakJust :: (a -> Maybe b) -> [a] -> (Prefix a, (b, Suffix a))
+breakJust f = go
+  where
+    go = \case
+      a : as | Just b <- f a -> ([], (b, as))
+             | otherwise     -> first (a:) $ go as
+      [] -> __IMPOSSIBLE__
+
 -- | A generalized version of @takeWhile@.
 --   (Cf. @mapMaybe@ vs. @filter@).
 --   @O(length . takeWhileJust f).
@@ -359,9 +413,19 @@ mapMaybeAndRest f = loop [] where
     x:xs | Just y <- f x -> first (y:) $ loop [] xs
          | otherwise     -> loop (x:acc) xs
 
--- | Sublist relation.
-isSublistOf :: Eq a => [a] -> [a] -> Bool
-isSublistOf = List.isSubsequenceOf
+-- | @dropFrom marker xs@ drops everything from @xs@
+-- starting with (and including) @marker@.
+--
+-- If the marker does not appear, the string is returned unchanged.
+--
+-- The following two properties hold provided @marker@ has no overlap with @xs@:
+--
+-- @
+--   dropFrom marker (xs ++ marker ++ ys) == xs
+--   dropFrom marker xs == xs
+-- @
+dropFrom :: Eq a => List1 a -> [a] -> [a]
+dropFrom marker xs = headWithDefault __IMPOSSIBLE__ $ splitOn (List1.toList marker) xs
 
 -- | All ways of removing one element from a list.
 --   O(n²).
@@ -570,8 +634,8 @@ fastDistinct xs = Set.size (Set.fromList xs) == length xs
 duplicates :: Ord a => [a] -> [a]
 duplicates = mapMaybe dup . Bag.groups . Bag.fromList
   where
-    dup (a : _ : _) = Just a
-    dup _           = Nothing
+    dup (a :| _ : _) = Just a
+    dup _            = Nothing
 
 -- | Remove the first representative for each list element.
 --   Thus, returns all duplicate copies.
@@ -579,7 +643,7 @@ duplicates = mapMaybe dup . Bag.groups . Bag.fromList
 --
 --   @allDuplicates xs == sort $ xs \\ nub xs@.
 allDuplicates :: Ord a => [a] -> [a]
-allDuplicates = concatMap (drop 1 . reverse) . Bag.groups . Bag.fromList
+allDuplicates = concatMap (List1.tail . List1.reverse) . Bag.groups . Bag.fromList
   -- The reverse is necessary to actually remove the *first* occurrence
   -- of each element.
 
@@ -738,6 +802,11 @@ zipWithKeepRest f = loop
 -- zipWithTails f (x : xs) (y : ys) = (f x y : zs , as , bs)
 --   where (zs , as , bs) = zipWithTails f xs ys
 
+-- | Analogous to zip, combines two lists by taking the union using These (strict).
+align :: [a] -> [b] -> [These a b]
+align xs [] = This <$> xs
+align [] ys = That <$> ys
+align (x:xs) (y:ys) = These x y : align xs ys
 
 ---------------------------------------------------------------------------
 -- * Unzipping

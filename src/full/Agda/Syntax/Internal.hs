@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
 
 module Agda.Syntax.Internal
     ( module Agda.Syntax.Internal
@@ -13,17 +15,16 @@ import Prelude hiding (null)
 import Control.Monad.Identity
 import Control.DeepSeq
 
-import Data.Function (on)
 import qualified Data.List as List
 import Data.Maybe
-import Data.Semigroup ( Semigroup, (<>), Sum(..) )
+import Data.Semigroup ( Sum(..) )
+import System.IO.Unsafe (unsafePerformIO)
 
 import GHC.Generics (Generic)
 
 import Agda.Syntax.Position
 import Agda.Syntax.Common
 import Agda.Syntax.Literal
-import Agda.Syntax.Concrete.Pretty (prettyHiding)
 import Agda.Syntax.Abstract.Name
 import Agda.Syntax.Internal.Blockers
 import Agda.Syntax.Internal.Elim
@@ -43,7 +44,8 @@ import Agda.Utils.Functor
 import Agda.Utils.Lens
 import Agda.Utils.Null
 import Agda.Utils.Size
-import Agda.Utils.Tuple
+import qualified Agda.Utils.CompactRegion as Compact
+import qualified Agda.Utils.MinimalArray.Lifted as AL
 
 import Agda.Utils.Impossible
 
@@ -116,6 +118,7 @@ instance LensAnnotation    (Dom' t e) where
 instance LensRelevance (Dom' t e) where
 instance LensQuantity  (Dom' t e) where
 instance LensCohesion  (Dom' t e) where
+instance LensModalPolarity (Dom' t e) where
 
 argFromDom :: Dom' t a -> Arg a
 argFromDom Dom{domInfo = i, unDom = a} = Arg i a
@@ -154,6 +157,10 @@ data DataOrRecord' p
   deriving (Show, Eq, Generic)
 
 type DataOrRecord = DataOrRecord' PatternOrCopattern
+type DataOrRecord_ = DataOrRecord' ()
+
+pattern IsRecord_ :: DataOrRecord_
+pattern IsRecord_ = IsRecord ()
 
 instance PatternMatchingAllowed DataOrRecord where
   patternMatchingAllowed = \case
@@ -214,7 +221,7 @@ instance LensConName ConHead where
 --     every constant, even if the definition is an empty
 --     list of clauses.
 --
-data Term = Var {-# UNPACK #-} !Int Elims -- ^ @x es@ neutral
+data Term = Var' {-# UNPACK #-} !Int Elims -- ^ @x es@ neutral
           | Lam ArgInfo (Abs Term)        -- ^ Terms are beta normal. Relevance is ignored
           | Lit Literal
           | Def QName Elims               -- ^ @f es@, possibly a delta/iota-redex
@@ -241,6 +248,39 @@ data Term = Var {-# UNPACK #-} !Int Elims -- ^ @x es@ neutral
             --   eliminators, which are only there to ease debugging when a dummy term incorrectly
             --   leaks into a relevant position.
   deriving Show
+
+-- Caching small variables
+--------------------------------------------------------------------------------
+
+{-# NOINLINE varTable #-}
+varTable :: AL.Array Term
+varTable = unsafePerformIO $ do
+  !c <- Compact.new 4096
+  let !tbl = AL.fromList [Var' i [] | i <- [0..(varTableSize - 1)]]
+  Compact.add c tbl
+
+pattern Var :: Int -> Elims -> Term
+pattern Var i es <- Var' i es where
+  Var i es = case es of
+    [] -> case i < varTableSize of
+      True -> AL.unsafeIndex varTable i
+      _    -> Var' i es
+    _  -> Var' i es
+{-# INLINE Var #-}
+{-# COMPLETE Var, Lam, Lit, Def, Con, Pi, Sort, Level, MetaV, DontCare, Dummy #-}
+
+{-# INLINE varTableSize #-}
+varTableSize :: Int
+varTableSize = 128
+
+-- | An unapplied variable.
+var :: Nat -> Term
+var i | i >= 0 = case i < varTableSize of
+          True -> AL.unsafeIndex varTable i
+          _    -> Var' i []
+      | otherwise = __IMPOSSIBLE__
+
+--------------------------------------------------------------------------------
 
 type ConInfo = ConOrigin
 
@@ -343,14 +383,6 @@ pattern SSet l = Univ USSet l
 
 type Sort = Sort' Term
 
--- | Is this a strict universe inhabitable by data types?
-isStrictDataSort :: Sort' t -> Bool
-isStrictDataSort = \case
-  Univ u _ -> univFibrancy u == IsStrict
-  Inf  u _ -> univFibrancy u == IsStrict
-  _ -> False
-
-
 -- | A level is a maximum expression of a closed level and 0..n
 --   'PlusLevel' expressions each of which is an atom plus a number.
 data Level' t = Max !Integer [PlusLevel' t]
@@ -389,6 +421,27 @@ type Blocked_ = Blocked ()
 -- | Named pattern arguments.
 type NAPs = [NamedArg DeBruijnPattern]
 
+-- | Does the clause body contain calls to any of the mutually recursive functions?
+data ClauseRecursive
+  = YesRecursive
+      -- ^ Definitely a call to a mutually recursive function.
+  | NotRecursive
+      -- ^ Definitely no call to a mutually recursive function.
+  | MaybeRecursive
+      -- ^ Don't know because the analysis has not run yet.
+  deriving (Bounded, Enum, Eq, Generic, Show)
+
+couldBeRecursive :: ClauseRecursive -> Bool
+couldBeRecursive = \case
+  YesRecursive   -> True
+  NotRecursive   -> False
+  MaybeRecursive -> True
+
+decideRecursive :: Bool -> ClauseRecursive
+decideRecursive = \case
+  True  -> YesRecursive
+  False -> NotRecursive
+
 -- | A clause is a list of patterns and the clause body.
 --
 --  The telescope contains the types of the pattern variables and the
@@ -417,21 +470,10 @@ data Clause = Clause
       --   Used, e.g., by @TermCheck@.
       --   Can be 'Irrelevant' if we encountered an irrelevant projection
       --   pattern on the lhs.
-    , clauseCatchall    :: Bool
+    , clauseCatchall    :: Catchall
       -- ^ Clause has been labelled as CATCHALL.
-    , clauseExact       :: Maybe Bool
-      -- ^ Pattern matching of this clause is exact, no catch-all case.
-      --   Computed by the coverage checker.
-      --   @Nothing@ means coverage checker has not run yet (clause may be inexact).
-      --   @Just False@ means clause is not exact.
-      --   @Just True@ means clause is exact.
-    , clauseRecursive   :: Maybe Bool
-      -- ^ @clauseBody@ contains recursive calls; computed by termination checker.
-      --   @Nothing@ means that termination checker has not run yet,
-      --   or that @clauseBody@ contains meta-variables;
-      --   these could be filled with recursive calls later!
-      --   @Just False@ means definitely no recursive call.
-      --   @Just True@ means definitely a recursive call.
+    , clauseRecursive   :: ClauseRecursive
+      -- ^ @clauseBody@ contains recursive calls? Computed by termination checker.
     , clauseUnreachable :: Maybe Bool
       -- ^ Clause has been labelled as unreachable by the coverage checker.
       --   @Nothing@ means coverage checker has not run yet (clause may be unreachable).
@@ -471,6 +513,7 @@ defaultPatternInfo = PatternInfo PatOSystem []
 data PatOrigin
   = PatOSystem         -- ^ Pattern inserted by the system
   | PatOSplit          -- ^ Pattern generated by case split
+  | PatOSplitArg ArgName -- ^ Argument to pattern generated by case split
   | PatOVar Name       -- ^ User wrote a variable pattern
   | PatODot            -- ^ User wrote a dot pattern
   | PatOWild           -- ^ User wrote a wildcard pattern
@@ -585,6 +628,7 @@ fromConPatternInfo i = patToConO $ patOrigin $ conPInfo i
     patToConO = \case
       PatOSystem -> ConOSystem
       PatOSplit  -> ConOSplit
+      PatOSplitArg{} -> ConOSystem
       PatOVar{}  -> ConOSystem
       PatODot    -> ConOSystem
       PatOWild   -> ConOSystem
@@ -635,27 +679,6 @@ patternInfo (DefP i _ _)      = Just i
 -- | Retrieve the origin of a pattern
 patternOrigin :: Pattern' x -> Maybe PatOrigin
 patternOrigin = fmap patOrigin . patternInfo
-
--- | Does the pattern perform a match that could fail?
-properlyMatching :: Pattern' a -> Bool
-properlyMatching = properlyMatching' True True
-
-properlyMatching'
-  :: Bool       -- ^ Should absurd patterns count as proper match?
-  -> Bool       -- ^ Should projection patterns count as proper match?
-  -> Pattern' a -- ^ The pattern.
-  -> Bool
-properlyMatching' absP projP = \case
-  p | absP && patternOrigin p == Just PatOAbsurd -> True
-  ConP _ ci ps    -- record constructors do not count as proper matches themselves
-    | conPRecord ci -> List.any (properlyMatching . namedArg) ps
-    | otherwise     -> True
-  LitP{}    -> True
-  DefP{}    -> True
-  ProjP{}   -> projP
-  VarP{}    -> False
-  DotP{}    -> False
-  IApplyP{} -> False
 
 instance IsProjP (Pattern' a) where
   isProjP = \case
@@ -743,11 +766,16 @@ instance Null (Substitution' a) where
 
 data EqualityView
   = EqualityViewType EqualityTypeData
-  | OtherType Type -- ^ reduced
-  | IdiomType Type -- ^ reduced
+      -- ^ A type of the form @u ≡ v@ decomposed into its parts.
+      --   Used as type for the @rewrite@ expression.
+  | OtherType Type
+      -- ^ A reduced type used as type for a @with@ expression.
+  | IdiomType Type
+      -- ^ A reduced type used as type for the @with@ inspect idiom.
 
 data EqualityTypeData = EqualityTypeData
-    { _eqtSort   :: Sort        -- ^ Sort of this type.
+    { _eqtRange  :: Range       -- ^ Range of the @rewrite@ expression, if any.
+    , _eqtSort   :: Sort        -- ^ Sort of this type.
     , _eqtName   :: QName       -- ^ Builtin EQUALITY.
     , _eqtParams :: Args        -- ^ Hidden.  Empty or @Level@.
     , _eqtType   :: Arg Term    -- ^ Hidden.
@@ -755,16 +783,17 @@ data EqualityTypeData = EqualityTypeData
     , _eqtRhs    :: Arg Term    -- ^ NotHidden.
     }
 
-pattern EqualityType
-  :: Sort
+pattern EqualityType ::
+     Range
+  -> Sort
   -> QName
   -> Args
   -> Arg Term
   -> Arg Term
   -> Arg Term
   -> EqualityView
-pattern EqualityType{ eqtSort, eqtName, eqtParams, eqtType, eqtLhs, eqtRhs } =
-  EqualityViewType (EqualityTypeData eqtSort eqtName eqtParams eqtType eqtLhs eqtRhs)
+pattern EqualityType{ eqtRange, eqtSort, eqtName, eqtParams, eqtType, eqtLhs, eqtRhs } =
+  EqualityViewType (EqualityTypeData eqtRange eqtSort eqtName eqtParams eqtType eqtLhs eqtRhs)
 
 {-# COMPLETE EqualityType, OtherType, IdiomType #-}
 
@@ -826,11 +855,6 @@ isAbsurdPatternName x = x == absurdPatternName
 -- * Smart constructors
 ---------------------------------------------------------------------------
 
--- | An unapplied variable.
-var :: Nat -> Term
-var i | i >= 0    = Var i []
-      | otherwise = __IMPOSSIBLE__
-
 -- | Add 'DontCare' is it is not already a @DontCare@.
 dontCare :: Term -> Term
 dontCare v =
@@ -848,10 +872,8 @@ dummyLocName cs = maybe __IMPOSSIBLE__ prettyCallSite (headCallSite cs)
 dummyTermWith :: DummyTermKind -> CallStack -> Term
 dummyTermWith kind cs = flip Dummy [] $ concat [kind, ": ", dummyLocName cs]
 
--- | A dummy level to constitute a level/sort created at location.
---   Note: use macro __DUMMY_LEVEL__ !
-dummyLevel :: CallStack -> Level
-dummyLevel = atomicLevel . dummyTermWith "dummyLevel"
+__DUMMY_TERM_WITH__ :: HasCallStack => DummyTermKind -> Term
+__DUMMY_TERM_WITH__ = withCallerCallStack . dummyTermWith
 
 -- | A dummy term created at location.
 --   Note: use macro __DUMMY_TERM__ !
@@ -860,6 +882,11 @@ dummyTerm = dummyTermWith "dummyTerm"
 
 __DUMMY_TERM__ :: HasCallStack => Term
 __DUMMY_TERM__ = withCallerCallStack dummyTerm
+
+-- | A dummy level to constitute a level/sort created at location.
+--   Note: use macro __DUMMY_LEVEL__ !
+dummyLevel :: CallStack -> Level
+dummyLevel = atomicLevel . dummyTermWith "dummyLevel"
 
 __DUMMY_LEVEL__ :: HasCallStack => Level
 __DUMMY_LEVEL__ = withCallerCallStack dummyLevel
@@ -921,13 +948,39 @@ mkProp n = Prop $ ClosedLevel n
 mkSSet :: Integer -> Sort
 mkSSet n = SSet $ ClosedLevel n
 
+impossibleTerm :: CallStack -> Term
+impossibleTerm = flip Dummy [] . show . Impossible
+
+---------------------------------------------------------------------------
+-- * Sorts.
+---------------------------------------------------------------------------
+
 isSort :: Term -> Maybe Sort
 isSort = \case
   Sort s -> Just s
   _      -> Nothing
 
-impossibleTerm :: CallStack -> Term
-impossibleTerm = flip Dummy [] . show . Impossible
+-- | Get the flavor of the universe. 'Nothing' could also mean "don't know".
+sortUniv :: Sort' t -> Maybe Univ
+sortUniv = \case
+  Univ u _ -> Just u
+  Inf  u _ -> Just u
+  _        -> Nothing
+
+-- | Is this a Prop universe?  Answers are yes ('True') or maybe ('False').
+isProp :: Sort' t -> Bool
+isProp = (Just UProp ==) . sortUniv
+
+-- | Is this a strict universe inhabitable by data types?
+isStrictDataSort :: Sort' t -> Bool
+isStrictDataSort = maybe False ((IsStrict ==) . univFibrancy) . sortUniv
+
+-- | Turn a known 'UProp' sort into a 'UType' sort, leave others unchanged.
+propToType :: Sort' t -> Sort' t
+propToType = \case
+  Univ UProp l -> Univ UType l
+  Inf  UProp l -> Inf  UType l
+  s -> s
 
 ---------------------------------------------------------------------------
 -- * Telescopes.
@@ -935,7 +988,7 @@ impossibleTerm = flip Dummy [] . show . Impossible
 
 -- | A traversal for the names in a telescope.
 mapAbsNamesM :: Applicative m => (ArgName -> m ArgName) -> Tele a -> m (Tele a)
-mapAbsNamesM f EmptyTel                  = pure EmptyTel
+mapAbsNamesM _ EmptyTel                  = pure EmptyTel
 mapAbsNamesM f (ExtendTel a (  Abs x b)) = ExtendTel a <$> (  Abs <$> f x <*> mapAbsNamesM f b)
 mapAbsNamesM f (ExtendTel a (NoAbs x b)) = ExtendTel a <$> (NoAbs <$> f x <*> mapAbsNamesM f b)
   -- Ulf, 2013-11-06: Last case is really impossible but I'd rather find out we
@@ -1049,12 +1102,12 @@ suggests (Suggestion x : xs) = fromMaybe (suggests xs) $ suggestName x
 
 -- | Convert top-level postfix projections into prefix projections.
 unSpine :: Term -> Term
-unSpine = unSpine' $ const True
+unSpine = unSpine' $ \_ _ -> True
 
 -- | Convert 'Proj' projection eliminations
 --   according to their 'ProjOrigin' into
 --   'Def' projection applications.
-unSpine' :: (ProjOrigin -> Bool) -> Term -> Term
+unSpine' :: (ProjOrigin -> QName -> Bool) -> Term -> Term
 unSpine' p v =
   case hasElims v of
     Just (h, es) -> loop h [] es
@@ -1063,9 +1116,9 @@ unSpine' p v =
     loop :: (Elims -> Term) -> Elims -> Elims -> Term
     loop h res es =
       case es of
-        []                   -> v
-        Proj o f : es' | p o -> loop (Def f) [Apply (defaultArg v)] es'
-        e        : es'       -> loop h (e : res) es'
+        []                     -> v
+        Proj o f : es' | p o f -> loop (Def f) [Apply (defaultArg v)] es'
+        e        : es'         -> loop h (e : res) es'
       where v = h $ reverse res
 
 -- | A view distinguishing the neutrals @Var@, @Def@, and @MetaV@ which
@@ -1114,11 +1167,14 @@ instance Null (Tele a) where
   null EmptyTel    = True
   null ExtendTel{} = False
 
+instance Null ClauseRecursive where
+  empty = MaybeRecursive
+
 -- | A 'null' clause is one with no patterns and no rhs.
 --   Should not exist in practice.
 instance Null Clause where
-  empty = Clause empty empty empty empty empty empty False Nothing Nothing Nothing empty empty
-  null (Clause _ _ tel pats body _ _ _ _ _ _ wm)
+  empty = Clause empty empty empty empty empty empty empty empty empty empty empty
+  null (Clause _ _ tel pats body _ _ _ _ _ wm)
     =  null tel
     && null pats
     && null body
@@ -1297,9 +1353,12 @@ instance KillRange a => KillRange (Pattern' a) where
       IApplyP o u t x  -> killRangeN (IApplyP o) u t x
       DefP o q ps      -> killRangeN (DefP o) q ps
 
+instance KillRange ClauseRecursive where
+  killRange = id
+
 instance KillRange Clause where
-  killRange (Clause rl rf tel ps body t catchall exact recursive unreachable ell wm) =
-    killRangeN Clause rl rf tel ps body t catchall exact recursive unreachable ell wm
+  killRange (Clause rl rf tel ps body t catchall recursive unreachable ell wm) =
+    killRangeN Clause rl rf tel ps body t catchall recursive unreachable ell wm
 
 instance KillRange a => KillRange (Tele a) where
   killRange = fmap killRange
@@ -1319,7 +1378,7 @@ instance Pretty a => Pretty (Substitution' a) where
     where
     pr p rho = case rho of
       IdS                -> "idS"
-      EmptyS err         -> "emptyS"
+      EmptyS _err        -> "emptyS"
       t :# rho           -> mparens (p > 2) $
                             sep [ pr 2 rho <> ",", prettyPrec 3 t ]
       Strengthen _ n rho -> mparens (p > 9) $
@@ -1339,12 +1398,12 @@ instance Pretty Term where
             , nest 2 $ pretty (unAbs b) ]
       Lit l                -> pretty l
       Def q els            -> pretty q `pApp` els
-      Con c ci vs          -> pretty (conName c) `pApp` vs
+      Con c _ci vs         -> pretty (conName c) `pApp` vs
       Pi a (NoAbs _ b)     -> mparens (p > 0) $
-        sep [ prettyPrec 1 (unDom a) <+> "->"
+        sep [ pretty (getModality a) <+> prettyPrec 1 (unDom a) <+> "->"
             , nest 2 $ pretty b ]
       Pi a b               -> mparens (p > 0) $
-        sep [ pDom (domInfo a) (text (absName b) <+> ":" <+> pretty (unDom a)) <+> "->"
+        sep [ pDom (domInfo a) (pretty (getModality a) <+> text (absName b) <+> ":" <+> pretty (unDom a)) <+> "->"
             , nest 2 $ pretty (unAbs b) ]
       Sort s      -> prettyPrec p s
       Level l     -> prettyPrec p l
@@ -1360,7 +1419,7 @@ instance Pretty t => Pretty (Abs t) where
   pretty (NoAbs x t) = "NoAbs" <+> (text x <> ".") <+> pretty t
 
 instance (Pretty t, Pretty e) => Pretty (Dom' t e) where
-  pretty dom = pLock <+> pTac <+> pDom dom (pretty $ unDom dom)
+  pretty dom = pLock <+> pTac <+> pDom dom (pretty (getModality dom) <+> pretty (unDom dom))
     where
       pTac | Just t <- domTactic dom = "@" <> parens ("tactic" <+> pretty t)
            | otherwise               = empty
@@ -1373,6 +1432,12 @@ pDom i =
     NotHidden  -> parens
     Hidden     -> braces
     Instance{} -> braces . braces
+
+instance Pretty ClauseRecursive where
+  pretty = \case
+    YesRecursive   -> "+Rec"
+    NotRecursive   -> "-Rec"
+    MaybeRecursive -> "?Rec"
 
 instance Pretty Clause where
   pretty Clause{clauseTel = tel, namedClausePats = ps, clauseBody = b, clauseType = t} =
@@ -1443,7 +1508,7 @@ instance Pretty a => Pretty (Pattern' a) where
     where ps = map (fmap namedThing) nps
           lazy | conPLazy i = "~"
                | otherwise  = empty
-  prettyPrec n (DefP o q nps)= mparens (n > 0 && not (null nps)) $
+  prettyPrec n (DefP _o q nps)= mparens (n > 0 && not (null nps)) $
     pretty q <+> fsep (map (prettyPrec 10) ps)
     where ps = map (fmap namedThing) nps
   -- -- Version with printing record type:
@@ -1510,11 +1575,12 @@ instance NFData PlusLevel where
 instance NFData e => NFData (Dom e) where
   rnf (Dom a c d e f) = rnf a `seq` rnf c `seq` rnf d `seq` rnf e `seq` rnf f
 
-instance NFData DataOrRecord
+instance NFData a => NFData (DataOrRecord' a)
 instance NFData ConHead
 instance NFData a => NFData (Abs a)
 instance NFData a => NFData (Tele a)
 instance NFData IsFibrant
+instance NFData ClauseRecursive
 instance NFData Clause
 instance NFData PatternInfo
 instance NFData PatOrigin

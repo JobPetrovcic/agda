@@ -2,8 +2,8 @@
 --
 -- Implements one big fold over abstract syntax.
 
--- {-# OPTIONS_GHC -fwarn-unused-imports #-}  -- Data.Semigroup is redundant in later GHC versions
-{-# OPTIONS_GHC -fwarn-unused-binds   #-}
+{-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-binds   #-}
 
 module Agda.Interaction.Highlighting.FromAbstract
   ( runHighlighter
@@ -12,12 +12,9 @@ module Agda.Interaction.Highlighting.FromAbstract
 
 import Prelude hiding (null)
 
-import Control.Applicative
 import Control.Monad.Reader  ( MonadReader(..), asks, Reader, runReader )
 
-import qualified Data.Map      as Map
 import           Data.Maybe
-import           Data.Semigroup       ( Semigroup(..) )          -- for ghc 8.0
 import           Data.Void            ( Void )
 
 import           Agda.Interaction.Highlighting.Precise hiding ( singleton )
@@ -27,7 +24,7 @@ import           Agda.Interaction.Highlighting.Range   ( rToR )  -- Range is amb
 import           Agda.Syntax.Abstract                ( IsProjP(..) )
 import qualified Agda.Syntax.Abstract      as A
 import           Agda.Syntax.Common        as Common
-import           Agda.Syntax.Concrete                ( FieldAssignment'(..) )
+import           Agda.Syntax.Concrete                ( FieldAssignment'(..), TacticAttribute' )
 import qualified Agda.Syntax.Concrete.Name as C
 import           Agda.Syntax.Info                    ( ModuleInfo(..) )
 import           Agda.Syntax.Literal
@@ -102,6 +99,7 @@ instance Hilite a => Hilite [a]
 instance Hilite a => Hilite (List1 a)
 instance Hilite a => Hilite (Maybe a)
 instance Hilite a => Hilite (Ranged a)
+instance Hilite a => Hilite (TacticAttribute' a)
 instance Hilite a => Hilite (WithHiding a)
 
 instance Hilite Void where
@@ -159,7 +157,6 @@ instance (Hilite a, Hilite b) => Hilite (a, b) where
 -- | A.LetBinding
 -- ---------------------------------------------------------------------
 -- | getLet                | A.LetBind                   | bound
--- | getLet                | A.LetDeclaredVariable       | bound
 -- ---------------------------------------------------------------------
 -- | A.LamBinding
 -- ---------------------------------------------------------------------
@@ -195,6 +192,11 @@ instance (Hilite a, Hilite b) => Hilite (a, b) where
 instance Hilite A.RecordDirectives where
   hilite (RecordDirectives _ _ _ c) = hilite c
 
+instance Hilite A.RecordConName where
+  hilite = \case
+    A.NamedRecCon x -> hilite x
+    A.FreshRecCon{} -> mempty
+
 instance Hilite A.Declaration where
   hilite = \case
       A.Axiom _ax _di ai _occ x e            -> hl ai <> hl x <> hl e
@@ -225,17 +227,19 @@ instance Hilite A.Declaration where
 
 instance Hilite A.Pragma where
   hilite = \case
-    A.OptionsPragma _strings     -> mempty
-    A.BuiltinPragma b x          -> singleAspect Keyword b <> hilite x
-    A.BuiltinNoDefPragma b k x   -> singleAspect Keyword b <> hiliteQName (Just $ kindOfNameToNameKind k) x
-    A.CompilePragma b x _foreign -> singleAspect Keyword b <> hilite x
-    A.RewritePragma r xs         -> singleAspect Keyword r <> hilite xs
-    A.StaticPragma x             -> hilite x
-    A.EtaPragma x                -> hilite x
-    A.InjectivePragma x          -> hilite x
-    A.NotProjectionLikePragma x  -> hilite x
-    A.InlinePragma _inline x     -> hilite x
-    A.DisplayPragma x ps e       -> hilite x <> hilite ps <> hilite e
+    A.OptionsPragma _strings        -> mempty
+    A.BuiltinPragma b x             -> singleAspect Keyword b <> hilite x
+    A.BuiltinNoDefPragma b k x      -> singleAspect Keyword b <> hiliteQName (Just $ kindOfNameToNameKind k) x
+    A.CompilePragma b x _foreign    -> singleAspect Keyword b <> hilite x
+    A.RewritePragma r xs            -> singleAspect Keyword r <> hilite xs
+    A.StaticPragma x                -> hilite x
+    A.EtaPragma x                   -> hilite x
+    A.InjectivePragma x             -> hilite x
+    A.InjectiveForInferencePragma x -> hilite x
+    A.NotProjectionLikePragma x     -> hilite x
+    A.OverlapPragma x _             -> hilite x
+    A.InlinePragma _inline x        -> hilite x
+    A.DisplayPragma x ps e          -> hilite x <> hilite ps <> hilite e
 
 instance Hilite A.Expr where
   hilite = \case
@@ -259,8 +263,10 @@ instance Hilite A.Expr where
       A.Generalized _qs e           -> hl e
       A.Fun _r a b                  -> hl a <> hl b
       A.Let _r bs e                 -> hl bs <> hl e
-      A.Rec _r ass                  -> hl ass
-      A.RecUpdate _r e ass          -> hl e <> hl ass
+      A.Rec _kwr _r ass             -> hl ass
+      A.RecUpdate _kwr _r e ass     -> hl e <> hl ass
+      A.RecWhere _kwr _r e ass      -> hl e
+      A.RecUpdateWhere _k _r e bs _ -> hl e <> hl bs
       A.ScopedExpr _ e              -> hl e
       A.Quote _r                    -> mempty
       A.QuoteTerm _r                -> mempty
@@ -284,10 +290,9 @@ instance (Hilite a, IsProjP a) => Hilite (A.Pattern' a) where
       A.AbsurdP _r           -> mempty
       A.LitP _r l            -> hl l
       A.PatternSynP _r qs es -> hilitePatternSynonym qs <> hl es
-      A.RecP _r ps           -> hl ps
+      A.RecP _kwr _r ps      -> hl ps
       A.EqualP _r ps         -> hl ps
       A.WithP _ p            -> hl p
-      A.AnnP _r a p          -> hl p
 
     where
     hl a = hilite a
@@ -327,6 +332,7 @@ instance (HasRange n, Hilite p, Hilite e) => Hilite (RewriteEqn' x n p e) where
   hilite = \case
     Rewrite es    -> hilite $ fmap snd es
     Invert _x pes -> hilite pes
+    LeftLet pes   -> hilite pes
 
 instance Hilite a => Hilite (A.Clause' a) where
   hilite (A.Clause lhs strippedPats rhs wh _catchall) =
@@ -352,11 +358,11 @@ instance Hilite A.ModuleApplication where
 instance Hilite A.LetBinding where
   hilite = \case
       A.LetBind    _r ai x t e     -> hl ai <> hl x <> hl t <> hl e
-      A.LetPatBind _r p e          -> hl p  <> hl e
+      A.LetAxiom   _r ai x t       -> hl ai <> hl x <> hl t
+      A.LetPatBind _r ai p e       -> hl ai <> hl p  <> hl e
       A.LetApply mi er x es _c dir -> hl mi <> hl er <> hl x <>
                                       hl es <> hl dir
       A.LetOpen mi x dir           -> hl mi <> hl x <> hl dir
-      A.LetDeclaredVariable x      -> hl x
     where
     hl x = hilite x
 
@@ -374,7 +380,7 @@ instance Hilite A.LamBinding where
     A.DomainFull bind      -> hilite bind
 
 instance Hilite a => Hilite (A.Binder' a) where
-  hilite (A.Binder p x) = hilite p <> hilite x
+  hilite (A.Binder p _ x) = hilite p <> hilite x
 
 instance Hilite A.BindName where
   hilite (A.BindName x) = hiliteBound x
@@ -394,7 +400,7 @@ instance Hilite ArgInfo where
   hilite (ArgInfo _hiding modality _origin _fv _a) = hilite modality
 
 instance Hilite Modality where
-  hilite (Modality _relevance quantity _cohesion) = hilite quantity
+  hilite (Modality _relevance quantity _cohesion _polarity) = hilite quantity
 
 -- | If the 'Quantity' attribute comes with a 'Range', highlight the
 -- corresponding attribute as 'Symbol'.
@@ -591,7 +597,7 @@ hiliteCName xs x fr mR asp = do
   mFilePos :: Maybe DefinitionSite
   mFilePos = do
     r <- mR
-    P.Pn { P.srcFile = Strict.Just f, P.posPos = p } <- P.rStart r
+    P.Pn (Strict.Just f) p _ _ <- P.rStart r
     mod <- P.rangeFileName f
     -- Andreas, 2017-06-16, Issue #2604: Symbolic anchors.
     -- We drop the file name part from the qualifiers, since

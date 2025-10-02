@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedLists #-}
+{-# OPTIONS_GHC -Wunused-imports #-}
 
 -- | Library management.
 --
@@ -20,14 +21,18 @@
 --
 module Agda.Interaction.Library
   ( findProjectRoot
-  , getAgdaAppDir
   , getDefaultLibraries
   , getInstalledLibraries
   , getTrustedExecutables
   , libraryIncludePaths
-  , getAgdaLibFiles'
+  , getAgdaLibFile
   , getPrimitiveLibDir
-  , LibName
+  , classifyBuiltinModule_
+  , builtinModules
+  , builtinModulesWithSafePostulates
+  , builtinModulesWithUnsafePostulates
+  , primitiveModules
+  , LibName, parseLibName
   , OptionsPragma(..)
   , AgdaLibFile(..)
   , ExeName
@@ -38,69 +43,54 @@ module Agda.Interaction.Library
   , libraryWarningName
   , ProjectConfig(..)
   -- * Exported for testing
-  , VersionView(..), versionView, unVersionView
   , findLib'
   ) where
 
-import Control.Arrow          ( first , second )
 import qualified Control.Exception as E
-import Control.Monad          ( filterM, forM )
-import Control.Monad.Except
-import Control.Monad.State
+import Control.Monad.Except   ( runExceptT, MonadError, throwError )
 import Control.Monad.Writer   ( Writer, runWriterT, tell )
 import Control.Monad.IO.Class ( MonadIO(..) )
 
-import Data.Char
+import Data.Bifunctor ( second )
 import Data.Either
 import Data.Function (on)
+import qualified Data.List as List
 import Data.Map ( Map )
 import qualified Data.Map as Map
-import qualified Data.List as List
+import Data.Set ( Set )
+import qualified Data.Set as Set
 import qualified Data.Text as T
 
 import System.Directory
 import System.FilePath
-import System.Environment
+import System.IO.Error ( isPermissionError )
 
 import Agda.Interaction.Library.Base
 import Agda.Interaction.Library.Parse
 
+import Agda.TypeChecking.Monad.Base.Types ( IsBuiltinModule(..) )
+
 import Agda.Utils.Environment
 import Agda.Utils.FileName
-import Agda.Utils.Functor ( (<&>) )
 import Agda.Utils.IO ( catchIO )
 import qualified Agda.Utils.IO.UTF8 as UTF8
 import Agda.Utils.Lens
 import Agda.Utils.List
 import Agda.Utils.List1             ( List1, pattern (:|) )
-import Agda.Utils.List2             ( List2 )
+import Agda.Utils.List2             ( pattern List2 )
 import qualified Agda.Utils.List1   as List1
 import qualified Agda.Utils.List2   as List2
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
-import Agda.Syntax.Common.Pretty
 import Agda.Utils.Singleton
-import Agda.Utils.String ( trim )
 import Agda.Utils.Tuple ( mapSndM )
 
+import Agda.Setup ( getDataFileName, getAgdaAppDir )
 import Agda.Version
-
--- Paths_Agda.hs is in $(BUILD_DIR)/build/autogen/.
-import Paths_Agda ( getDataFileName )
 
 ------------------------------------------------------------------------
 -- * Types and Monads
 ------------------------------------------------------------------------
-
--- | Library names are structured into the base name and a suffix of version
---   numbers, e.g. @mylib-1.2.3@.  The version suffix is optional.
-data VersionView = VersionView
-  { vvBase    :: LibName
-      -- ^ Actual library name.
-  , vvNumbers :: [Integer]
-      -- ^ Major version, minor version, subminor version, etc., all non-negative.
-      --   Note: a priori, there is no reason why the version numbers should be @Int@s.
-  } deriving (Eq, Show)
 
 -- | Raise collected 'LibErrors' as exception.
 --
@@ -109,42 +99,20 @@ mkLibM libs m = do
   (x, ews) <- lift $ lift $ runWriterT m
   let (errs, warns) = partitionEithers ews
   tell warns
-  unless (null errs) $ do
-    let doc = vcat $ map (formatLibError libs) errs
-    throwError doc
+  () <- List1.unlessNull errs \ errs -> throwError $ LibErrors libs errs
   return x
 
 ------------------------------------------------------------------------
 -- * Resources
 ------------------------------------------------------------------------
 
--- | Get the path to @~/.agda@ (system-specific).
---   Can be overwritten by the @AGDA_DIR@ environment variable.
---
---   (This is not to be confused with the directory for the data files
---   that Agda needs (e.g. the primitive modules).)
---
-getAgdaAppDir :: IO FilePath
-getAgdaAppDir = do
-  -- System-specific command to build the path to ~/.agda (Unix) or %APPDATA%\agda (Win)
-  let agdaDir = getAppUserDataDirectory "agda" >>= \legacyAgdaDir ->
-        ifM (doesDirectoryExist legacyAgdaDir)
-            (pure legacyAgdaDir)
-            (getXdgDirectory XdgConfig "agda")
-  -- The default can be overwritten by setting the AGDA_DIR environment variable
-  caseMaybeM (lookupEnv "AGDA_DIR") agdaDir $ \ dir ->
-      ifM (doesDirectoryExist dir) (canonicalizePath dir) $ do
-        d <- agdaDir
-        putStrLn $ "Warning: Environment variable AGDA_DIR points to non-existing directory " ++ show dir ++ ", using " ++ show d ++ " instead."
-        return d
-
 -- | Returns the absolute default lib dir. This directory is used to
 -- store the Primitive.agda file.
-getPrimitiveLibDir :: IO FilePath
+getPrimitiveLibDir :: IO AbsolutePath
 getPrimitiveLibDir = do
   libdir <- filePath <$> (absolute =<< getDataFileName "lib")
   ifM (doesDirectoryExist libdir)
-      (return $ libdir </> "prim")
+      (return $ AbsolutePath $ T.pack $ libdir </> "prim")
       (error $ "The lib directory " ++ libdir ++ " does not exist")
 
 -- | The @~/.agda/libraries@ file lists the libraries Agda should know about.
@@ -175,6 +143,91 @@ defaultExecutableFiles :: List1 FilePath
 defaultExecutableFiles = ("executables-" ++ version) :| "executables" : []
 
 ------------------------------------------------------------------------
+-- * Agda builtin modules
+------------------------------------------------------------------------
+
+-- | Prefix path with @Agda.Builtin@.
+
+agdaBuiltin :: FilePath -> FilePath
+agdaBuiltin = ("Agda" </>) . ("Builtin" </>)
+
+-- | The very magical, auto-imported modules.
+
+primitiveModules :: Set FilePath
+primitiveModules = Set.fromList
+  [ "Agda" </> "Primitive.agda"
+  , "Agda" </> "Primitive" </> "Cubical.agda"
+  ]
+
+-- | These builtins may use postulates, and are still considered @--safe@.
+
+builtinModulesWithSafePostulates :: Set FilePath
+builtinModulesWithSafePostulates =
+  (primitiveModules `Set.union`) $ Set.fromList $
+  map agdaBuiltin $
+    [ "Bool.agda"
+    , "Char.agda"
+    , "Char" </> "Properties.agda"
+    , "Coinduction.agda"
+    , "Cubical" </> "Equiv.agda"
+    , "Cubical" </> "Glue.agda"
+    , "Cubical" </> "HCompU.agda"
+    , "Cubical" </> "Id.agda"
+    , "Cubical" </> "Path.agda"
+    , "Cubical" </> "Sub.agda"
+    , "Equality" </> "Erase.agda"
+    , "Equality.agda"
+    , "Float.agda"
+    , "Float" </> "Properties.agda"
+    , "FromNat.agda"
+    , "FromNeg.agda"
+    , "FromString.agda"
+    , "Int.agda"
+    , "IO.agda"
+    , "List.agda"
+    , "Maybe.agda"
+    , "Nat.agda"
+    , "Reflection.agda"
+    , "Reflection" </> "Properties.agda"
+    , "Reflection" </> "External.agda"
+    , "Sigma.agda"
+    , "Size.agda"
+    , "Strict.agda"
+    , "String.agda"
+    , "String" </> "Properties.agda"
+    , "Unit.agda"
+    , "Word.agda"
+    , "Word" </> "Properties.agda"
+    ]
+
+-- | These builtins may not use postulates under @--safe@. They are not
+--   automatically unsafe, but will be if they use an unsafe feature.
+
+builtinModulesWithUnsafePostulates :: Set FilePath
+builtinModulesWithUnsafePostulates = Set.fromList $
+  map agdaBuiltin $
+    [ "TrustMe.agda"
+    , "Equality" </> "Rewrite.agda"
+    ]
+
+-- | All builtin modules.
+
+builtinModules :: Set FilePath
+builtinModules = builtinModulesWithSafePostulates `Set.union`
+                 builtinModulesWithUnsafePostulates
+
+-- | Determine whether the second absolute path refers to one of Agda's primitive modules.
+--   The first argument should be the result of 'getPrimitiveLibDir'.
+--
+classifyBuiltinModule_ :: AbsolutePath -> AbsolutePath -> Maybe IsBuiltinModule
+classifyBuiltinModule_ primLibDir fp = do
+  f <- relativizeAbsolutePath fp primLibDir
+  guard $ f `Set.member` builtinModules
+  if f `Set.member` builtinModulesWithUnsafePostulates then return IsBuiltinModule
+  else if f `Set.member` primitiveModules then return IsPrimitiveModule
+  else return IsBuiltinModuleWithSafePostulates
+
+------------------------------------------------------------------------
 -- * Get the libraries for the current project
 ------------------------------------------------------------------------
 
@@ -182,18 +235,15 @@ defaultExecutableFiles = ("executables-" ++ version) :| "executables" : []
 --
 --   If there are none, look in the parent directories until one is found.
 
-findProjectConfig
-  :: FilePath                          -- ^ Candidate (init: the directory Agda was called in)
-  -> LibM ProjectConfig                -- ^ Actual root and @.agda-lib@ files for this project
-findProjectConfig root = mkLibM [] $ findProjectConfig' root
-
-findProjectConfig'
-  :: FilePath                          -- ^ Candidate (init: the directory Agda was called in)
-  -> LibErrorIO ProjectConfig          -- ^ Actual root and @.agda-lib@ files for this project
-findProjectConfig' root = do
+findProjectConfig ::
+     FilePath
+       -- ^ Candidate (initially: the directory Agda was called in).
+  -> LibM ProjectConfig
+       -- ^ Actual root and @.agda-lib@ file for this project.
+findProjectConfig root = do
   getCachedProjectConfig root >>= \case
     Just conf -> return conf
-    Nothing   -> do
+    Nothing   -> handlePermissionException do
       libFiles <- liftIO $ getDirectoryContents root >>=
         filterM (\file -> and2M
           (pure $ takeExtension file == ".agda-lib")
@@ -201,22 +251,25 @@ findProjectConfig' root = do
       case libFiles of
         []     -> liftIO (upPath root) >>= \case
           Just up -> do
-            conf <- findProjectConfig' up
-            conf <- return $ case conf of
-                  DefaultProjectConfig{} -> conf
-                  ProjectConfig{..}      ->
-                    ProjectConfig{ configAbove = configAbove + 1
-                                 , ..
-                                 }
+            conf <- over lensConfigAbove (+ 1) <$> findProjectConfig up
             storeCachedProjectConfig root conf
             return conf
           Nothing -> return DefaultProjectConfig
-        files -> do
-          let conf = ProjectConfig root files 0
+        [file] -> do
+          let conf = ProjectConfig root file 0
           storeCachedProjectConfig root conf
           return conf
+        f1:f2:files -> throwError $ LibErrors [] $ singleton $ LibError Nothing $
+          SeveralAgdaLibFiles root $ List2 f1 f2 files
 
   where
+    -- Andreas, 2024-06-26, issue #7331:
+    -- In case of missing permission we terminate our search for the project file
+    -- with the default value.
+    handlePermissionException :: LibM ProjectConfig -> LibM ProjectConfig
+    handlePermissionException = flip catchIO \ e ->
+      if isPermissionError e then return DefaultProjectConfig else liftIO $ E.throwIO e
+
     -- Note that "going up" one directory is OS dependent
     -- if the directory is a symlink.
     --
@@ -244,13 +297,13 @@ findProjectRoot root = findProjectConfig root <&> \case
   DefaultProjectConfig -> Nothing
 
 
--- | Get the contents of @.agda-lib@ files in the given project root.
-getAgdaLibFiles' :: FilePath -> LibErrorIO [AgdaLibFile]
-getAgdaLibFiles' path = findProjectConfig' path >>= \case
+-- | Get the content of the @.agda-lib@ file in the given project root.
+getAgdaLibFile :: FilePath -> LibM [AgdaLibFile]
+getAgdaLibFile path = findProjectConfig path >>= \case
   DefaultProjectConfig          -> return []
-  ProjectConfig root libs above ->
+  ProjectConfig root file above -> mkLibM [] $
     map (set libAbove above) <$>
-    parseLibFiles Nothing (map ((0,) . (root </>)) libs)
+    parseLibFiles Nothing [(0, root </> file)]
 
 -- | Get dependencies and include paths for given project root:
 --
@@ -262,10 +315,10 @@ getDefaultLibraries
   :: FilePath  -- ^ Project root.
   -> Bool      -- ^ Use @defaults@ if no @.agda-lib@ file exists for this project?
   -> LibM ([LibName], [FilePath])  -- ^ The returned @LibName@s are all non-empty strings.
-getDefaultLibraries root optDefaultLibs = mkLibM [] $ do
-  libs <- getAgdaLibFiles' root
+getDefaultLibraries root optDefaultLibs = do
+  libs <- getAgdaLibFile root
   if null libs
-    then (,[]) <$> if optDefaultLibs then (libNameForCurrentDir :) <$> readDefaultsFile else return []
+    then (,[]) <$> if optDefaultLibs then mkLibM [] $ (libNameForCurrentDir :) <$> readDefaultsFile else return []
     else return $ libsAndPaths libs
   where
     libsAndPaths ls = ( concatMap _libDepends ls
@@ -282,7 +335,7 @@ readDefaultsFile = do
     let file = agdaDir </> defaultsFile
     ifNotM (liftIO $ doesFileExist file) (return []) $ {-else-} do
       ls <- liftIO $ map snd . stripCommentLines <$> UTF8.readFile file
-      return $ concatMap splitCommas ls
+      return $ map parseLibName $ concatMap splitCommas ls
   `catchIO` \ e -> do
     raiseErrors' [ ReadError e "Failed to read defaults file." ]
     return []
@@ -384,10 +437,9 @@ getExecutablesFile
 getExecutablesFile = do
   agdaDir <- getAgdaAppDir
   let defaults = List1.map (agdaDir </>) defaultExecutableFiles  -- NB: very short list
-  files <- filterM doesFileExist (List1.toList defaults)
-  case files of
-    file : _ -> return $ ExecutablesFile file True
-    []       -> return $ ExecutablesFile (List1.last defaults) False -- doesn't exist, but that's ok
+  findM doesFileExist defaults >>= \case
+    Just file -> return $ ExecutablesFile file True
+    Nothing   -> return $ ExecutablesFile (List1.last defaults) False -- doesn't exist, but that's ok
 
 -- | Return the trusted executables Agda knows about.
 --
@@ -452,7 +504,7 @@ libraryIncludePaths overrideLibFile libs xs0 = mkLibM libs $ do
         return []
       Right file -> embedWriter $ (dot ++) . incs <$> find file [] xs
   where
-    (dots, xs) = List.partition (== libNameForCurrentDir) $ map trim xs0
+    (dots, xs) = List.partition (== libNameForCurrentDir) xs0
     incs       = nubOn id . concatMap _libIncludes
     dot        = [ "." | not $ null dots ]
 
@@ -470,7 +522,7 @@ libraryIncludePaths overrideLibFile libs xs0 = mkLibM libs $ do
           ml <- case findLib x libs of
             [l] -> pure (Just l)
             []  -> Nothing <$ raiseErrors' [LibNotFound file x]
-            ls  -> Nothing <$ raiseErrors' [AmbiguousLib x ls]
+            l1 : l2 : ls  -> Nothing <$ raiseErrors' [AmbiguousLib x $ List2 l1 l2 ls]
           -- If it is found, add its dependencies to work list
           let xs' = foldMap _libDepends ml ++ xs
           mcons ml <$> find file (x : visited) xs'
@@ -501,46 +553,15 @@ findLib' :: (a -> LibName) -> LibName -> [a] -> [a]
 findLib' libName x libs =
   case ls of
     -- Take the first and all exact matches (modulo leading zeros in version numbers).
-    l : ls' -> l : takeWhile (((==) `on` versionMeasure) l) ls'
+    l : ls' -> l : takeWhile (((==) `on` libName) l) ls'
     []      -> []
   where
     -- @LibName@s that match @x@, sorted descendingly.
     -- The unversioned LibName, if any, will come first.
-    ls = List.sortBy (flip compare `on` versionMeasure)
-                     [ l | l <- libs, x `hasMatch` libName l ]
-
+    ls = List.sortBy (flip compare `on` libName) [ l | l <- libs, x `hasMatch` libName l ]
     -- foo > foo-2.2 > foo-2.0.1 > foo-2 > foo-1.0
-    versionMeasure l = (rx, null vs, vs)
-      where
-        VersionView rx vs = versionView (libName l)
 
--- | @x `hasMatch` y@ if @x@ and @y@ have the same @vvBase@ and
+-- | @x `hasMatch` y@ if @x@ and @y@ have the same base and
 --   either @x@ has no version qualifier or the versions also match.
 hasMatch :: LibName -> LibName -> Bool
-hasMatch x y = rx == ry && (vx == vy || null vx)
-  where
-    VersionView rx vx = versionView x
-    VersionView ry vy = versionView y
-
--- | Split a library name into basename and a list of version numbers.
---
---   > versionView "foo-1.2.3"    == VersionView "foo" [1, 2, 3]
---   > versionView "foo-01.002.3" == VersionView "foo" [1, 2, 3]
---
---   Note that because of leading zeros, @versionView@ is not injective.
---   (@unVersionView . versionView@ would produce a normal form.)
-versionView :: LibName -> VersionView
-versionView s =
-  case span (\ c -> isDigit c || c == '.') (reverse s) of
-    (v, '-' : x) | valid vs ->
-      VersionView (reverse x) $ reverse $ map (read . reverse) vs
-      where vs = chopWhen (== '.') v
-            valid [] = False
-            valid vs = not $ any null vs
-    _ -> VersionView s []
-
--- | Print a @VersionView@, inverse of @versionView@ (modulo leading zeros).
-unVersionView :: VersionView -> LibName
-unVersionView = \case
-  VersionView base [] -> base
-  VersionView base vs -> base ++ "-" ++ List.intercalate "." (map show vs)
+hasMatch (LibName rx vx) (LibName ry vy) = rx == ry && (vx == vy || null vx)

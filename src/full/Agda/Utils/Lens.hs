@@ -6,12 +6,13 @@
 module Agda.Utils.Lens
   ( module Agda.Utils.Lens
   , (<&>) -- reexported from Agda.Utils.Functor
+  , (&&&) -- reexported from Control.Arrow
   ) where
 
 import Control.Applicative ( Const(Const), getConst )
+import Control.Arrow       ( (&&&) )
 import Control.Monad.State
 import Control.Monad.Reader
-import Control.Monad.Writer
 
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -55,6 +56,17 @@ set l = over l . const
 over :: Lens' o i -> LensMap o i
 over l f o = runIdentity $ l (Identity . f) o
 
+-- | Build a lens out of an isomorphism.
+iso :: (o -> i) -> (i -> o) -> Lens' o i
+iso get set f = fmap set . f . get
+
+-- | Build a lens from a getter and a setter.
+lens :: LensGet o i -> LensSet o i -> Lens' o i
+lens get set f o = f (get o) <&> \ i -> set i o
+
+-- | Only sound if the lenses are disjoint!
+lensProduct :: Lens' s a -> Lens' s b -> Lens' s (a , b)
+lensProduct l1 l2 = lens ((^. l1) &&& (^. l2)) (\ (a, b) -> set l2 b . set l1 a)
 
 -- * State accessors and modifiers using 'StateT'.
 
@@ -84,15 +96,15 @@ l %= f = modify $ over l f
 infix 4 %==
 -- | Modify a part of the state monadically.
 (%==) :: MonadState o m => Lens' o i -> (i -> m i) -> m ()
-l %== f = put =<< l f =<< get
+l %== f = use l >>= f >>= (l .=)
 
 infix 4 %%=
 -- | Modify a part of the state monadically, and return some result.
 (%%=) :: MonadState o m => Lens' o i -> (i -> m (i, r)) -> m r
 l %%= f = do
-  o <- get
-  (o', r) <- runWriterT $ l (WriterT . f) o
-  put o'
+  i <- use l
+  (i', r) <- f i
+  l .= i'
   return r
 
 -- | Modify a part of the state locally.

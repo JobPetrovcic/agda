@@ -20,7 +20,7 @@ instance NFData ModuleNameHash where
 
 instance HasTag ModuleNameHash where
   type Tag ModuleNameHash = ModuleNameHash
-  tag = Just . id
+  tag = Just
 
 noModuleNameHash :: ModuleNameHash
 noModuleNameHash = ModuleNameHash 0
@@ -37,6 +37,9 @@ data TopLevelModuleName' range = TopLevelModuleName
   { moduleNameRange :: range
   , moduleNameId    :: {-# UNPACK #-} !ModuleNameHash
   , moduleNameParts :: TopLevelModuleNameParts
+  , moduleNameInferred :: !Bool
+      -- ^ Was this module name constructed from a file name
+      --   rather than declared in the file?
   }
   deriving (Show, Generic)
 
@@ -56,5 +59,4 @@ instance Hashable (TopLevelModuleName' range) where
 -- | The 'range' is not forced.
 
 instance NFData (TopLevelModuleName' range) where
-  rnf (TopLevelModuleName _ x y) = rnf (x, y)
-
+  rnf (TopLevelModuleName _ x y _) = rnf (x, y)

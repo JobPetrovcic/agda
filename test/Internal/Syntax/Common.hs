@@ -14,7 +14,7 @@ import Internal.Helpers
 
 instance CoArbitrary Modality
 instance Arbitrary Modality where
-  arbitrary = Modality <$> arbitrary <*> arbitrary <*> arbitrary
+  arbitrary = Modality <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
 
 instance Arbitrary a => Arbitrary (UnderAddition a) where
   arbitrary = UnderAddition <$> arbitrary
@@ -61,14 +61,24 @@ instance Arbitrary Quantity where
   --   , Quantityω <$> arbitrary
   --   ]
 
-instance CoArbitrary Relevance
+instance CoArbitrary Relevance where
+  coarbitrary = \case
+    Relevant{}        -> variant 0
+    Irrelevant{}      -> variant 1
+    ShapeIrrelevant{} -> variant 2
+
 instance Arbitrary Relevance where
-  arbitrary = elements allRelevances
+  arbitrary = elements [ relevant, irrelevant, shapeIrrelevant ]
 
 instance CoArbitrary Cohesion
 instance Arbitrary Cohesion where
   arbitrary = elements $ filter (/= Squash) allCohesions
   -- left division does not respect laws for Squash on the left.
+
+instance CoArbitrary ModalPolarity where
+instance CoArbitrary PolarityModality
+instance Arbitrary PolarityModality where
+  arbitrary = elements [ withStandardLock p | p <- allModalPolarities ]
 
 instance Arbitrary NameId where
   arbitrary = elements [ NameId x (ModuleNameHash y) | x <- [0, 1], y <- [0, 1] ]
@@ -100,8 +110,6 @@ instance (Arbitrary a, Arbitrary b) => Arbitrary (ImportedName' a b) where
     a <- arbitrary
     b <- arbitrary
     elements [ ImportedModule a, ImportedName b ]
-
-deriving instance (Show a, Show b) => Show (Using' a b)
 
 instance (Arbitrary a, Arbitrary b) => Arbitrary (Using' a b) where
   arbitrary = do
@@ -147,10 +155,10 @@ prop_Galois_Relevance_comp :: Prop3 (UnderComposition Relevance)
 prop_Galois_Relevance_comp = isGaloisConnection
 
 prop_left_identity_invcomp_Relevance :: Relevance -> Bool
-prop_left_identity_invcomp_Relevance x = Relevant `inverseComposeRelevance` x == x
+prop_left_identity_invcomp_Relevance x = relevant `inverseComposeRelevance` x == x
 
 prop_right_absorptive_invcomp_Relevance :: Relevance -> Bool
-prop_right_absorptive_invcomp_Relevance x = x `inverseComposeRelevance` Relevant == Relevant
+prop_right_absorptive_invcomp_Relevance x = isRelevant $ x `inverseComposeRelevance` relevant
 
 prop_monoid_Relevance_add :: Property3 (UnderAddition Relevance)
 prop_monoid_Relevance_add = isMonoid

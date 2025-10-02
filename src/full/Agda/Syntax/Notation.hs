@@ -1,4 +1,6 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
+{-# OPTIONS_GHC -Wunused-binds #-}
 
 {-| As a concrete name, a notation is a non-empty list of alternating 'IdPart's and holes.
     In contrast to concrete names, holes can be binders.
@@ -13,16 +15,13 @@
 
 module Agda.Syntax.Notation where
 
-import Prelude hiding (null)
+import Prelude hiding ( null, zip, zipWith )
 
-import Control.Arrow ( (&&&) )
 import Control.DeepSeq
 import Control.Monad
 import Control.Monad.Except
 
 import qualified Data.List as List
-import Data.Set (Set)
-import qualified Data.Set as Set
 
 import GHC.Generics (Generic)
 
@@ -37,8 +36,13 @@ import Agda.Utils.Lens
 import Agda.Utils.List
 import Agda.Utils.List1           ( List1, pattern (:|) )
 import qualified Agda.Utils.List1 as List1
+import Agda.Utils.ListInf         ( pattern (:<) )
+import qualified Agda.Utils.ListInf as ListInf
+import Agda.Utils.Set1            ( Set1 )
+import qualified Agda.Utils.Set1  as Set1
 import Agda.Utils.Null
 import Agda.Utils.Singleton
+import Agda.Utils.Zip
 
 import Agda.Utils.Impossible
 
@@ -122,13 +126,13 @@ mkNotation _ [] = throwError "empty notation is disallowed"
 mkNotation holes ids = do
   unless uniqueHoleNames     $ throwError "syntax must use unique argument names"
   let xs :: Notation = map mkPart ids
+  unless (isExprLinear xs)   $ throwError "syntax must use holes exactly once"
+  unless (isLambdaLinear xs) $ throwError "syntax must use binding holes exactly once"
   unless (noAdjacentHoles xs)  $ throwError $ concat
      [ "syntax must not contain adjacent holes ("
      , prettyHoles
      , ")"
      ]
-  unless (isExprLinear xs)   $ throwError "syntax must use holes exactly once"
-  unless (isLambdaLinear xs) $ throwError "syntax must use binding holes exactly once"
   -- Andreas, 2018-10-18, issue #3285:
   -- syntax that is just a single hole is ill-formed and crashes the operator parser
   when   (isSingleHole xs)   $ throwError "syntax cannot be a single hole"
@@ -223,7 +227,7 @@ mkNotation holes ids = do
                    _          -> False)
         where
         noAdj []       = __IMPOSSIBLE__
-        noAdj [x]      = True
+        noAdj [_]      = True
         noAdj (x:y:xs) =
           not (isAHole x && isAHole y) &&
           noAdj (y:xs)
@@ -237,11 +241,10 @@ mkNotation holes ids = do
 -- | All the notation information related to a name.
 data NewNotation = NewNotation
   { notaName  :: QName
-  , notaNames :: Set A.Name
+  , notaNames :: Set1 A.Name
     -- ^ The names the syntax and/or fixity belong to.
     --
-    -- Invariant: The set is non-empty. Every name in the list matches
-    -- 'notaName'.
+    -- Invariant: Every name in the list matches 'notaName'.
   , notaFixity :: Fixity
     -- ^ Associativity and precedence (fixity) of the names.
   , notation :: Notation
@@ -259,7 +262,7 @@ instance LensFixity NewNotation where
 namesToNotation :: QName -> A.Name -> NewNotation
 namesToNotation q n = NewNotation
   { notaName       = q
-  , notaNames      = Set.singleton n
+  , notaNames      = singleton n
   , notaFixity     = f
   , notation       = if null syn then syntaxOf (unqualify q) else syn
   , notaIsOperator = null syn
@@ -278,7 +281,7 @@ useDefaultFixity n
 --   @M.for x ∈ xs return e@, or @x ℕ.+ y@.
 notationNames :: NewNotation -> [QName]
 notationNames (NewNotation q _ _ parts _) =
-  zipWith ($) (reQualify : repeat QName) [simpleName $ rangedThing x | IdPart x <- parts ]
+  zipWith ($) (reQualify :< ListInf.repeat QName) [ simpleName $ rangedThing x | IdPart x <- parts ]
   where
     -- The qualification of @q@.
     modules     = List1.init (qnameParts q)
@@ -298,7 +301,7 @@ syntaxOf y
     -- numbering the holes from left to right.
     -- Result will have no 'BindingHole's.
     mkSyn :: Int -> [NamePart] -> Notation
-    mkSyn n []          = []
+    mkSyn _ []          = []
     mkSyn n (Hole : xs) = HolePart noRange (defaultNamedArg $ unranged n) : mkSyn (1 + n) xs
     mkSyn n (Id x : xs) = IdPart (unranged x) : mkSyn n xs
 
@@ -321,10 +324,12 @@ syntaxOf y
 --
 -- Postcondition: No 'A.Name' occurs in more than one list element.
 mergeNotations :: List1 NewNotation -> List1 NewNotation
-mergeNotations =
+mergeNotations ns@(_ :| []) = ns
+mergeNotations ns =
   fmap merge
   . List1.concatMap1 groupIfLevelsMatch
   . List1.groupOn1 (notation &&& notaIsOperator)
+  $ ns
   where
   groupIfLevelsMatch :: List1 NewNotation -> List1 (List1 NewNotation)
   groupIfLevelsMatch ns =
@@ -360,7 +365,7 @@ mergeNotations =
         _                                          -> NonAssoc
 
   merge :: List1 NewNotation -> NewNotation
-  merge (n :| ns) = n { notaNames = Set.unions $ map notaNames $ n:ns }
+  merge ns@(n :| _) = n { notaNames = Set1.unions $ fmap notaNames ns }
 
 -- | Check if a notation contains any lambdas (in which case it cannot be used in a pattern).
 isLambdaNotation :: NewNotation -> Bool

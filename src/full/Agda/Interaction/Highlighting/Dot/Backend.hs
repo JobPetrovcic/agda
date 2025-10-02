@@ -4,6 +4,8 @@ module Agda.Interaction.Highlighting.Dot.Backend
   ( dotBackend
   ) where
 
+import Prelude hiding (null)
+
 import Agda.Interaction.Highlighting.Dot.Base (renderDotToFile)
 
 import Control.Monad.Except
@@ -27,10 +29,10 @@ import qualified Data.Text.Lazy as L
 
 import GHC.Generics (Generic)
 
-import Agda.Compiler.Backend (Backend(..), Backend'(..), Definition, Recompile(..))
+import Agda.Compiler.Backend (Backend,Backend_boot(..), Backend',Backend'_boot(..), Definition, Recompile(..))
 import Agda.Compiler.Common (curIF, IsMain)
 
-import Agda.Interaction.FindFile (findFile, srcFilePath)
+import Agda.Interaction.FindFile (findFile)
 import Agda.Interaction.Library
 import Agda.Interaction.Options
   ( ArgDescr(ReqArg)
@@ -38,6 +40,7 @@ import Agda.Interaction.Options
   , OptDescr(..)
   )
 
+import Agda.Syntax.Common.Pretty ( prettyShow )
 import Agda.Syntax.TopLevelModuleName (TopLevelModuleName)
 
 import Agda.TypeChecking.Monad
@@ -45,22 +48,23 @@ import Agda.TypeChecking.Monad
   , MonadTCError
   , ReadTCState
   , MonadTCM(..)
-  , genericError
+  , internalError
   , reportSDoc
   , getAgdaLibFiles
+  , srcFilePath
   )
 import Agda.TypeChecking.Pretty
 
 import Agda.Utils.Graph.AdjacencyMap.Unidirectional
   (Graph, WithUniqueInt)
 import qualified Agda.Utils.Graph.AdjacencyMap.Unidirectional as Graph
-import Agda.Syntax.Common.Pretty ( prettyShow )
+import Agda.Utils.Null
 
 -- ------------------------------------------------------------------------
 
 data DotFlags = DotFlags
   { dotFlagDestination :: Maybe FilePath
-  , dotFlagLibraries   :: Maybe (HashSet String)
+  , dotFlagLibraries   :: HashSet LibName
     -- ^ Only include modules from the given libraries.
   } deriving (Eq, Generic)
 
@@ -69,7 +73,7 @@ instance NFData DotFlags
 defaultDotFlags :: DotFlags
 defaultDotFlags = DotFlags
   { dotFlagDestination = Nothing
-  , dotFlagLibraries   = Nothing
+  , dotFlagLibraries   = empty
   }
 
 dotFlagsDescriptions :: [OptDescr (Flag DotFlags)]
@@ -85,17 +89,15 @@ dependencyGraphFlag :: FilePath -> Flag DotFlags
 dependencyGraphFlag f o = return $ o { dotFlagDestination = Just f }
 
 includeFlag :: String -> Flag DotFlags
-includeFlag l o = return $
-  o { dotFlagLibraries =
-        case dotFlagLibraries o of
-          Nothing -> Just (HashSet.singleton l)
-          Just s  -> Just (HashSet.insert l s)
+includeFlag s o = return $
+  o { dotFlagLibraries = HashSet.insert (parseLibName s) $ dotFlagLibraries o
     }
 
 data DotCompileEnv = DotCompileEnv
   { dotCompileEnvDestination :: FilePath
-  , dotCompileEnvLibraries   :: Maybe (HashSet String)
-    -- ^ Only include modules from the given libraries.
+  , dotCompileEnvLibraries   :: HashSet LibName
+      -- ^ Only include modules from the given libraries.
+      --   If the set is empty, include all libraries.
   }
 
 -- Currently unused
@@ -121,18 +123,20 @@ dotBackend' = Backend'
   , options               = defaultDotFlags
   , commandLineFlags      = dotFlagsDescriptions
   , isEnabled             = isJust . dotFlagDestination
-  , preCompile            = asTCErrors . preCompileDot
+  , preCompile            = asInternalErrors . preCompileDot
   , preModule             = preModuleDot
   , compileDef            = compileDefDot
   , postModule            = postModuleDot
   , postCompile           = postCompileDot
   , scopeCheckingSuffices = True
   , mayEraseType          = const $ return True
+  , backendInteractTop    = Nothing
+  , backendInteractHole   = Nothing
   }
 
 -- | Convert a general "MonadError String m" into "MonadTCError m".
-asTCErrors :: MonadTCError m => ExceptT String m b -> m b
-asTCErrors t = either genericError return =<< runExceptT t
+asInternalErrors :: (MonadTCError m) => ExceptT String m b -> m b
+asInternalErrors t = either internalError return =<< runExceptT t
 
 preCompileDot
   :: MonadError String m
@@ -145,6 +149,7 @@ preCompileDot d = case dotFlagDestination d of
     }
   Nothing ->
     throwError "The Dot backend was invoked without being enabled!"
+      -- Andreas, 2024-08-03: I suppose this counts as internal error.
 
 preModuleDot
   :: Applicative m
@@ -175,18 +180,20 @@ postModuleDot
 postModuleDot cenv DotModuleEnv _main m _defs = do
   i <- curIF
   let importedModuleNames = Set.fromList $ fst <$> (iImportedModules i)
-  include <- case dotCompileEnvLibraries cenv of
-    Nothing -> return True
-    Just ls -> liftTCM $ do
-      f    <- findFile m
-      libs <- getAgdaLibFiles (srcFilePath f) m
+  let ls = dotCompileEnvLibraries cenv
+  include <- case null ls of
+    True  -> return True
+    False -> liftTCM do
+      sf   <- findFile m
+      f    <- srcFilePath sf
+      libs <- getAgdaLibFiles f m
 
       let incLibs = filter (\l -> _libName l `HashSet.member` ls) libs
           inLib   = not (null incLibs)
 
       reportSDoc "dot.include" 10 $ do
         let name = pretty m
-            list = nest 2 . vcat . map (text . _libName)
+            list = nest 2 . vcat . map (pretty . _libName)
         if inLib then
           fsep
             ([ "Including"

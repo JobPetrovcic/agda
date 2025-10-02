@@ -1,10 +1,14 @@
+InstanceErrorMessageMultiple.agda:32.16-17: error: [UnsolvedConstraints]
 Failed to solve the following constraints:
   Resolve instance argument _r_30 : Semiring Nat
   Candidates
     ringNat′ : Semiring Nat
     ringNat : Semiring Nat
     (stuck)
+      [ at InstanceErrorMessageMultiple.agda:32.16-17 ]
   (_r_30 Semiring.+ a) c = c +N a : Nat (blocked on _r_30)
+
+InstanceErrorMessageMultiple.agda:32.16-26: error: [UnsolvedMetaVariables]
 Unsolved metas at the following locations:
-  InstanceErrorMessageMultiple.agda:32,16-17
-  InstanceErrorMessageMultiple.agda:32,22-26
+  InstanceErrorMessageMultiple.agda:32.16-17
+  InstanceErrorMessageMultiple.agda:32.22-26

@@ -7,6 +7,8 @@ module Agda.Syntax.Parser.Tokens
     , Symbol(..)
     ) where
 
+import Data.Functor (void)
+
 import Agda.Syntax.Literal (RLiteral)
 import Agda.Syntax.Position
 
@@ -24,7 +26,7 @@ data Keyword
         | KwOpaque | KwUnfolding
         | KwOPTIONS | KwBUILTIN | KwLINE
         | KwFOREIGN | KwCOMPILE
-        | KwIMPOSSIBLE | KwSTATIC | KwINJECTIVE | KwINLINE | KwNOINLINE
+        | KwIMPOSSIBLE | KwSTATIC | KwINJECTIVE | KwINJECTIVE_FOR_INFERENCE | KwINLINE | KwNOINLINE
         | KwETA
         | KwNO_TERMINATION_CHECK | KwTERMINATING | KwNON_TERMINATING
         | KwNOT_PROJECTION_LIKE
@@ -32,6 +34,7 @@ data Keyword
         | KwWARNING_ON_USAGE | KwWARNING_ON_IMPORT
         | KwMEASURE | KwDISPLAY
         | KwREWRITE
+        | KwOVERLAPPABLE | KwOVERLAPPING | KwOVERLAPS | KwINCOHERENT
         | KwQuote | KwQuoteTerm
         | KwUnquote | KwUnquoteDecl | KwUnquoteDef
         | KwSyntax
@@ -111,3 +114,6 @@ instance HasRange Token where
   getRange (TokComment (i, _)) = getRange i
   getRange TokDummy            = noRange
   getRange (TokEOF i)          = getRange i
+
+instance HasRangeWithoutFile Token where
+  getRangeWithoutFile = void . getRange

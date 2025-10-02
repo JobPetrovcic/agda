@@ -7,20 +7,16 @@
 
 module Agda.Termination.Monad where
 
-import Prelude hiding (null)
+import Prelude hiding (null, zip, zipWith)
 
 import Control.Applicative hiding (empty)
 
-import qualified Control.Monad.Fail as Fail
-
-import Control.Monad          ( forM )
 import Control.Monad.IO.Class ( MonadIO(..) )
-import Control.Monad.Except
-import Control.Monad.Reader
+import Control.Monad.Except   ( MonadError(..) )
+import Control.Monad.Reader   ( MonadReader(..), ReaderT(..) )
 
 import Data.DList (DList)
 import qualified Data.DList as DL
-import Data.Semigroup ( Semigroup(..) )
 import Data.Set (Set)
 import qualified Data.Set as Set
 
@@ -47,14 +43,18 @@ import Agda.Utils.Function
 import Agda.Utils.Functor
 import Agda.Utils.Lens
 import Agda.Utils.List   ( hasElem )
+import Agda.Utils.ListInf ( ListInf )
+import Agda.Utils.ListInf qualified as ListInf
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Monoid
 import Agda.Utils.Null
 import Agda.Syntax.Common.Pretty (Pretty, prettyShow)
+import Agda.Utils.Singleton
 import qualified Agda.Syntax.Common.Pretty as P
 import Agda.Utils.VarSet (VarSet)
 import qualified Agda.Utils.VarSet as VarSet
+import Agda.Utils.Zip
 
 import Agda.Utils.Impossible
 
@@ -105,7 +105,7 @@ data TerEnv = TerEnv
   , terTarget  :: Target
     -- ^ Target type of the function we are currently termination checking.
     --   Only the constructors of 'Target' are considered guarding.
-  , terMaskArgs :: [Bool]
+  , terMaskArgs :: ListInf Bool
     -- ^ Only consider the 'notMasked' 'False' arguments for establishing termination.
     --   See issue #1023.
   , terMaskResult :: Bool
@@ -154,14 +154,14 @@ defaultTerEnv = TerEnv
   , terCurrent                  = __IMPOSSIBLE__ -- needs to be set!
   , terHaveInlinedWith          = False
   , terTarget                   = TargetOther
-  , terMaskArgs                 = repeat False   -- use all arguments (mask none)
+  , terMaskArgs                 = ListInf.repeat False   -- use all arguments (mask none)
   , terMaskResult               = False          -- use result (do not mask)
   , _terSizeDepth               = __IMPOSSIBLE__ -- needs to be set!
   , terPatterns                 = __IMPOSSIBLE__ -- needs to be set!
   , terPatternsRaise            = 0
   , terGuarded                  = le -- not initially guarded
   , terUseSizeLt                = False -- initially, not under data constructor
-  , terUsableVars               = VarSet.empty
+  , terUsableVars               = empty
   }
 
 -- | Termination monad service class.
@@ -179,7 +179,6 @@ newtype TerM a = TerM { terM :: ReaderT TerEnv TCM a }
   deriving ( Functor
            , Applicative
            , Monad
-           , Fail.MonadFail
            , MonadError TCErr
            , MonadStatistics
            , HasOptions
@@ -293,10 +292,10 @@ terGetHaveInlinedWith = terAsks terHaveInlinedWith
 terSetHaveInlinedWith :: TerM a -> TerM a
 terSetHaveInlinedWith = terLocal $ \ e -> e { terHaveInlinedWith = True }
 
-terGetMaskArgs :: TerM [Bool]
+terGetMaskArgs :: TerM (ListInf Bool)
 terGetMaskArgs = terAsks terMaskArgs
 
-terSetMaskArgs :: [Bool] -> TerM a -> TerM a
+terSetMaskArgs :: ListInf Bool -> TerM a -> TerM a
 terSetMaskArgs b = terLocal $ \ e -> e { terMaskArgs = b }
 
 terGetMaskResult :: TerM Bool
@@ -363,7 +362,7 @@ withUsableVars pats m = do
   reportSLn "term.size" 70 $ "usableSizeVars = " ++ show vars
   reportSDoc "term.size" 20 $ if null vars then "no usuable size vars" else
     "the size variables amoung these variables are usable: " <+>
-      sep (map (prettyTCM . var) $ VarSet.toList vars)
+      sep (map (prettyTCM . var) $ VarSet.toAscList vars)
   terSetUsableVars vars $ m
 
 -- | Set 'terUseSizeLt' when going under constructor @c@.
@@ -427,11 +426,11 @@ isCoinductiveProjection mustBeRecursive q = liftTCM $ do
       Just Projection{ projProper = Just{}, projFromType = Arg _ r, projIndex = n } ->
         caseMaybeM (isRecord r) __IMPOSSIBLE__ $ \ rdef -> do
           -- no for inductive or non-recursive record
-          if recInduction rdef /= Just CoInductive then return False else do
+          if _recInduction rdef /= Just CoInductive then return False else do
             reportSLn "term.guardedness" 40 $ prettyShow q ++ " is coinductive; record type is " ++ prettyShow r
             if not mustBeRecursive then return True else do
               reportSLn "term.guardedness" 40 $ prettyShow q ++ " must be recursive"
-              if not (safeRecRecursive rdef) then return False else do
+              if notSafeRecRecursive rdef then return False else do
                 reportSLn "term.guardedness" 40 $ prettyShow q ++ " has been declared recursive, doing actual check now..."
                 -- TODO: the following test for recursiveness of a projection should be cached.
                 -- E.g., it could be stored in the @Projection@ component.
@@ -439,7 +438,7 @@ isCoinductiveProjection mustBeRecursive q = liftTCM $ do
                 -- Get the type of the field by dropping record parameters and record argument.
                 let TelV tel core = telView' (defType pdef)
                     (pars, tel') = splitAt n $ telToList tel
-                    mut = fromMaybe __IMPOSSIBLE__ $ recMutual rdef
+                    mut = fromMaybe __IMPOSSIBLE__ $ _recMutual rdef
                 -- Check if any recursive symbols appear in the record type.
                 -- Q (2014-07-01): Should we normalize the type?
                 -- A (2017-01-13): Yes, since we also normalize during positivity check?
@@ -476,9 +475,9 @@ isCoinductiveProjection mustBeRecursive q = liftTCM $ do
   -- that has not happened.  To avoid crashing (as in Agda 2.5.3),
   -- we rather give the possibly wrong answer here,
   -- restoring the behavior of Agda 2.5.2.  TODO: fix record declaration checking.
-  safeRecRecursive :: Defn -> Bool
-  safeRecRecursive (Record { recMutual = Just qs }) = not $ null qs
-  safeRecRecursive _ = False
+  notSafeRecRecursive :: RecordData -> Bool
+  notSafeRecRecursive = maybe True null . _recMutual
+    -- @_recMutual@ should be something (@Just (_:_)@) to be safe
 
 -- * De Bruijn pattern stuff
 
@@ -507,7 +506,7 @@ class UsableSizeVars a where
 
 instance UsableSizeVars DeBruijnPattern where
   usableSizeVars = foldrPattern $ \case
-    VarP _ x   -> const $ ifM terGetUseSizeLt (return $ VarSet.singleton $ dbPatVarIndex x) $
+    VarP _ x   -> const $ ifM terGetUseSizeLt (return $ singleton $ dbPatVarIndex x) $
                    {-else-} return mempty
     ConP c _ _ -> conUseSizeLt $ conName c
     LitP{}     -> none
@@ -526,7 +525,7 @@ instance UsableSizeVars [DeBruijnPattern] where
 
 instance UsableSizeVars (Masked DeBruijnPattern) where
   usableSizeVars (Masked m p) = (`foldrPattern` p) $ \case
-    VarP _ x   -> const $ ifM terGetUseSizeLt (return $ VarSet.singleton $ dbPatVarIndex x) $
+    VarP _ x   -> const $ ifM terGetUseSizeLt (return $ singleton $ dbPatVarIndex x) $
                    {-else-} return mempty
     ConP c _ _ -> if m then none else conUseSizeLt $ conName c
     LitP{}     -> none

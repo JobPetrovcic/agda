@@ -8,9 +8,9 @@ module Agda.Compiler.Treeless.Erase
        , isErasable
        ) where
 
-import Control.Arrow (first, second)
-import Control.Monad
-import Control.Monad.State
+import Control.Arrow       ( first, second )
+import Control.Monad.State ( StateT, evalStateT )
+
 import Data.Map (Map)
 import qualified Data.Map as Map
 
@@ -26,7 +26,6 @@ import Agda.TypeChecking.Datatypes
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Primitive
 
-import {-# SOURCE #-} Agda.Compiler.Backend
 import Agda.Compiler.Treeless.Subst
 import Agda.Compiler.Treeless.Unused
 
@@ -305,11 +304,6 @@ getFunInfo q = memo (funMap . key q) $ getInfo q
 
 isErasable :: QName -> TCM Bool
 isErasable qn =
-  -- The active backend should be set
-  caseMaybeM (viewTC eActiveBackendName) __IMPOSSIBLE__ $ \ bname ->
-  -- However it may not be part of the set of available backends
-  -- in which case we default to not erasable to avoid false negatives.
-  caseMaybeM (lookupBackend bname)       (pure False)   $ \ _ ->
   erasable . snd <$> runE (getFunInfo qn)
 
 telListView :: Type -> TCM (ListTel, Type)
@@ -350,7 +344,6 @@ getTypeInfo t0 = do
   typeInfo :: QName -> E TypeInfo
   typeInfo q = ifM (erasureForbidden q) (return NotErasable) $ {-else-} do
     memoRec (typeMap . key q) Erasable $ do  -- assume recursive occurrences are erasable
-      mId    <- lift $ getName' builtinId
       msizes <- lift $ mapM getBuiltinName
                          [builtinSize, builtinSizeLt]
       def    <- lift $ getConstInfo q
@@ -359,7 +352,6 @@ getTypeInfo t0 = do
                   I.Record{ recConHead = c }  -> Just [conName c]
                   _                           -> Nothing
       case mcs of
-        _ | Just q == mId        -> return NotErasable
         _ | Just q `elem` msizes -> return Erasable
         Just [c] -> do
           (ts, _) <- lift $ typeWithoutParams c

@@ -36,6 +36,7 @@ import Agda.Syntax.Internal.Defs
 import Agda.Syntax.Common.Pretty  (prettyShow)
 
 import Agda.TypeChecking.Monad
+import Agda.TypeChecking.CompiledClause
 
 import Agda.Utils.Impossible
 
@@ -100,7 +101,8 @@ markNonRecursive :: QName -> TCM ()
 markNonRecursive q = modifySignature $ updateDefinition q $ updateTheDef $ \case
   def@Function{} -> def
    { funTerminates = Just True
-   , funClauses    = map (\ cl -> cl { clauseRecursive = Just False }) $ funClauses def
+   , funClauses    = map (\ cl -> cl { clauseRecursive = NotRecursive }) $ funClauses def
+   , funCompiled   = fmap (mapDone \ done -> done{ ccClauseRecursive = NotRecursive }) $ funCompiled def
    }
   def@Record{} -> def
    { recTerminates = Just True
@@ -113,7 +115,8 @@ markRecursive
   -> QName -> TCM ()
 markRecursive f q = modifySignature $ updateDefinition q $ updateTheDef $ \case
   def@Function{} -> def
-   { funClauses    = zipWith (\ i cl -> cl { clauseRecursive = Just (f i) }) [0..] $ funClauses def
+   { funClauses    = zipWith (\ i cl -> cl { clauseRecursive = decideRecursive (f i) }) [0..] $ funClauses def
+   , funCompiled   = fmap (mapDone \ done@CCDone{ ccClauseNumber = i } -> done{ ccClauseRecursive = decideRecursive (f i) }) $ funCompiled def
    }
   def -> def
 
@@ -136,8 +139,14 @@ recDef include name = do
           (i,) <$> anyDefs include cl
       return (IntMap.fromList perClause, mconcat $ map snd perClause)
 
-    Record{ recTel } -> do
-      ns <- anyDefs include recTel
+    Datatype{ dataClause = Just cl } -> do
+      ns <- anyDefs include cl
+      return (IntMap.singleton 0 ns, ns)
+
+    Record{ recClause, recTel } -> do
+      ns1 <- anyDefs include recClause
+      ns2 <- anyDefs include recTel
+      let ns = ns1 `mappend` ns2
       return (IntMap.singleton 0 ns, ns)
 
     _ -> return (mempty, mempty)
@@ -163,7 +172,6 @@ anyDefs include a = do
   where
   -- TODO: Is it bad to ignore the lambdas?
   inst (InstV i)                      = instBody i
-  inst Open                           = __IMPOSSIBLE__
-  inst OpenInstance                   = __IMPOSSIBLE__
+  inst OpenMeta{}                     = __IMPOSSIBLE__
   inst BlockedConst{}                 = __IMPOSSIBLE__
   inst PostponedTypeCheckingProblem{} = __IMPOSSIBLE__

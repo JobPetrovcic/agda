@@ -1,4 +1,3 @@
-{-# LANGUAGE DoAndIfThenElse   #-}
 
 module Succeed.Tests where
 
@@ -38,6 +37,56 @@ tests = do
   -- -- Andreas, 2020-10-19, work around issue #4940:
   -- -- Put @ExecAgda@ last.
   -- reorder = uncurry (++) . List.partition (not . ("ExecAgda" `List.isInfixOf`))
+
+-- | Filtering out succed-tests that require Agda built with -fdebug.
+
+fdebugTestFilter :: [RegexFilter]
+fdebugTestFilter =
+-- This list was crafted using
+--    grep -RP '(?<!-- ){-# OPTIONS.* -v' | grep Succeed/
+--  and screening the results (e.g. for comments)
+  [ disable "Succeed/Issue1809"
+  , disable "Succeed/Issue5730"
+  , disable "Succeed/Issue1701II"
+  , disable "Succeed/Issue1407"
+  , disable "Succeed/ForcedConstructorPattern"
+  , disable "Succeed/Issue2292"
+  , disable "Succeed/Issue4016"
+  , disable "Succeed/Issue2434"
+  , disable "Succeed/NotProjectionLike"
+  , disable "Succeed/Issue5989"
+  , disable "Succeed/Issue2717"
+  , disable "Succeed/Issue7286"
+  , disable "Succeed/Issue778b"
+  , disable "Succeed/Issue1597/Main2"
+  , disable "Succeed/RepeatedCase"
+  , disable "Succeed/Issue6298-d"
+  , disable "Succeed/Issue1770"
+  , disable "Succeed/Issue578"
+  , disable "Succeed/Issue2300"
+  , disable "Succeed/Issue882a"
+  , disable "Succeed/Issue1009"
+  , disable "Succeed/Issue3933"
+  , disable "Succeed/Issue3933"
+  , disable "Succeed/Issue5506"
+  , disable "Succeed/Issue1595"
+  , disable "Succeed/Issue365"
+  , disable "Succeed/Issue1914"
+  , disable "Succeed/Issue2257b"
+  , disable "Succeed/Issue1344"
+  , disable "Succeed/Issue4148"
+  , disable "Succeed/CheckIApplyConfluenceOnlyWhenCubical"
+  , disable "Succeed/OpaqueImport/C"
+  , disable "Succeed/OpaqueImport/B"
+  , disable "Succeed/OpaqueImport/A"
+  , disable "Succeed/Issue2223-constraints-in-frontmatter"
+  , disable "Succeed/Issue4211"
+  , disable "Succeed/Issue4211"
+  , disable "Succeed/Issue3971"
+  , disable "Succeed/Issue1740"
+  , disable "Succeed/Issue4020"
+  ]
+  where disable = RFInclude
 
 -- | Tests that get special preparation from the Makefile.
 makefileDependentTests :: [RegexFilter]
@@ -82,13 +131,13 @@ mkSucceedTest extraOpts dir agdaFile =
 
   updGolden = Just $ writeTextFile warnFile
 
-  doRun = do
+  doRun = withSystemTempDirectory testName \ compDir -> do
 
     let agdaArgs = [ "-v0", "-i" ++ dir, "-itest/", agdaFile
                    , "-vimpossible:10" -- BEWARE: no spaces allowed here
                    , "-vwarning:1"
                    , "--double-check"
-                   -- , "--ghc-flag=-outputdir=ghc-" ++ testName
+                   , "--ghc-flag=-outputdir=" ++ compDir
                    -- , "-vcompile.cmd:1"
                    ] ++
                    [ if testName == "Issue481"

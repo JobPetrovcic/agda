@@ -35,7 +35,7 @@ Some other tricks that improves performance:
 module Agda.TypeChecking.Reduce.Fast
   ( fastReduce, fastNormalise ) where
 
-import Prelude hiding ((!!))
+import Prelude hiding ((!!), null)
 
 import Control.Applicative hiding (empty)
 import Control.Monad.ST
@@ -47,7 +47,6 @@ import qualified Data.Map as Map
 import qualified Data.Map.Strict as MapS
 import qualified Data.IntSet as IntSet
 import qualified Data.List as List
-import Data.Semigroup ((<>))
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -75,12 +74,13 @@ import Agda.Utils.Lens
 import Agda.Utils.List
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
-import Agda.Utils.Null (empty)
+import Agda.Utils.Null (empty, null)
 import Agda.Utils.Functor
 import Agda.Syntax.Common.Pretty
 import Agda.Utils.Size
 import Agda.Utils.Zipper
 import qualified Agda.Utils.SmallSet as SmallSet
+import qualified Agda.Utils.VarSet as VarSet
 
 import Agda.Utils.Impossible
 
@@ -92,8 +92,7 @@ import Debug.Trace
 -- information needed for fast reduction from the definition.
 
 data CompactDef =
-  CompactDef { cdefNonterminating :: Bool
-             , cdefUnconfirmed    :: Bool
+  CompactDef { cdefUnconfirmed    :: Bool
              , cdefDef            :: CompactDefn
              , cdefRewriteRules   :: RewriteRules
              }
@@ -119,9 +118,7 @@ compactDef bEnv def rewr = do
 
   -- WARNING: don't use isPropM here because it relies on reduction,
   -- which causes an infinite loop.
-  let isPrp = case getSort (defType def) of
-        Prop{} -> True
-        _      -> False
+  let isPrp = isProp $ getSort $ defType def
 
   shouldReduce <- shouldReduceDef (defName def)
   allowed <- asksTC envAllowedReductions
@@ -142,7 +139,7 @@ compactDef bEnv def rewr = do
             ]
           ]
         , not (defNonterminating def) || SmallSet.member NonTerminatingReductions allowed
-        , not (defTerminationUnconfirmed def) || SmallSet.member UnconfirmedReductions allowed
+        -- , not (defTerminationUnconfirmed def) || SmallSet.member UnconfirmedReductions allowed
         , not isPrp
         , not (isIrrelevant def)
         ]
@@ -326,8 +323,7 @@ compactDef bEnv def rewr = do
           charRel _ _ = __IMPOSSIBLE__
 
   return $
-    CompactDef { cdefNonterminating = defNonterminating def
-               , cdefUnconfirmed    = defTerminationUnconfirmed def
+    CompactDef { cdefUnconfirmed    = defTerminationUnconfirmed def
                , cdefDef            = cdefn
                , cdefRewriteRules   = if allowReduce then rewr else []
                }
@@ -344,10 +340,10 @@ data FastCase c = FBranches
   , fsucBranch      :: Maybe c
   , flitBranches    :: Map Literal c
     -- ^ Map from literal to case subtree.
-  , fcatchAllBranch :: Maybe c
+  , fcatchallBranch :: Maybe c
     -- ^ (Possibly additional) catch-all clause.
   , ffallThrough    :: Bool
-    -- ^ (if True) In case of non-canonical argument use catchAllBranch.
+    -- ^ (if True) In case of non-canonical argument use catchallBranch.
   }
 
 --UNUSED Liang-Ting Chen 2019-07-16
@@ -356,7 +352,7 @@ data FastCase c = FBranches
 --                      , fconBranches    = Map.empty
 --                      , fsucBranch      = Nothing
 --                      , flitBranches    = Map.empty
---                      , fcatchAllBranch = Nothing
+--                      , fcatchallBranch = Nothing
 --                      , ffallThrough    = False }
 
 -- | Case tree with bodies.
@@ -370,11 +366,13 @@ data FastCompiledClauses
   | FEta Int [Arg QName] FastCompiledClauses (Maybe FastCompiledClauses)
     -- ^ Match on record constructor. Can still have a catch-all though. Just
     --   contains the fields, not the actual constructor.
-  | FDone [Arg ArgName] Term
-    -- ^ @Done xs b@ stands for the body @b@ where the @xs@ contains hiding
+  | FDone (CCDone Term)
+    -- ^ See 'Done'.
+    --   @FDone (CCDone _ mr xs b)@ stands for the body @b@ where the @xs@ contains hiding
     --   and name suggestions for the free variables. This is needed to build
     --   lambdas on the right hand side for partial applications which can
     --   still reduce.
+    --   @mr@ indicates whether this leaf containts recursive mutually recursive calls.
   | FFail
     -- ^ Absurd case.
 
@@ -382,8 +380,8 @@ fastCompiledClauses :: BuiltinEnv -> CompiledClauses -> FastCompiledClauses
 fastCompiledClauses bEnv cc =
   case cc of
     Fail{}            -> FFail
-    Done xs b         -> FDone xs b
-    Case (Arg _ n) Branches{ etaBranch = Just (c, cc), catchAllBranch = ca } ->
+    Done_ done        -> FDone done
+    Case (Arg _ n) Branches{ etaBranch = Just (c, cc), catchallBranch = ca } ->
       FEta n (conFields c) (fastCompiledClauses bEnv $ content cc) (fastCompiledClauses bEnv <$> ca)
     Case (Arg _ n) bs -> FCase n (fastCase bEnv bs)
 
@@ -394,8 +392,8 @@ fastCase env (Branches proj con _ lit wild fT _) =
     , fconBranches    = Map.mapKeysMonotonic (nameId . qnameName) $ fmap (fastCompiledClauses env . content) (stripSuc con)
     , fsucBranch      = fmap (fastCompiledClauses env . content) $ flip Map.lookup con . conName =<< bSuc env
     , flitBranches    = fmap (fastCompiledClauses env) lit
-    , ffallThrough    = (Just True ==) fT
-    , fcatchAllBranch = fmap (fastCompiledClauses env) wild }
+    , ffallThrough    = Just True == fT
+    , fcatchallBranch = fmap (fastCompiledClauses env) wild }
   where
     stripSuc | Just c <- bSuc env = Map.delete (conName c)
              | otherwise          = id
@@ -458,7 +456,6 @@ fastReduce' norm v = do
 
       bEnv = BuiltinEnv { bZero = zero, bSuc = suc, bTrue = true, bFalse = false, bRefl = refl,
                           bPrimForce = force, bPrimErase = erase }
-  allowedReductions <- asksTC envAllowedReductions
   rwr <- optRewriting <$> pragmaOptions
   constInfo <- unKleisli $ \f -> do
     info <- getConstInfo f
@@ -466,9 +463,6 @@ fastReduce' norm v = do
                    else return []
     compactDef bEnv info rewr
   ReduceM $ \ redEnv -> reduceTm redEnv bEnv (memoQName constInfo) norm v
-
-unKleisli :: (a -> ReduceM b) -> ReduceM (a -> b)
-unKleisli f = ReduceM $ \ env x -> unReduceM (f x) env
 
 -- * Closures
 
@@ -603,19 +597,19 @@ data AM s = Eval (Closure s) !(ControlStack s)
             --   instance, long chains of 'suc' constructors.
           | Match QName FastCompiledClauses (Spine s) (MatchStack s) (ControlStack s)
             -- ^ @Match f cc spine stack ctrl@ Match the arguments @spine@ against the case tree
-            --   @cc@. The match stack contains a (possibly empty) list of 'CatchAll' frames and a
+            --   @cc@. The match stack contains a (possibly empty) list of 'Catchall' frames and a
             --   closure to return in case of a stuck match.
 
 -- | The control stack contains a list of continuations, i.e. what to do with
 --   the result of the current focus.
 type ControlStack s = [ControlFrame s]
 
--- | The control stack for matching. Contains a list of CatchAllFrame's and the closure to return in
+-- | The control stack for matching. Contains a list of CatchallFrame's and the closure to return in
 --   case of a stuck match.
-data MatchStack s = [CatchAllFrame s] :> Closure s
+data MatchStack s = [CatchallFrame s] :> Closure s
 infixr 2 :>, >:
 
-(>:) :: CatchAllFrame s -> MatchStack s -> MatchStack s
+(>:) :: CatchallFrame s -> MatchStack s -> MatchStack s
 (>:) c (cs :> cl) = c : cs :> cl
 -- Previously written as:
 --   c >: cs :> cl = c : cs :> cl
@@ -628,11 +622,11 @@ infixr 2 :>, >:
 --
 -- See https://ghc.haskell.org/trac/ghc/ticket/10018 which may be related.
 
-data CatchAllFrame s = CatchAll FastCompiledClauses (Spine s)
-                        -- ^ @CatchAll cc spine@. Case trees are not fully expanded, that is,
+data CatchallFrame s = Catchall FastCompiledClauses (Spine s)
+                        -- ^ @Catchall cc spine@. Case trees are not fully expanded, that is,
                         --   inner matches can be partial and covered by a catch-all at a higher
                         --   level. This catch-all is represented on the match stack as a
-                        --   @CatchAll@. @cc@ is the case tree in the catch-all case and @spine@ is
+                        --   @Catchall@. @cc@ is the case tree in the catch-all case and @spine@ is
                         --   the value of the pattern variables at the point of the catch-all.
 
 -- An Elim' with a hole.
@@ -782,7 +776,7 @@ elimsToSpine env es = do
 trimEnvironment :: FreeVariables -> Env s -> Env s
 trimEnvironment UnknownFVs env = env
 trimEnvironment (KnownFVs fvs) env
-  | IntSet.null fvs = emptyEnv
+  | null fvs = emptyEnv
     -- Environment trimming is too expensive (costs 50% on some benchmarks), and while it does make
     -- some cases run in constant instead of linear space you need quite contrived examples to
     -- notice the effect.
@@ -791,7 +785,7 @@ trimEnvironment (KnownFVs fvs) env
     -- Important: strict enough that the trimming actually happens
     trim _ [] = []
     trim i (p : ps)
-      | IntSet.member i fvs = (p :)             $! trim (i + 1) ps
+      | VarSet.member i fvs = (p :)             $! trim (i + 1) ps
       | otherwise           = (unusedPointer :) $! trim (i + 1) ps
 
 -- | Build an environment for a body with some given free variables from a spine of arguments.
@@ -897,10 +891,7 @@ reduceTm rEnv bEnv !constInfo normalisation =
         -- slow reduce for unsupported definitions.
         Def f [] ->
           evalIApplyAM spine ctrl $
-          let CompactDef{ cdefNonterminating = nonterm
-                        , cdefUnconfirmed    = unconf
-                        , cdefDef            = def } = constInfo f
-          in case def of
+          case cdefDef (constInfo f) of
             CFun{ cfunCompiled = cc } -> runAM (Match f cc spine ([] :> cl) ctrl)
             CAxiom         -> rewriteAM done
             CTyCon         -> rewriteAM done
@@ -989,8 +980,7 @@ reduceTm rEnv bEnv !constInfo normalisation =
               spine' <- elimsToSpine env es
               let (zs, env, !spine'') = buildEnv (instTel i) (spine' <> spine)
               runAM (evalClosure (lams zs (instBody i)) env spine'' ctrl)
-            Just Open{}                         -> __IMPOSSIBLE__
-            Just OpenInstance{}                 -> __IMPOSSIBLE__
+            Just OpenMeta{}                     -> __IMPOSSIBLE__
             Just BlockedConst{}                 -> __IMPOSSIBLE__
             Just PostponedTypeCheckingProblem{} -> __IMPOSSIBLE__
 
@@ -1136,8 +1126,8 @@ reduceTm rEnv bEnv !constInfo normalisation =
     -- Case: CaseK. Pattern matching against a value. If it's a stuck value the pattern match is
     -- stuck and we return the closure from the match stack (see stuckMatch). Otherwise we need to
     -- find a matching branch switch to the Match state. If there is no matching branch we look for
-    -- a CatchAll in the match stack, or fail if there isn't one (see failedMatch). If the current
-    -- branches contain a catch-all case we need to push a CatchAll on the match stack if picking
+    -- a Catchall in the match stack, or fail if there isn't one (see failedMatch). If the current
+    -- branches contain a catch-all case we need to push a Catchall on the match stack if picking
     -- one of the other branches.
     runAM' (Eval cl@(Closure (Value blk) t env spine) ctrl0@(CaseK f i bs spine0 spine1 stack : ctrl)) =
       {-# SCC "runAM.CaseK" #-}
@@ -1190,9 +1180,9 @@ reduceTm rEnv bEnv !constInfo normalisation =
 
         -- Push catch-all frame on the match stack if there is a catch-all (and we're not taking it
         -- right now).
-        catchallStack = case fcatchAllBranch bs of
+        catchallStack = case fcatchallBranch bs of
           Nothing -> stack
-          Just cc -> CatchAll cc catchallSpine >: stack
+          Just cc -> Catchall cc catchallSpine >: stack
 
         -- The matchX functions below all take an extra argument which is what to do if there is no
         -- appropriate branch in the case tree. ifJust is maybe with a different argument order
@@ -1205,8 +1195,8 @@ reduceTm rEnv bEnv !constInfo normalisation =
         matchCon' q ar = lookupCon q bs `ifJust` \ cc ->
           runAM (Match f cc (spine0 <> spine <> spine1) catchallStack ctrl)
 
-        -- Catch-all: Don't add a CatchAll to the match stack since this _is_ the catch-all.
-        matchCatchall = fcatchAllBranch bs `ifJust` \ cc ->
+        -- Catch-all: Don't add a Catchall to the match stack since this _is_ the catch-all.
+        matchCatchall = fcatchallBranch bs `ifJust` \ cc ->
           runAM (Match f cc catchallSpine stack ctrl)
 
         -- Matching literal: Switch to the Match state. There are no arguments to add to the spine.
@@ -1240,7 +1230,15 @@ reduceTm rEnv bEnv !constInfo normalisation =
         FFail -> stuckMatch (NotBlocked AbsurdMatch ()) stack ctrl
 
         -- Matching complete. Compute the environment for the body and switch to the Eval state.
-        FDone xs body -> do
+        FDone (CCDone _ mr xs body) -> do
+          let allowedReductions = envAllowedReductions (redEnv rEnv)
+          let undo = stuckMatch (NotBlocked ReallyNotBlocked ()) stack ctrl
+          let abort = and
+               [ couldBeRecursive mr
+               , cdefUnconfirmed (constInfo f)
+               , UnconfirmedReductions `SmallSet.notMember` allowedReductions
+               ]
+          if abort then undo else do
             -- Don't ask me why, but not being strict in the spine causes a memory leak.
             let (zs, env, !spine') = buildEnv xs spine
             runAM (Eval (Closure Unevaled (lams zs body) env spine') ctrl)
@@ -1253,11 +1251,11 @@ reduceTm rEnv bEnv !constInfo normalisation =
             (_, [])                    -> done Underapplied -- matter for equality, but might for
             (spine0, Apply e : spine1) -> do                -- rewriting or 'with'.
               -- Replace e by its projections in the spine. And don't forget a
-              -- CatchAll frame if there's a catch-all.
+              -- Catchall frame if there's a catch-all.
               let projClosure (Arg ai f) = Closure Unevaled (Var 0 []) (extendEnv (unArg e) emptyEnv) [Proj ProjSystem f]
               projs <- mapM (createThunk . projClosure) fs
               let spine' = spine0 <> map (Apply . defaultArg) projs <> spine1
-                  stack' = caseMaybe ca stack $ \ cc -> CatchAll cc spine >: stack
+                  stack' = caseMaybe ca stack $ \ cc -> Catchall cc spine >: stack
               runAM (Match f cc spine' stack' ctrl)
             _ -> __IMPOSSIBLE__
 
@@ -1376,11 +1374,11 @@ reduceTm rEnv bEnv !constInfo normalisation =
     stuckMatch :: Blocked_ -> MatchStack s -> ControlStack s -> ST s (Blocked Term)
     stuckMatch blk (_ :> cl) ctrl = rewriteAM (Eval (mkValue blk cl) ctrl)
 
-    -- On a mismatch we find the next 'CatchAll' on the control stack and
+    -- On a mismatch we find the next 'Catchall' on the control stack and
     -- continue matching from there. If there isn't one we get an incomplete
     -- matching error (or get stuck if the function is marked partial).
     failedMatch :: QName -> MatchStack s -> ControlStack s -> ST s (Blocked Term)
-    failedMatch f (CatchAll cc spine : stack :> cl) ctrl = runAM (Match f cc spine (stack :> cl) ctrl)
+    failedMatch f (Catchall cc spine : stack :> cl) ctrl = runAM (Match f cc spine (stack :> cl) ctrl)
     failedMatch f ([] :> cl) ctrl
         -- Bad work-around for #3870: don't fail hard during instance search.
       | speculative          = rewriteAM (Eval (mkValue (NotBlocked (MissingClauses f) ()) cl) ctrl)
@@ -1414,7 +1412,7 @@ instance Pretty a => Pretty (FastCase a) where
       prSuc (Just x) = ["suc ->" <?> pretty x]
 
 instance Pretty FastCompiledClauses where
-  pretty (FDone xs t) = ("done" <+> prettyList xs) <?> prettyPrec 10 t
+  pretty (FDone done) = pretty done
   pretty FFail        = "fail"
   pretty (FEta n _ cc ca) =
     text ("eta " ++ show n ++ " of") <?>
@@ -1454,8 +1452,8 @@ instance Pretty (AM s) where
                           , nest 2 $ pretty stack
                           , nest 2 $ prettyList ctrl ]
 
-instance Pretty (CatchAllFrame s) where
-  pretty CatchAll{} = "CatchAll"
+instance Pretty (CatchallFrame s) where
+  pretty Catchall{} = "Catchall"
 
 instance Pretty (MatchStack s) where
   pretty ([] :> _) = empty

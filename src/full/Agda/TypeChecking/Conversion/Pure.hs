@@ -1,9 +1,6 @@
 
 module Agda.TypeChecking.Conversion.Pure where
 
--- Control.Monad.Fail import is redundant since GHC 8.8.1
-import Control.Monad.Fail (MonadFail)
-
 import Control.Monad.Except
 import Control.Monad.State
 
@@ -40,12 +37,24 @@ pureEqualTerm
 pureEqualTerm a u v =
   isJust <$> runPureConversion (equalTerm a u v)
 
+{-# SPECIALIZE pureEqualTermB :: Type -> Term -> Term -> TCM (Either Blocker Bool) #-}
+-- | Return the blocker instead of throwing a `patternViolation`.
+pureEqualTermB :: PureTCM m => Type -> Term -> Term -> m (Either Blocker Bool)
+pureEqualTermB a u v =
+  fmap isJust <$> runPureConversionB (equalTerm a u v)
+
 {-# SPECIALIZE pureEqualType :: Type -> Type -> TCM Bool #-}
 pureEqualType
   :: (PureTCM m, MonadBlock m)
   => Type -> Type -> m Bool
 pureEqualType a b =
   isJust <$> runPureConversion (equalType a b)
+
+{-# SPECIALIZE pureEqualType :: Type -> Type -> TCM Bool #-}
+-- | Return the blocker instead of throwing a `patternViolation`.
+pureEqualTypeB :: PureTCM m => Type -> Type -> m (Either Blocker Bool)
+pureEqualTypeB a b =
+  fmap isJust <$> runPureConversionB (equalType a b)
 
 {-# SPECIALIZE pureCompareAs :: Comparison -> CompareAs -> Term -> Term -> TCM Bool #-}
 pureCompareAs
@@ -58,7 +67,11 @@ pureCompareAs cmp a u v =
 runPureConversion
   :: (MonadBlock m, PureTCM m)
   => PureConversionT m a -> m (Maybe a)
-runPureConversion (PureConversionT m) = locallyTC eCompareBlocked (const True) $
+runPureConversion m = either patternViolation pure =<< runPureConversionB m
+
+{-# SPECIALIZE runPureConversionB :: PureConversionT TCM a -> TCM (Either Blocker (Maybe a)) #-}
+runPureConversionB :: PureTCM m => PureConversionT m a -> m (Either Blocker (Maybe a))
+runPureConversionB (PureConversionT m) = locallyTC eCompareBlocked (const True) $
   verboseBracket "tc.conv.pure" 40 "runPureConversion" $ do
   i <- useR stFreshInt
   pid <- useR stFreshProblemId
@@ -69,18 +82,19 @@ runPureConversion (PureConversionT m) = locallyTC eCompareBlocked (const True) $
     Left (PatternErr block)
      | block == neverUnblock -> do
          debugResult "stuck"
-         return Nothing
+         return $ Right Nothing
      | otherwise             -> do
          debugResult $ "blocked on" <+> prettyTCM block
-         patternViolation block
-    Left TypeError{}   -> do
+         return $ Left block
+    Left TypeError{}         -> do
       debugResult "type error"
-      return Nothing
-    Left Exception{}   -> __IMPOSSIBLE__
-    Left IOException{} -> __IMPOSSIBLE__
-    Right x            -> do
+      return $ Right Nothing
+    Left GenericException{}  -> __IMPOSSIBLE__
+    Left IOException{}       -> __IMPOSSIBLE__
+    Left ParserError{}       -> __IMPOSSIBLE__
+    Right x                  -> do
       debugResult "success"
-      return $ Just x
+      return $ Right $ Just x
   where
     debugResult msg = reportSDoc "tc.conv.pure" 40 $ "runPureConversion result: " <+> msg
 
@@ -114,7 +128,7 @@ instance Monad m => MonadBlock (PureConversionT m) where
     err          -> throwError err
 
 
-instance (PureTCM m, MonadBlock m) => MonadConstraint (PureConversionT m) where
+instance PureTCM m => MonadConstraint (PureConversionT m) where
   addConstraint u _ = patternViolation u
   addAwakeConstraint u _ = patternViolation u
   solveConstraint c = patternViolation alwaysUnblock  -- TODO: does this happen?
@@ -124,7 +138,7 @@ instance (PureTCM m, MonadBlock m) => MonadConstraint (PureConversionT m) where
   modifyAwakeConstraints _ = patternViolation alwaysUnblock  -- TODO: does this happen?
   modifySleepingConstraints _ = patternViolation alwaysUnblock  -- TODO: does this happen?
 
-instance (PureTCM m, MonadBlock m) => MonadMetaSolver (PureConversionT m) where
+instance PureTCM m => MonadMetaSolver (PureConversionT m) where
   newMeta' _ _ _ _ _ _ = patternViolation alwaysUnblock  -- TODO: does this happen?
   assignV _ m _ v _ = do
     bv <- isBlocked v
@@ -140,7 +154,7 @@ instance (PureTCM m, MonadBlock m) => MonadMetaSolver (PureConversionT m) where
     KeepMetas     -> return ()
     RollBackMetas -> fallback
 
-instance (PureTCM m, MonadBlock m) => MonadInteractionPoints (PureConversionT m) where
+instance PureTCM m => MonadInteractionPoints (PureConversionT m) where
   freshInteractionId = patternViolation alwaysUnblock  -- TODO: does this happen?
   modifyInteractionPoints _ = patternViolation alwaysUnblock  -- TODO: does this happen?
 
@@ -151,13 +165,14 @@ instance ReadTCState m => MonadStConcreteNames (PureConversionT m) where
     concNames <- useR stConcreteNames
     fst <$> runStateT m concNames
 
-instance (PureTCM m, MonadBlock m) => MonadWarning (PureConversionT m) where
-  addWarning w = case classifyWarning (tcWarning w) of
+instance PureTCM m => MonadWarning (PureConversionT m) where
+  addWarning _enabled w = case classifyWarning (tcWarning w) of
     ErrorWarnings -> patternViolation neverUnblock
     AllWarnings   -> return ()
 
 instance ReadTCState m => MonadStatistics (PureConversionT m) where
-  modifyCounter _ _ = return ()
+  tickN   _ _ = return ()
+  tickMax _ _ = return ()
 
 instance Monad m => MonadFresh ProblemId (PureConversionT m) where
   fresh = do

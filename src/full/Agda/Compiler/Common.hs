@@ -1,6 +1,10 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-module Agda.Compiler.Common where
+module Agda.Compiler.Common
+  ( module Agda.Compiler.Common
+  , IsMain(..)
+  )
+  where
 
 import Prelude hiding ((!!))
 
@@ -19,7 +23,6 @@ import Agda.Syntax.Common
 import Agda.Syntax.Internal as I
 import Agda.Syntax.TopLevelModuleName
 
-import Agda.Interaction.FindFile ( srcFilePath )
 import Agda.Interaction.Options
 import Agda.Interaction.Imports  ( CheckResult, crInterface, crSource, Source(..) )
 import Agda.Interaction.Library
@@ -34,19 +37,6 @@ import Agda.Utils.Maybe
 import Agda.Utils.WithDefault    ( lensCollapseDefault )
 
 import Agda.Utils.Impossible
-
-data IsMain = IsMain | NotMain
-  deriving (Eq, Show)
-
--- | Conjunctive semigroup ('NotMain' is absorbing).
-instance Semigroup IsMain where
-  NotMain <> _ = NotMain
-  _       <> NotMain = NotMain
-  IsMain  <> IsMain = IsMain
-
-instance Monoid IsMain where
-  mempty = IsMain
-  mappend = (<>)
 
 doCompile :: Monoid r => (IsMain -> Interface -> TCM r) -> IsMain -> Interface -> TCM r
 doCompile f isMain i = do
@@ -66,6 +56,7 @@ doCompile f isMain i = do
     agdaPrim = RawTopLevelModuleName
       { rawModuleNameRange = mempty
       , rawModuleNameParts = "Agda" :| "Primitive" : []
+      , rawModuleNameInferred = False
       }
       -- N.B. The Range in TopLevelModuleName is ignored for Ord, so we can set it to mempty.
 
@@ -149,13 +140,13 @@ inCompilerEnv checkResult cont = do
     -- the current pragma options persistent when we setCommandLineOptions
     -- below.
     opts <- getsTC $ stPersistentOptions . stPersistentState
-    let compileDir = case optCompileDir opts of
-          Just dir -> dir
-          Nothing  ->
-            -- The default output directory is the project root.
-            let tm = iTopLevelModuleName mainI
-                f  = srcFilePath $ srcOrigin checkedSource
-            in filePath $ projectRoot f tm
+    compileDir <- case optCompileDir opts of
+        Just dir -> pure dir
+        Nothing  -> do
+          -- The default output directory is the project root.
+          let tm = iTopLevelModuleName mainI
+          f <- srcFilePath $ srcOrigin checkedSource
+          pure $ filePath $ projectRoot f tm
     setCommandLineOptions $
       opts { optCompileDir = Just compileDir }
 
@@ -175,7 +166,10 @@ inCompilerEnv checkResult cont = do
     when (any ("--erased-cubical" `elem`) $ iFilePragmaStrings mainI) $
       setTCLens (stPragmaOptions . lensOptCubical) $ Just CErased
 
-    setScope (iInsideScope mainI) -- so that compiler errors don't use overly qualified names
+    setScope $ iInsideScope mainI -- so that compiler errors don't use overly qualified names
+    -- András, 2025-08-30: this is a fresh creation of a scope from an interface
+    -- so inverse scopes don't yet exist.
+    recomputeInverseScope
     ignoreAbstractMode cont
   -- keep generated warnings
   let newWarnings = stPostTCWarnings $  stPostScopeState $ s

@@ -144,6 +144,8 @@ class (Ord (BenchPhase m), Functor m, MonadIO m) => MonadBench m where
   -- | We need to be able to terminate benchmarking in case of an exception.
   finally :: m b -> m c -> m b
 
+  {-# MINIMAL getBenchmark , (putBenchmark | modifyBenchmark) , finally #-}
+
 getsBenchmark :: MonadBench m => (Benchmark (BenchPhase m) -> c) -> m c
 getsBenchmark f = f <$> getBenchmark
 
@@ -242,5 +244,15 @@ billPureTo account = billTo account . return
 
 -- NFData instances.
 
-instance NFData a => NFData (BenchmarkOn a)
 instance NFData a => NFData (Benchmark a)
+
+-- Andreas, 2025-07-31:
+-- Generic derivation of NFData with embedded function spaces
+-- throws deprecation warning in GHC 9.10.3 (deepseq-1.5.2.0),
+-- see https://github.com/haskell/deepseq/issues/111 ,
+-- so we spell it out.
+instance NFData a => NFData (BenchmarkOn a) where
+  rnf = \case
+    BenchmarkOff -> ()
+    BenchmarkOn  -> ()
+    BenchmarkSome _fun -> ()  -- functions cannot be normalized

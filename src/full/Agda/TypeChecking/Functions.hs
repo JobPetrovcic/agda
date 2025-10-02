@@ -13,6 +13,7 @@ import Agda.Syntax.Internal
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Context
 import Agda.TypeChecking.Monad.Debug
+import Agda.TypeChecking.Monad.Pure
 import Agda.TypeChecking.Level
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Reduce
@@ -36,12 +37,12 @@ import Agda.Utils.Size
 --  This is used instead of special treatment of lambdas
 --  (which was unsound: Issue #121)
 
-etaExpandClause :: MonadTCM tcm => Clause -> tcm Clause
-etaExpandClause clause = liftTCM $ do
+etaExpandClause :: PureTCM tcm => Clause -> tcm Clause
+etaExpandClause clause = do
   case clause of
-    Clause _  _  ctel ps _           Nothing  _ _ _ _ _ _ -> return clause
-    Clause _  _  ctel ps Nothing     (Just t) _ _ _ _ _ _ -> return clause
-    Clause rl rf ctel ps (Just body) (Just t) catchall exact recursive unreachable ell wm -> do
+    Clause _  _  ctel ps _           Nothing  _ _ _ _ _ -> return clause
+    Clause _  _  ctel ps Nothing     (Just t) _ _ _ _ _ -> return clause
+    Clause rl rf ctel ps (Just body) (Just t) catchall recursive unreachable ell wm -> do
 
       -- Get the telescope to expand the clause with.
       TelV tel0 t' <- addContext ctel $ telView $ unArg t
@@ -63,7 +64,7 @@ etaExpandClause clause = liftTCM $ do
         , "  xs      = " <+> text (prettyShow xs)
         , "  new tel = " <+> prettyTCM ctel'
         ]
-      return $ Clause rl rf ctel' ps' (Just body') (Just (t $> t')) catchall exact recursive unreachable ell wm
+      return $ Clause rl rf ctel' ps' (Just body') (Just (t $> t')) catchall recursive unreachable ell wm
   where
     -- Get all initial lambdas of the body.
     peekLambdas :: Term -> [Arg ArgName]

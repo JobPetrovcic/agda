@@ -155,13 +155,47 @@ Org_ files. Code blocks are surrounded by two lines including only
   final document may be placed in source blocks without the ``agda2``
   label.
 
+Literate Forester
+-----------------
+
+Files ending in :file:`.lagda.tree` are interpreted as literate
+Forester_ files. Literate forester uses ```\agda{...}``` for code blocks.
+
+You will need the postprocessor agda-tree_ to convert ``html/*.tree`` to a valid forester tree.
+
+  * ``agda --html --html-highlight=code example.lagda.tree`` will produce the file ``html/example.tree``.
+  * Run ``agda-tree build`` at where ``html/`` is located, this will produce subdirectory ``trees/`` there.
+  * Add ``trees/`` to ``forest.toml``.
+  * Add ``html/`` to ``forest.toml`` as assets.
+  * Modify ``theme/tree.xsl`` of your forester project, adding ``Agda.css`` to the linked styles.
+
+Running ``forester build`` should now produce file ``example.xml`` with Agda syntax highlighting.
+
+.. code-block:: text
+
+   \p{This line is ordinary text, which is ignored by Agda.}
+
+   \agda{
+   module Whatever where
+   -- Agda code goes here
+   }
+
+   \p{Here is another code block:}
+
+   \agda{
+   data ℕ : Set where
+    zero : ℕ
+    suc  : ℕ → ℕ
+   }
 
 .. _TeX: http://tug.org/
 .. _reStructuredText: http://docutils.sourceforge.io/rst.html
 .. _Markdown: https://daringfireball.net/projects/markdown/
 .. _Org: https://orgmode.org
 .. _Typst: https://typst.app
+.. _Forester: https://sr.ht/~jonsterling/forester/
 
 .. _lhs2TeX: https://www.andres-loeh.de/lhs2tex/
+.. _agda-tree: https://github.com/dannypsnl/agda-tree
 .. _Sphinx: http://www.sphinx-doc.org/en/stable/
 .. _Pandoc: https://pandoc.org/

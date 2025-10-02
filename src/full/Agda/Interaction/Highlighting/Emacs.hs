@@ -3,32 +3,33 @@
 -- | Functions which give precise syntax highlighting info to Emacs.
 
 module Agda.Interaction.Highlighting.Emacs
-  ( lispifyHighlightingInfo
+  ( HighlightingInfo
+  , lispifyHighlightingInfo
+  , lispifyHighlightingInfo_
   , lispifyTokenBased
   ) where
 
 import Prelude hiding (null)
 
-import Agda.Interaction.Highlighting.Common
-import Agda.Interaction.Highlighting.Precise
-import Agda.Interaction.Highlighting.Range (Range(..))
-import Agda.Interaction.EmacsCommand
-import Agda.Interaction.Response
-import Agda.TypeChecking.Monad (HighlightingMethod(..), ModuleToSource)
-import Agda.Utils.FileName (filePath)
-import Agda.Utils.IO.TempFile (writeToTempFile)
-import Agda.Syntax.Common.Pretty (prettyShow)
-import Agda.Utils.String (quote)
-
 import qualified Data.List as List
-import qualified Data.Map as Map
 import Data.Maybe
 
-import Agda.Utils.Null
-import Agda.Utils.Impossible
+import Agda.Syntax.Common.Pretty (prettyShow)
 
-------------------------------------------------------------------------
--- Read/show functions
+import Agda.Interaction.Highlighting.Common
+import Agda.Interaction.Highlighting.Precise
+import Agda.Utils.Range (Range(..))
+import Agda.Interaction.Emacs.Lisp
+import Agda.Interaction.Response
+
+import Agda.TypeChecking.Monad (HighlightingMethod(..), ModuleToSource, topLevelModuleFilePath)
+
+import Agda.Utils.CallStack    (HasCallStack)
+import Agda.Utils.FileName     (AbsolutePath, filePath)
+import Agda.Utils.IO.TempFile  (writeToTempFile)
+import Agda.Utils.Null
+import Agda.Utils.String       (quote)
+
 
 -- | Shows meta information in such a way that it can easily be read
 -- by Emacs.
@@ -51,7 +52,9 @@ showAspects modFile (r, m) = L $
   where
   defSite (DefinitionSite m p _ _) =
     Cons (A $ quote $ filePath f) (A $ show p)
-    where f = Map.findWithDefault __IMPOSSIBLE__ m modFile
+    where
+      f :: HasCallStack => AbsolutePath
+      f = topLevelModuleFilePath modFile m  -- partial function, so use CallStack!
 
   dropNils = List.dropWhileEnd (== A "nil")
 
@@ -61,6 +64,14 @@ showAspects modFile (r, m) = L $
 lispifyTokenBased :: TokenBased -> Lisp String
 lispifyTokenBased TokenBased        = A "t"
 lispifyTokenBased NotOnlyTokenBased = A "nil"
+
+-- | Run 'showAspects' on a whole 'RangeMap'.
+lispifyHighlightingInfo_ ::
+     ModuleToSource
+       -- ^ Must contain a mapping for every definition site's module.
+  -> HighlightingInfo
+  -> [Lisp String]
+lispifyHighlightingInfo_ m2s = map (showAspects m2s) . toList
 
 -- | Turns syntax highlighting information into a list of
 -- S-expressions.
@@ -83,14 +94,16 @@ lispifyHighlightingInfo h remove method modFile =
     Indirect -> indirect
   where
   info :: [Lisp String]
-  info = (case remove of
-                RemoveHighlighting -> A "remove"
-                KeepHighlighting   -> A "nil") :
-             map (showAspects modFile) (toList h)
+  info =
+    A (case remove of
+        RemoveHighlighting -> "remove"
+        KeepHighlighting   -> "nil") :
+    lispifyHighlightingInfo_ modFile h
 
   direct :: IO (Lisp String)
-  direct = return $ L (A "agda2-highlight-add-annotations" :
-                         map Q info)
+  direct = return $ L $
+    A "agda2-highlight-add-annotations" :
+    map Q info
 
   indirect :: IO (Lisp String)
   indirect = do

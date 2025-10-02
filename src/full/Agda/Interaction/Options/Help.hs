@@ -12,7 +12,10 @@ import Control.DeepSeq
 
 import GHC.Generics (Generic)
 
+import Agda.Interaction.Options.Errors
 import Agda.Interaction.Options.Warnings
+
+import qualified Agda.Setup.EmacsMode as EmacsMode
 
 -- | Interface to the @help@ function
 data Help
@@ -30,23 +33,31 @@ instance NFData Help
 
 data HelpTopic
   = Warning
+  | Error
+  | EmacsMode
   deriving (Eq, Show, Generic)
 
 instance NFData HelpTopic
 
 allHelpTopics :: [(String, HelpTopic)]
-allHelpTopics = [("warning", Warning)]
+allHelpTopics =
+  [ ("warning"   , Warning  )
+  , ("error"     , Error    )
+  , ("emacs-mode", EmacsMode)
+  ]
 
 -- | Usage information generation
 
 helpTopicUsage :: HelpTopic -> String
-helpTopicUsage tp = case tp of
-  Warning -> usageWarning
+helpTopicUsage = \case
+  Warning   -> usageWarning
+  Error     -> helpErrors
+  EmacsMode -> EmacsMode.help
 
 -- | Conversion functions to strings
 
 string2HelpTopic :: String -> Maybe HelpTopic
-string2HelpTopic str = lookup str allHelpTopics
+string2HelpTopic = flip lookup allHelpTopics
 
 -- UNUSED Liang-Ting Chen 2019-07-15
 --helpTopic2String :: HelpTopic -> String

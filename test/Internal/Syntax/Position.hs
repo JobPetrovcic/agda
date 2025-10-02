@@ -9,13 +9,13 @@ import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.List ( distinct )
 import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Null ( null )
+import Agda.Utils.Tuple ( sortPair )
 
 import Control.Monad
 
-import Data.Int
 import Data.List (sort)
-import Data.Set (Set)
-import qualified Data.Set as Set
+import Data.IntSet (IntSet)
+import qualified Data.IntSet as IntSet
 import qualified Data.Text as T
 
 import Internal.Helpers
@@ -33,20 +33,20 @@ import System.FilePath
 -- | The positions corresponding to the interval. The positions do not
 -- refer to characters, but to the positions between characters, with
 -- zero pointing to the position before the first character.
-iPositions :: Interval' a -> Set Int32
-iPositions i = Set.fromList [posPos (iStart i) .. posPos (iEnd i)]
+iPositions :: Interval' a -> IntSet
+iPositions i = IntSet.fromList [fromIntegral (posPos (iStart i)) .. fromIntegral (posPos (iEnd i))]
 
 -- | The positions corresponding to the range, including the
 -- end-points.
-rPositions :: Range' a -> Set Int32
-rPositions r = Set.unions (map iPositions $ rangeIntervals r)
+rPositions :: Range' a -> IntSet
+rPositions r = IntSet.unions (map iPositions $ rangeIntervals r)
 
 -- | Constructs the least interval containing all the elements in the
 -- set.
-makeInterval :: Set Int32 -> Set Int32
+makeInterval :: IntSet -> IntSet
 makeInterval s
-  | Set.null s = Set.empty
-  | otherwise  = Set.fromList [Set.findMin s .. Set.findMax s]
+  | IntSet.null s = IntSet.empty
+  | otherwise  = IntSet.fromList [IntSet.findMin s .. IntSet.findMax s]
 
 prop_iLength :: Interval' Integer -> Bool
 prop_iLength i = iLength i >= 0
@@ -117,13 +117,12 @@ prop_continuousPerLine r =
       s = posLine (iStart i)
       e = posLine (iEnd   i)
 
-prop_fuseIntervals :: Interval' Integer -> Property
-prop_fuseIntervals i1 =
-  forAll (intervalInSameFileAs i1) $ \i2 ->
+prop_fuseIntervals :: IntervalWithoutFile -> IntervalWithoutFile -> Bool
+prop_fuseIntervals i1 i2 =
     let i = fuseIntervals i1 i2 in
     intervalInvariant i &&
     iPositions i ==
-      makeInterval (Set.union (iPositions i1) (iPositions i2))
+      makeInterval (IntSet.union (iPositions i1) (iPositions i2))
 
 prop_fuseRanges :: Range -> Property
 prop_fuseRanges r1 =
@@ -131,7 +130,7 @@ prop_fuseRanges r1 =
     let r = fuseRanges r1 r2 in
     rangeInvariant r
       &&
-    rPositions r == Set.union (rPositions r1) (rPositions r2)
+    rPositions r == IntSet.union (rPositions r1) (rPositions r2)
 
 prop_beginningOf :: Range -> Bool
 prop_beginningOf r = rangeInvariant (beginningOf r)
@@ -146,17 +145,15 @@ instance Arbitrary a => Arbitrary (Position' a) where
     let pos  = fromInteger pos'
         line = pred pos `div` 10 + 1
         col  = pred pos `mod` 10 + 1
-    return (Pn {srcFile = srcFile, posPos = pos,
-                posLine = line, posCol = col })
+    return (Pn srcFile pos line col)
 
 -- | Generates an interval located in the same file as the given
 -- interval.
 
-intervalInSameFileAs ::
-  (Arbitrary a, Ord a) => Interval' a -> Gen (Interval' a)
-intervalInSameFileAs i =
-  setIntervalFile (srcFile $ iStart i) <$>
-    (arbitrary :: Gen IntervalWithoutFile)
+intervalInSameFileAs :: Arbitrary a => Interval' a -> Gen (Interval' a)
+intervalInSameFileAs (Interval f _ _) = do
+  i :: IntervalWithoutFile <- arbitrary
+  pure $ f <$ i
 
 prop_intervalInSameFileAs :: Interval' Integer -> Property
 prop_intervalInSameFileAs i =
@@ -190,6 +187,7 @@ instance Arbitrary RawTopLevelModuleName where
     return $ RawTopLevelModuleName
       { rawModuleNameRange = r
       , rawModuleNameParts = parts
+      , rawModuleNameInferred = False
       }
 
 instance Arbitrary TopLevelModuleName where
@@ -213,9 +211,10 @@ instance Arbitrary RangeFile where
 
 instance (Arbitrary a, Ord a) => Arbitrary (Interval' a) where
   arbitrary = do
-    (p1, p2 :: Position' a) <- liftM2 (,) arbitrary arbitrary
-    let [p1', p2'] = sort [p1, p2 { srcFile = srcFile p1 }]
-    return (Interval p1' p2')
+    f <- arbitrary
+    (p1, p2 :: PositionWithoutFile) <- liftM2 (,) arbitrary arbitrary
+    let (p1', p2') = sortPair (p1, p2)
+    return (Interval f p1' p2')
 
 instance (Ord a, Arbitrary a) => Arbitrary (Range' a) where
   arbitrary = do

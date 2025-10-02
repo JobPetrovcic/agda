@@ -1,20 +1,26 @@
+DisallowedOverlaps.agda:27.9-37.11: error: [UnsolvedConstraints]
 Failed to solve the following constraints:
   Resolve instance argument _18 : A
   Candidates
+    overlap b .B.a : A
     a : A
-    overlap B.a b : A
     (stuck)
+      [ at DisallowedOverlaps.agda:27.9-11 ]
   Resolve instance argument _24 : A
   Candidates
-    overlap C.a c : A
-    D.a d : A
+    d .D.a : A
+    overlap c .C.a : A
     (stuck)
+      [ at DisallowedOverlaps.agda:31.9-11 ]
   Resolve instance argument _30 : A
   Candidates
-    overlap B.a b : A
     a : A
+    overlap b .B.a : A
     (stuck)
+      [ at DisallowedOverlaps.agda:37.9-11 ]
+
+DisallowedOverlaps.agda:27.9-37.11: error: [UnsolvedMetaVariables]
 Unsolved metas at the following locations:
-  DisallowedOverlaps.agda:27,9-11
-  DisallowedOverlaps.agda:31,9-11
-  DisallowedOverlaps.agda:37,9-11
+  DisallowedOverlaps.agda:27.9-11
+  DisallowedOverlaps.agda:31.9-11
+  DisallowedOverlaps.agda:37.9-11

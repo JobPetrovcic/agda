@@ -7,11 +7,12 @@ import Prelude hiding ( null )
 import Agda.Syntax.Abstract as A
 import Agda.Syntax.Abstract.Views
 import Agda.Syntax.Common
-import Agda.Syntax.Fixity
+import qualified Agda.Syntax.Common.Pretty as P
 import qualified Agda.Syntax.Concrete.Definitions as D
 import qualified Agda.Syntax.Info as A
-import Agda.Syntax.Position
+import Agda.Syntax.Fixity
 import Agda.Syntax.Internal
+import Agda.Syntax.Position
 import Agda.Syntax.Scope.Monad
 import Agda.Syntax.Translation.AbstractToConcrete
 
@@ -22,21 +23,14 @@ import Agda.TypeChecking.Monad.Context
 import Agda.TypeChecking.Monad.Debug
 import Agda.TypeChecking.Pretty
 
-import Agda.Utils.Function
 import Agda.Utils.Null
-import qualified Agda.Syntax.Common.Pretty as P
 
 import Agda.Utils.Impossible
 
 import Agda.Version (docsUrl)
 
 sayWhere :: MonadPretty m => HasRange a => a -> m Doc -> m Doc
-sayWhere x d = applyUnless (null r) (prettyTCM r $$) d
-  where r = getRange x
-
-sayWhen :: MonadPretty m => Range -> Maybe (Closure Call) -> m Doc -> m Doc
-sayWhen r Nothing   m = sayWhere r m
-sayWhen r (Just cl) m = sayWhere r (m $$ prettyTCM cl)
+sayWhere x d = prettyTCM (getRange x) $$ d
 
 instance PrettyTCM CallInfo where
   prettyTCM (CallInfo callInfoTarget callInfoCall) = do
@@ -155,7 +149,7 @@ instance PrettyTCM Call where
         pwords "fits in the sort" ++ [prettyTCM s] ++
         pwords "of the datatype."
 
-    CheckFunDefCall _ f _ _ ->
+    CheckFunDefCall _ f _ ->
       fsep $ pwords "when checking the definition of" ++ [prettyTCM f]
 
     CheckPragma _ p ->
@@ -172,7 +166,7 @@ instance PrettyTCM Call where
     CheckWithFunctionType a -> fsep $
       pwords "when checking that the type" ++
       [prettyTCM a] ++ pwords "of the generated with function is well-formed" ++
-      [parens $ text $ docsUrl "language/with-abstraction.html#ill-typed-with-abstractions"]
+      [parens $ url $ docsUrl "language/with-abstraction.html#ill-typed-with-abstractions"]
 
     CheckDotPattern e v -> fsep $
       pwords "when checking that the given dot pattern" ++ [prettyA e] ++
@@ -199,13 +193,10 @@ instance PrettyTCM Call where
     ScopeCheckExpr e -> fsep $ pwords "when scope checking" ++ [pretty e]
 
     ScopeCheckDeclaration d ->
-      fwords ("when scope checking the declaration" ++ suffix) $$
-      nest 2 (vcat $ map pretty ds)
+      fsep (pwords "when scope checking the" ++ [ pluralS ds "declaration" ]) $$
+      nest 2 (vcat $ fmap pretty ds)
       where
       ds     = D.notSoNiceDeclarations d
-      suffix = case ds of
-        [_] -> ""
-        _   -> "s"
 
     ScopeCheckLHS x p ->
       fsep $ pwords "when scope checking the left-hand side" ++ [pretty p] ++
@@ -215,11 +206,13 @@ instance PrettyTCM Call where
 
     SetRange r -> fsep (pwords "when doing something at") <+> prettyTCM r
 
-    CheckSectionApplication _ erased m1 modapp -> fsep $
-      pwords "when checking the module application" ++
-      [prettyA $ A.Apply info erased m1 modapp initCopyInfo empty]
+    CheckSectionApplication _ erased m1 modapp -> do
+      fsep $
+        pwords "when checking the module application" ++
+        [prettyA $ A.Apply info erased m1 modapp copy empty]
       where
       info = A.ModuleInfo noRange noRange Nothing Nothing Nothing
+      copy = ScopeCopyInfo { renNames = mempty, renModules = mempty, renPublic = True, renTrimming = __IMPOSSIBLE__ }
 
     ModuleContents -> fsep $ pwords "when retrieving the contents of a module"
 

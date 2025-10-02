@@ -174,7 +174,7 @@ after the ``module`` keyword:
     F : @0 Set → Set
     F A = A
 
-  module M (A : Set) where
+  module M (@0 A : Set) where
 
     record R : Set where
       field
@@ -258,19 +258,21 @@ There is also a *hard compile-time mode*. In this mode all definitions
 are treated as erased. The hard compile-time mode is entered when an
 erased definition is checked.
 
+Unnamed and named `where` modules in erased context are always checked in hard compile-time mode.
+
 The type-checker switches from compile-time mode to run-time mode for
 certain expressions/declarations if it is not in the hard compile-time
 mode:
 
 - Absurd lambdas.
-- Non-erased pattern-matching lambdas.
+- Non-erased pattern lambdas.
 - Non-erased module definitions ("``module M … = …``") or applications
   ("``M …``").
 - Applications of ``♯`` (see :ref:`old-coinduction`).
 
-.. note::
-  The text above should be extended with information about how the
-  reflection machinery interacts with run-time irrelevance.
+The reflection API provides a primitive function
+`workOnTypes : TC A → TC A` that manually switches the type-checker
+from run-time mode to compile-time mode.
 
 .. _references:
 

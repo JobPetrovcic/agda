@@ -21,9 +21,10 @@ module Agda.Utils.List1
   ( module Agda.Utils.List1
   , module List1
   , module IsList
+  , module Unzip
   ) where
 
-import Prelude hiding (filter)
+import Prelude hiding (filter, unzip)
 
 import Control.Arrow ((&&&))
 import Control.Monad (filterM)
@@ -34,8 +35,15 @@ import Data.Function ( on )
 import qualified Data.List as List
 import qualified Data.Maybe as Maybe
 
-import Data.List.NonEmpty as List1 hiding (fromList, toList)
+import Data.List.NonEmpty as List1 hiding (fromList, toList, unzip)
 import qualified Data.List.NonEmpty as List1 (toList)
+
+-- Prevent warning -Wx-data-list-nonempty-unzip
+#if MIN_VERSION_base(4,19,0)
+import Data.Functor as Unzip (unzip)
+#else
+import Data.List.NonEmpty as Unzip (unzip)
+#endif
 
 import GHC.Exts as IsList ( IsList(..) )
 
@@ -83,29 +91,15 @@ last2 :: List1 a -> Maybe (a, a)
 last2 (x :| y : xs) = Just $ List.last2' x y xs
 last2 _ = Nothing
 
--- | Build a list with one element.
-
-#if !(MIN_VERSION_base(4,15,0))
-singleton :: a -> List1 a
-singleton = (:| [])
-#endif
-
-#if !MIN_VERSION_base(4,16,0)
--- | Append a list to a non-empty list.
-
-appendList :: List1 a -> [a] -> List1 a
-appendList (x :| xs) ys = x :| mappend xs ys
-
--- | Prepend a list to a non-empty list.
-
-prependList :: [a] -> List1 a -> List1 a
-prependList as bs = Prelude.foldr (<|) bs as
-#endif
-
 -- | More precise type for @snoc@.
 
 snoc :: [a] -> a -> List1 a
 snoc as a = prependList as $ a :| []
+
+-- | Append an element to a non-empty list.
+
+snoc1 :: List1 a -> a -> List1 a
+snoc1 as a = as <> (a :| [])
 
 -- | @'groupOn' f = 'groupBy' (('==') \`on\` f) '.' 'List.sortBy' ('compare' \`on\` f)@.
 -- O(n log n).
@@ -195,9 +189,15 @@ ifNotNull :: [a] -> (List1 a -> b) -> b -> b
 ifNotNull []       _ b = b
 ifNotNull (a : as) f _ = f $ a :| as
 
-unlessNull :: Null m => [a] -> (List1 a -> m) -> m
-unlessNull []       _ = empty
+-- | The more general type @Null m => [a] -> (List1 a -> m) -> m@
+--   often causes type inference to fail, as we do not in general have
+--   @instance Applicative m => Null (m ())@.
+unlessNull :: Applicative m => [a] -> (List1 a -> m ()) -> m ()
+unlessNull []       _ = pure ()
 unlessNull (x : xs) f = f $ x :| xs
+
+unlessNullM :: Monad m => m [a] -> (List1 a -> m ()) -> m ()
+unlessNullM m k = m >>= (`unlessNull` k)
 
 -- * List functions with no special behavior for non-empty lists.
 
@@ -214,8 +214,11 @@ catMaybes =  Maybe.catMaybes . List1.toList
 
 -- | Like 'Maybe.mapMaybe'.
 
+#if !MIN_VERSION_base(4,23,0)
+-- Will be part of base with GHC 9.16 (base-4.23)
 mapMaybe :: (a -> Maybe b) -> List1 a -> [b]
 mapMaybe f = Maybe.mapMaybe f . List1.toList
+#endif
 
 -- | Like 'List.find'.
 
@@ -246,6 +249,11 @@ unwords = List.unwords . List1.toList
 -- O(n²).
 nubM :: Monad m => (a -> a -> m Bool) -> List1 a -> m (List1 a)
 nubM eq (a :| as) = (a :|) <$> do List.nubM eq =<< filterM (not <.> eq a) as
+
+-- | Like 'Agda.Utils.List.unzipWith'.
+
+unzipWith :: (a -> (b, c)) -> List1 a -> (List1 b, List1 c)
+unzipWith f = unzip . fmap f
 
 -- | Like 'Control.Monad.zipWithM'.
 

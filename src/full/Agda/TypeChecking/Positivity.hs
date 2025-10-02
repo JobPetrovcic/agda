@@ -3,12 +3,11 @@
 -- | Check that a datatype is strictly positive.
 module Agda.TypeChecking.Positivity where
 
-import Prelude hiding ( null )
+import Prelude hiding ( null, (!!) )
 
 import Control.Applicative hiding (empty)
 import Control.DeepSeq
-import Control.Monad        ( forM_, guard, liftM2 )
-import Control.Monad.Reader ( MonadReader(..), asks, Reader, runReader )
+import Control.Monad.Reader ( MonadReader(..), asks, ReaderT, runReaderT )
 
 import Data.Either
 import qualified Data.Foldable as Fold
@@ -23,9 +22,11 @@ import Data.Sequence (Seq)
 import qualified Data.Sequence as DS
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Strict.These
 
 import Debug.Trace
 
+import Agda.Interaction.Options.Base ( optPolarity )
 import Agda.Syntax.Common
 import qualified Agda.Syntax.Info as Info
 import Agda.Syntax.Internal
@@ -34,6 +35,7 @@ import Agda.Syntax.Position (HasRange(..), noRange)
 import Agda.TypeChecking.Datatypes ( isDataOrRecordType )
 import Agda.TypeChecking.Functions
 import Agda.TypeChecking.Monad
+import Agda.TypeChecking.Patterns.Match ( properlyMatching )
 import Agda.TypeChecking.Positivity.Occurrence
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Records
@@ -63,8 +65,11 @@ type Graph n e = Graph.Graph n e
 -- | Check that the datatypes in the mutual block containing the given
 --   declarations are strictly positive.
 --
+--   Find polarity of datatypes parameters and indices.
+--
 --   Also add information about positivity and recursivity of records
 --   to the signature.
+--
 checkStrictlyPositive :: Info.MutualInfo -> Set QName -> TCM ()
 checkStrictlyPositive mi qset = do
   -- compute the occurrence graph for qs
@@ -103,16 +108,24 @@ checkStrictlyPositive mi qset = do
         ]
   reportSLn "tc.pos.graph.sccs" 15 $
     "  sccs = " ++ prettyShow [ scc | CyclicSCC scc <- sccs ]
-  forM_ sccs $ \case
-    -- If the mutuality information has never been set, we set it to []
-    AcyclicSCC (DefNode q) -> whenM (isNothing <$> getMutual q) $ do
-      reportSLn "tc.pos.mutual" 10 $ "setting " ++ prettyShow q ++ " to non-recursive"
-      -- Andreas, 2017-04-26, issue #2555
-      -- We should not have @DefNode@s pointing outside our formal mutual block.
-      unless (Set.member q qset) __IMPOSSIBLE__
-      setMutual q []
-    AcyclicSCC (ArgNode{}) -> return ()
-    CyclicSCC scc          -> setMut [ q | DefNode q <- scc ]
+
+  -- #7133: Note that the graph doesn't necessarily contain all of qs in the case where there are no
+  -- occurrences of a name, but we still need to setMutual for them.
+  let sccMap = Map.unions [ case scc of
+                              AcyclicSCC (DefNode q) -> Map.singleton q []
+                              AcyclicSCC ArgNode{}   -> mempty
+                              CyclicSCC scc          -> Map.fromList [ (q, qs) | q <- qs ]
+                                where qs = [ q | DefNode q <- scc ]
+                          | scc <- sccs ]
+  inAbstractMode $ forM_ qs $ \ q ->
+    whenM (isNothing <$> getMutual q) $ do
+      let qs = fromMaybe [] $ Map.lookup q sccMap
+      reportSLn "tc.pos.mutual" 10 $ "setting " ++ prettyShow q ++ " to " ++
+                                     if | null qs        -> "non-recursive"
+                                        | length qs == 1 -> "recursive"
+                                        | otherwise      -> "mutually recursive"
+      setMutual q qs
+
   mapM_ (checkPos g gstar) qs
   reportSDoc "tc.pos.tick" 100 $ "checked positivity"
 
@@ -120,9 +133,9 @@ checkStrictlyPositive mi qset = do
     checkPos :: Graph Node (Edge OccursWhere) ->
                 Graph Node Occurrence ->
                 QName -> TCM ()
-    checkPos g gstar q = inConcreteOrAbstractMode q $ \ _def -> do
+    checkPos g gstar q = inConcreteOrAbstractMode q $ \ def -> do
       -- we check positivity only for data or record definitions
-      whenJustM (isDatatype q) $ \ dr -> do
+      whenJust (isDatatype def) $ \ dr -> do
         reportSDoc "tc.pos.check" 10 $ "Checking positivity of" <+> prettyTCM q
 
         let loop :: Maybe Occurrence
@@ -193,31 +206,16 @@ checkStrictlyPositive mi qset = do
         -- 'Inductive' or 'Coinductive'.  Otherwise, error.
         unlessM (isJust . recInduction . theDef <$> getConstInfo q) $
           setCurrentRange (nameBindingSite $ qnameName q) $
-            typeError . GenericDocError =<<
-              "Recursive record" <+> prettyTCM q <+>
-              "needs to be declared as either inductive or coinductive"
+            typeError $ RecursiveRecordNeedsInductivity q
 
     occ (Edge o _) = o
 
-    isDatatype :: QName -> TCM (Maybe DataOrRecord)
-    isDatatype q = do
-      def <- theDef <$> getConstInfo q
-      return $ case def of
+    isDatatype :: Definition -> Maybe DataOrRecord
+    isDatatype def = do
+      case theDef def of
         Datatype{dataClause = Nothing} -> Just IsData
         Record  {recClause  = Nothing, recPatternMatching } -> Just $ IsRecord recPatternMatching
         _ -> Nothing
-
-    -- Set the mutually recursive identifiers for a SCC.
-    setMut :: [QName] -> TCM ()
-    setMut [] = return ()  -- nothing to do
-    setMut qs = forM_ qs $ \ q -> do
-      reportSLn "tc.pos.mutual" 10 $ "setting " ++ prettyShow q ++ " to (mutually) recursive"
-      setMutual q qs
-      -- TODO: The previous line produces data of quadratic size
-      -- (which has to be processed upon serialization).  Presumably qs is
-      -- usually short, but in some cases (for instance for generated
-      -- code) it may be long. Wouldn't it be better to assign a
-      -- unique identifier to each SCC, and avoid storing lists?
 
     -- Set the polarity of the arguments to a couple of definitions
     setArgOccs :: Set QName -> [QName] -> Graph Node Occurrence -> TCM ()
@@ -236,6 +234,7 @@ checkStrictlyPositive mi qset = do
         let findOcc i = fromMaybe Unused $ Graph.lookup (ArgNode q i) (DefNode q) g
             args = -- caseMaybe (Map.lookup q maxs) (replicate n Unused) $ \ m ->
               map findOcc [0 .. n-1]  -- [0 .. max m (n - 1)] -- triggers issue #3049
+
         reportSDoc "tc.pos.args" 10 $ sep
           [ "args of" <+> prettyTCM q <+> "="
           , nest 2 $ prettyList $ map prettyTCM args
@@ -243,8 +242,22 @@ checkStrictlyPositive mi qset = do
         -- The list args can take a long time to compute, but contains
         -- small elements, and is stored in the interface (right?), so
         -- it is computed deep-strictly.
-        setArgOccurrences q $!! args
+        modifyArgOccurrences q (mergeOccs $!! args)
+
       where
+      mergeOccs :: [Occurrence] -> [Occurrence] -> [Occurrence]
+      mergeOccs poccs toccs =
+        -- Lucas, 2022-12-01:
+        -- `poccs` are the occurences computed by the positivity-checker
+        -- `toccs` are the occurences/polarities explicitely given by the user
+        --   (and enforced through type-checking)
+        -- We consider the polarities explicitely given (toccs) to take priority over the ones
+        -- found out by the positivity checker.
+        -- Note: Alas, this is hard to enforce given that non-annotated variables are
+        -- always annotated with Mixed polarity. If the annotated polarity is Mixed,
+        -- for now we always rely on the result from the positivity analysis.
+        align poccs toccs <&> mergeThese (\a b -> if b == Mixed then a else b)
+
       -- Andreas, 2018-11-23, issue #3404
       -- Only assign argument occurrences to things which have a definition.
       -- Things without a definition would be judged "constant" in all arguments,
@@ -264,28 +277,21 @@ checkStrictlyPositive mi qset = do
 
 getDefArity :: Definition -> TCM Int
 getDefArity def = do
-  subtract (projectionArgs def) <$> arity' (defType def)
-  where
-  -- A variant of "\t -> arity <$> instantiateFull t".
-  arity' :: Type -> TCM Int
-  arity' t = do
-    t <- instantiate t
-    case unEl t of
-      Pi _ t -> succ <$> arity' (unAbs t)
-      _      -> return 0
+  TelV tel _ <- telView (defType def)
+  return $ size tel - projectionArgs def
 
 -- Computing occurrences --------------------------------------------------
 
-data Item = AnArg Nat
+data Item = AnArg Nat [Occurrence]
           | ADef QName
   deriving (Eq, Ord, Show)
 
 instance HasRange Item where
-  getRange (AnArg _) = noRange
+  getRange (AnArg _ _) = noRange
   getRange (ADef qn)   = getRange qn
 
 instance Pretty Item where
-  prettyPrec p (AnArg i) = P.mparens (p > 9) $ "AnArg" P.<+> P.pretty i
+  prettyPrec p (AnArg i t) = P.mparens (p > 9) $ "AnArg" P.<+> P.pretty i P.<+> P.pretty t
   prettyPrec p (ADef qn) = P.mparens (p > 9) $ "ADef"  P.<+> P.pretty qn
 
 type Occurrences = Map Item [OccursWhere]
@@ -341,7 +347,7 @@ preprocess ob = case pp Nothing ob of
       keep = case (m, i) of
         (Nothing, _)      -> True
         (_, ADef _)       -> True
-        (Just m, AnArg i) -> i < m
+        (Just m, AnArg i _) -> i < m
 
 -- | An interpreter for 'OccurrencesBuilder'.
 --
@@ -376,7 +382,7 @@ data OccEnv = OccEnv
   }
 
 -- | Monad for computing occurrences.
-type OccM = Reader OccEnv
+type OccM = ReaderT OccEnv ReduceM
 
 instance (Semigroup a, Monoid a) => Monoid (OccM a) where
   mempty  = return mempty
@@ -398,7 +404,9 @@ getOccurrences
 getOccurrences vars a = do
   reportSDoc "tc.pos.occ" 70 $ "computing occurrences in " <+> text (show a)
   reportSDoc "tc.pos.occ" 20 $ "computing occurrences in " <+> prettyTCM a
-  runReader (occurrences a) . OccEnv vars . fmap nameOfInf <$> coinductionKit
+  reportSDoc "tc.pos.var" 20 $ "variables in context: " <+> pretty vars
+  env <- OccEnv vars . fmap nameOfInf <$> coinductionKit
+  runReduceM $ runReaderT (occurrences a) env
 
 class ComputeOccurrences a where
   occurrences :: a -> OccM OccurrencesBuilder
@@ -412,14 +420,16 @@ instance ComputeOccurrences Clause where
         items = IntMap.elems $ patItems ps -- sorted from low to high DBI
     -- TODO #3733: handle hcomp/transp clauses properly
     if hasDefP ps then return mempty else do
-    (Concat (mapMaybe matching (zip [0..] ps)) <>) <$> do
+      argOccs <- mapMaybeM matching $ zip [0..] ps
+      (Concat argOccs <>) <$> do
       withExtendedOccEnv' items $
         occurrences $ clauseBody cl
     where
-      matching (i, p)
-        | properlyMatching (namedThing $ unArg p) =
-            Just $ OccursAs Matched $ OccursHere $ AnArg i
-        | otherwise                  = Nothing
+      matching :: (Int, NamedArg (Pattern' a)) -> OccM (Maybe OccurrencesBuilder)
+      matching (i, p) = do
+        properlyMatching (namedThing $ unArg p) >>= \case
+          True -> return $ Just $ OccursAs Matched $ OccursHere $ AnArg i []
+          False -> return Nothing
 
       -- @patItems ps@ creates a map from the pattern variables of @ps@
       -- to the index of the argument they are bound in.
@@ -431,14 +441,26 @@ instance ComputeOccurrences Clause where
         where
           ixs = map dbPatVarIndex $ lefts $ map unArg $ patternVars $ namedThing <$> p
 
-          makeEntry x = singleton (x, Just $ AnArg i)
+          makeEntry x = singleton (x, Just $ AnArg i [])
 
 instance ComputeOccurrences Term where
   occurrences v = case unSpine v of
-    Var i args -> (asks (occI . vars)) <> (OccursAs VarArg <$> occurrences args)
+    Var i args ->
+      asks (occI . vars) <> do
+        occs <- mapM occurrences args
+
+        -- Lucas, 2022-12-01: Now, variables may have the polarities of their arguments
+        -- stored in the context (say, if the variable refers to a datatype parameter)
+        item <- reader ((!! i) . vars)
+
+        let getPol i = fromMaybe Mixed $ do
+              AnArg _ aoccs <- item
+              aoccs !!! i
+
+        return $ Concat $ zipWith (\i -> OccursAs (VarArg (getPol i) i)) [0..] occs
       where
-      occI vars = maybe mempty OccursHere $ indexWithDefault unbound vars i
-      unbound = flip trace __IMPOSSIBLE__ $
+        occI vars = maybe mempty OccursHere $ indexWithDefault unbound vars i
+        unbound = flip trace __IMPOSSIBLE__ $
               "impossible: occurrence of de Bruijn index " ++ show i ++
               " in vars " ++ show vars ++ " is unbound"
 
@@ -485,6 +507,9 @@ instance ComputeOccurrences a => ComputeOccurrences (Elim' a) where
   occurrences (Apply a)      = occurrences a
   occurrences (IApply x y a) = occurrences (x,(y,a)) -- TODO Andrea: conservative
 
+instance (ComputeOccurrences x, ComputeOccurrences a) => ComputeOccurrences (Boundary' x a) where
+  occurrences = occurrences . theBoundary
+
 instance ComputeOccurrences a => ComputeOccurrences (Arg a)   where
 instance ComputeOccurrences a => ComputeOccurrences (Dom a)   where
 instance ComputeOccurrences a => ComputeOccurrences [a]       where
@@ -492,6 +517,9 @@ instance ComputeOccurrences a => ComputeOccurrences (Maybe a) where
 
 instance (ComputeOccurrences a, ComputeOccurrences b) => ComputeOccurrences (a, b) where
   occurrences (x, y) = occurrences x <> occurrences y
+
+instance ComputeOccurrences Int where
+  occurrences _ = mempty
 
 -- | Computes the number of occurrences of different 'Item's in the
 -- given definition.
@@ -520,38 +548,42 @@ computeOccurrences' q = inConcreteOrAbstractMode q $ \ def -> do
         mapM (getOccurrences []) cs
 
     Datatype{dataClause = Just c} -> getOccurrences [] =<< instantiateFull c
-    Datatype{dataPars = np0, dataCons = cs}       -> do
+    Datatype{dataPars = np0, dataCons = cs, dataTranspIx = trx} -> do
       -- Andreas, 2013-02-27 (later edited by someone else): First,
       -- include each index of an inductive family.
-      TelV tel _ <- telView $ defType def
+      TelV telD _ <- telView $ defType def
       -- Andreas, 2017-04-26, issue #2554: count first index as parameter if it has type Size.
       -- We compute sizeIndex=1 if first first index has type Size, otherwise sizeIndex==0
-      sizeIndex <- caseList (drop np0 $ telToList tel) (return 0) $ \ dom _ -> do
+      sizeIndex <- caseList (drop np0 $ telToList telD) (return 0) $ \ dom _ -> do
         caseMaybeM (isSizeType dom) (return 0) $ \ _ -> return 1
       let np = np0 + sizeIndex
-      let xs = [np .. size tel - 1] -- argument positions corresponding to indices
-      let ioccs = Concat $ map (OccursHere . AnArg) [np0 .. np - 1]
-                        ++ map (OccursAs IsIndex . OccursHere . AnArg) xs
+      let xs = [np .. size telD - 1] -- argument positions corresponding to indices
+
+      let ioccs = Concat $ map (\i -> OccursHere $ AnArg i []) [np0 .. np - 1]
+                        ++ map (\i -> OccursAs IsIndex $ OccursHere $ AnArg i []) xs
+
       -- Then, we compute the occurrences in the constructor types.
       let conOcc c = do
             -- Andreas, 2020-02-15, issue #4447:
             -- Allow UnconfimedReductions here to make sure we get the constructor type
             -- in same way as it was obtained when the data types was checked.
             (TelV tel t, bnd) <- putAllowedReductions allReductions $
-              telViewUpToPathBoundary' (-1) . defType =<< getConstInfo c
+              telViewPathBoundary . defType =<< getConstInfo c
             let (tel0,tel1) = splitTelescopeAt np tel
             -- Do not collect occurrences in the data parameters.
             -- Normalization needed e.g. for test/succeed/Bush.agda.
             -- (Actually, for Bush.agda, reducing the parameters should be sufficient.)
             tel1' <- addContext tel0 $ normalise $ tel1
-            let vars    = map (Just . AnArg) . downFrom
-                varsTel = vars (size tel)
+
+            -- Make parameters into context items, with polarity info
+            pvars <- parametersToItems tel0 np
+            let telvars = replicate (size tel1') Nothing ++ pvars
+
+            reportSLn "tc.pos.params" 50 $ "Adding datatypes parameters in context " ++ prettyShow pvars
+
             -- Occurrences in the types of the constructor arguments.
-            mappend (mappend
-                       (OccursAs (ConArgType c) <$>
-                        getOccurrences (vars np) tel1')
-                       (OccursAs (ConEndpoint c) <$>
-                        getOccurrences varsTel bnd)) $ do
+            (OccursAs (ConArgType c) <$> getOccurrences pvars tel1') <>
+              (OccursAs (ConEndpoint c) <$> getOccurrences telvars bnd) <> do
               -- Occurrences in the indices of the data type the constructor targets.
               -- Andreas, 2020-02-15, issue #4447:
               -- WAS: @t@ is not necessarily a data type, but it could be something
@@ -564,8 +596,8 @@ computeOccurrences' q = inConcreteOrAbstractMode q $ \ def -> do
                 Def q' vs
                   | q == q' -> do
                       let indices = fromMaybe __IMPOSSIBLE__ $ allApplyElims $ drop np vs
-                      OccursAs (IndArgType c) . OnlyVarsUpTo np <$> getOccurrences varsTel indices
-                  | otherwise -> __IMPOSSIBLE__  -- this ought to be impossible now (but hasn't been before, see #4447)
+                      OccursAs (IndArgType c) . OnlyVarsUpTo np <$> getOccurrences telvars indices
+                  | otherwise -> __IMPOSSIBLE__  -- this ought to be impossible now (but wasn't, see #4447)
                 Pi{}       -> __IMPOSSIBLE__  -- eliminated  by telView
                 MetaV{}    -> __IMPOSSIBLE__  -- not a constructor target; should have been solved by now
                 Var{}      -> __IMPOSSIBLE__  -- not a constructor target
@@ -576,13 +608,17 @@ computeOccurrences' q = inConcreteOrAbstractMode q $ \ def -> do
                 Level{}    -> __IMPOSSIBLE__  -- not a type
                 DontCare{} -> __IMPOSSIBLE__  -- not a type
                 Dummy{}    -> __IMPOSSIBLE__
-      mconcat $ pure ioccs : map conOcc cs
+
+      -- If the data type has a transport constructor (i.e. it's an
+      -- indexed family in cubical mode) we should also consider it for
+      -- positivity.
+      mconcat $ pure ioccs : map conOcc (cs ++ maybeToList trx)
 
     Record{recClause = Just c} -> getOccurrences [] =<< instantiateFull c
     Record{recPars = np, recTel = tel} -> do
       let (tel0,tel1) = splitTelescopeAt np tel
-          vars = map (Just . AnArg) $ downFrom np
-      getOccurrences vars =<< addContext tel0 (normalise tel1) -- Andreas, 2017-01-01, issue #1899, treat like data types
+      pvars <- parametersToItems tel0 np
+      getOccurrences pvars =<< addContext tel0 (normalise tel1) -- Andreas, 2017-01-01, issue #1899, treat like data types
 
     -- Arguments to other kinds of definitions are hard-wired.
     Constructor{}      -> mempty
@@ -592,6 +628,13 @@ computeOccurrences' q = inConcreteOrAbstractMode q $ \ def -> do
     PrimitiveSort{}    -> mempty
     GeneralizableVar{} -> mempty
     AbstractDefn{}     -> __IMPOSSIBLE__
+  where
+    parametersToItems :: Telescope -> Nat -> TCM [Maybe Item]
+    parametersToItems tel n = reverse <$>
+      zipWithM (\i -> fmap (Just . AnArg i) . getOccurrencesFromType)
+        [0 .. n -1]
+        (snd . unDom <$> telToList tel)
+
 
 -- Building the occurrence graph ------------------------------------------
 
@@ -726,7 +769,7 @@ computeEdges muts q ob =
     OccursHere' i ->
       let o = OccursWhere (getRange i) cs os in
       case i of
-        AnArg i ->
+        AnArg i t ->
           return $ applyUnless (null pol) (Graph.Edge
             { Graph.source = ArgNode q i
             , Graph.target = to
@@ -749,7 +792,7 @@ computeEdges muts q ob =
     -> Where
     -> TCM (Maybe Node, Occurrence)
   mkEdge' to !pol = \case
-    VarArg         -> mixed
+    VarArg p i     -> addPol p
     MetaArg        -> mixed
     LeftOfArrow    -> negative
     DefArg d i     -> do
@@ -842,9 +885,10 @@ instance PrettyTCM (Seq OccursWhere) where
                           [prettyTCM q]
         UnderInf     -> pwords "under" ++
                         [do -- this cannot fail if an 'UnderInf' has been generated
-                            Def inf _ <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinInf
+                            inf <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinInf
                             prettyTCM inf]
-        VarArg       -> pwords "in an argument of a bound variable"
+        VarArg p i   -> pwords "in an argument of a bound variable at position" ++ [prettyTCM i]
+                        ++ pwords "which uses its argument with polarity" ++ [ pretty p ]
         MetaArg      -> pwords "in an argument of a metavariable"
         ConArgType c -> pwords "in the type of the constructor" ++ [prettyTCM c]
         IndArgType c -> pwords "in an index of the target type of the constructor" ++ [prettyTCM c]

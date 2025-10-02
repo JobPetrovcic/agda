@@ -10,11 +10,7 @@ module Agda.TypeChecking.Rewriting.NonLinPattern where
 
 import Prelude hiding ( null )
 
-import Control.Monad        ( (>=>), forM )
 import Control.Monad.Reader ( asks )
-
-import Data.IntSet (IntSet)
-import qualified Data.IntSet as IntSet
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
@@ -41,6 +37,8 @@ import Agda.Utils.Monad
 import Agda.Utils.Null
 import Agda.Utils.Singleton
 import Agda.Utils.Size
+import qualified Agda.Utils.VarSet as VarSet
+import Agda.Utils.VarSet (VarSet)
 
 -- | Turn a term into a non-linear pattern, treating the
 --   free variables as pattern variables.
@@ -123,7 +121,7 @@ instance PatternFrom Term NLPat where
     t <- abortIfBlocked t
     etaRecord <- isEtaRecordType t
     prop <- isPropM t
-    let r = if prop then Irrelevant else r0
+    let r = if prop then irrelevant else r0
     v <- unLevel =<< abortIfBlocked v
     reportSDoc "rewriting.build" 60 $ sep
       [ "building a pattern from term v = " <+> prettyTCM v
@@ -157,14 +155,14 @@ instance PatternFrom Term NLPat where
                _              -> return Nothing
            case sequence mbvs of
              Just bvs | fastDistinct bvs -> do
-               let allBoundVars = IntSet.fromList (downFrom k)
+               let allBoundVars = VarSet.full k
                    ok = not (isIrrelevant r) ||
-                        IntSet.fromList (map unArg bvs) == allBoundVars
+                        VarSet.fromList (map unArg bvs) == allBoundVars
                if ok then return (PVar i bvs) else done
              _ -> done
        | otherwise -> done
       (_ , _ ) | Just (d, pars) <- etaRecord -> do
-        def <- theDef <$> getConstInfo d
+        RecordDefn def <- theDef <$> getConstInfo d
         (tel, c, ci, vs) <- etaExpandRecord_ d pars def v
         ct <- assertConOf c t
         PDef (conName c) <$> patternFrom r k (ct , Con c ci) (map Apply vs)
@@ -243,9 +241,9 @@ instance NLPatToTerm NLPSort Sort where
 
 -- | Gather the set of pattern variables of a non-linear pattern
 class NLPatVars a where
-  nlPatVarsUnder :: Int -> a -> IntSet
+  nlPatVarsUnder :: Int -> a -> VarSet
 
-  nlPatVars :: a -> IntSet
+  nlPatVars :: a -> VarSet
   nlPatVars = nlPatVarsUnder 0
 
 instance {-# OVERLAPPABLE #-} (Foldable f, NLPatVars a) => NLPatVars (f a) where

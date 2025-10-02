@@ -1,10 +1,13 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
 module Agda.Utils.Tuple
-  ( (-*-)
+  (
+    (//)
+  , (-*-)
   , mapFst
   , mapSnd
   , (/\)
+  , sortPair
   , fst3
   , snd3
   , thd3
@@ -17,12 +20,22 @@ module Agda.Utils.Tuple
   , Pair(..)
   ) where
 
-import Control.Arrow  ((&&&))
-import Data.Bifunctor (bimap, first, second)
-import Data.Tuple (swap)
+import Control.Arrow   ( (&&&) )
+import Control.DeepSeq ( NFData )
+
+import Data.Bifunctor  ( bimap, first, second )
+import Data.Tuple      ( swap )
+
+import GHC.Generics    ( Generic )
 
 infix 2 -*-
 infix 3 /\ -- backslashes at EOL interact badly with CPP...
+
+{-# INLINE (//) #-}
+-- | Strict pairing.
+(//) :: a -> b -> (a, b)
+(//) !a !b = (a, b)
+infixr 4 //
 
 -- | Bifunctoriality for pairs.
 (-*-) :: (a -> c) -> (b -> d) -> (a,b) -> (c,d)
@@ -39,6 +52,12 @@ mapSnd = second
 -- | Lifted pairing.
 (/\) :: (a -> b) -> (a -> c) -> a -> (b,c)
 (/\) = (&&&)
+
+-- | Order a pair.
+sortPair :: Ord a => (a, a) -> (a, a)
+sortPair p@(x, y)
+  | x <= y    = p
+  | otherwise = (y, x)
 
 -- * Triple (stolen from Data.Tuple.HT)
 
@@ -75,8 +94,10 @@ mapSndM :: Functor m => (b -> m d) -> (a,b) -> m (a,d)
 mapSndM f ~(a,b) = (a,) <$> f b
 
 data Pair a = Pair a a
-  deriving (Eq, Functor, Foldable, Traversable)
+  deriving (Show, Eq, Generic, Functor, Foldable, Traversable)
 
 instance Applicative Pair where
   pure a                  = Pair a a
   Pair f f' <*> Pair a a' = Pair (f a) (f' a')
+
+instance NFData a => NFData (Pair a)

@@ -22,6 +22,7 @@ import Agda.Interaction.Monad
 import qualified Agda.Syntax.Abstract as A
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty
+import Agda.Syntax.Common.Pretty.ANSI (putDocLn)
 import Agda.Syntax.Internal (telToList, alwaysUnblock)
 import qualified Agda.Syntax.Internal as I
 import Agda.Syntax.Parser
@@ -36,7 +37,6 @@ import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Errors
 import Agda.TypeChecking.Pretty ( PrettyTCM(prettyTCM) )
 import Agda.TypeChecking.Substitute
-import Agda.TypeChecking.Warnings (runPM)
 
 import Agda.Utils.FileName (absolute, AbsolutePath)
 import Agda.Utils.Maybe (caseMaybeM)
@@ -58,6 +58,7 @@ newtype ReplM a = ReplM { unReplM :: ReaderT ReplEnv (StateT ReplState IM) a }
     , HasOptions, MonadTCEnv, ReadTCState, MonadTCState, MonadTCM
     , MonadError TCErr
     , MonadReader ReplEnv, MonadState ReplState
+    , MonadFileId
     )
 
 runReplM :: Maybe AbsolutePath -> TCM () -> (AbsolutePath -> TCM CheckResult) -> ReplM () -> TCM ()
@@ -107,8 +108,7 @@ interaction prompt cmds eval = loop
                     Just _ ->
                         do  go =<< liftTCM (eval $ fromJust ms)
             `catchError` \e ->
-                do  s <- renderError e
-                    liftIO $ putStrLn s
+                do  putDocLn =<< prettyError e
                     loop
 
 runInteractionLoop :: Maybe AbsolutePath -> TCM () -> (AbsolutePath -> TCM CheckResult) -> TCM ()
@@ -135,15 +135,18 @@ interactionLoop = do
     where
         reload :: ReplM () = do
             checked <- checkCurrentFile
-            liftTCM $ setScope $ maybe emptyScopeInfo (iInsideScope . crInterface) checked
+            liftTCM $ do
+              case checked of
+                Nothing    -> setScope emptyScopeInfo
+                Just scope -> do setScope (iInsideScope $ crInterface scope)
+                                 recomputeInverseScope
             -- Andreas, 2021-01-27, issue #5132, make Set and Prop available from Agda.Primitive
             -- if no module is loaded.
             when (isNothing checked) $ do
               -- @open import Agda.Primitive using (Set; Prop)@
               void $ liftTCM importPrimitives
           `catchError` \e -> do
-            s <- renderError e
-            liftIO $ putStrLn s
+            putDocLn =<< prettyError e
             liftIO $ putStrLn "Failed."
 
         commands =
@@ -174,7 +177,8 @@ continueAfter m = withCurrentFile $ do
 withCurrentFile :: ReplM a -> ReplM a
 withCurrentFile cont = do
   mpath <- gets currentFile
-  localTC (\ e -> e { envCurrentPath = mpath }) cont
+  i <- traverse idFromFile mpath
+  localTC (\ e -> e { envCurrentPath = i }) cont
 
 loadFile :: ReplM () -> [String] -> ReplM ()
 loadFile reload [file] = do
@@ -185,7 +189,7 @@ loadFile _ _ = liftIO $ putStrLn ":load file"
 
 showConstraints :: [String] -> TCM ()
 showConstraints [] =
-    do  cs <- BasicOps.getConstraints
+    do  cs <- BasicOps.getConstraints AsIs
         liftIO $ putStrLn $ unlines (List.map prettyShow cs)
 showConstraints _ = liftIO $ putStrLn ":constraints [cid]"
 
@@ -295,14 +299,14 @@ typeOf s =
     do  e  <- parseExpr (unwords s)
         e0 <- typeInCurrent Normalised e
         e1 <- typeInCurrent AsIs e
-        liftIO . putStrLn =<< showA e1
+        liftIO . print =<< prettyA e1
 
 typeIn :: [String] -> TCM ()
 typeIn s@(_:_:_) =
     actOnMeta s $ \i e ->
     do  e1 <- typeInMeta i Normalised e
         e2 <- typeInMeta i AsIs e
-        liftIO . putStrLn =<< showA e1
+        liftIO . print =<< prettyA e1
 typeIn _ = liftIO $ putStrLn ":typeIn meta expr"
 
 showContext :: [String] -> TCM ()
@@ -351,5 +355,4 @@ help cs = putStr $ unlines $
 readM :: Read a => String -> TCM a
 readM s = maybe err return $ readMaybe s
   where
-  err    = throwError $ strMsg $ "Cannot parse: " ++ s
-  strMsg = Exception noRange . text
+  err = throwError $ GenericException $ "Cannot parse: " ++ s

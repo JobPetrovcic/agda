@@ -32,7 +32,7 @@ import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Sort
 import Agda.TypeChecking.Telescope
 
-import Agda.Utils.Function (applyWhen)
+import Agda.Utils.Function (applyWhen, applyWhenM)
 import Agda.Utils.Functor (($>))
 import Agda.Utils.Maybe
 import Agda.Utils.Size
@@ -111,26 +111,39 @@ class CheckInternal a where
 
 instance CheckInternal Type where
   checkInternal' action (El s t) cmp _ = do
+    reportSDoc "tc.check.internal" 20 $ sep
+      [ "checking internal type "
+      , nest 2 $ sep [ prettyTCM t <+> ":"
+                     , nest 2 $ prettyTCM s ]
+      ]
     t' <- checkInternal' action t cmp (sort s)
     s' <- sortOf t'
+    reportSDoc "tc.check.internal" 30 $
+      "checking if sort" <+> prettyTCM s' <+>
+      "of" <+> prettyTCM t' <+>
+      "fits in given sort" <+> prettyTCM s
     compareSort cmp s' s
     return (El s t')
 
 instance CheckInternal Term where
   checkInternal' :: (MonadCheckInternal m) => Action m -> Term -> Comparison -> Type -> m Term
   checkInternal' action v cmp t = verboseBracket "tc.check.internal" 20 "" $ do
-    reportSDoc "tc.check.internal" 20 $ sep
-      [ "checking internal "
-      , nest 2 $ sep [ prettyTCM v <+> ":"
-                    , nest 2 $ prettyTCM t ] ]
-    reportSDoc "tc.check.internal" 60 $ sep
-      [ "checking internal with DB indices"
-      , nest 2 $ sep [ pretty v <+> ":"
-                    , nest 2 $ pretty t ] ]
-    ctx <- getContextTelescope
-    unless (null ctx) $ reportSDoc "tc.check.internal" 30 $ sep
-      [ "In context"
-      , nest 2 $ sep [ prettyTCM ctx ] ]
+
+    -- Debug print
+    verboseS "tc.check.internal" 20 do
+      reportSDoc "tc.check.internal" 20 $ sep
+        [ "checking internal "
+        , nest 2 $ sep [ prettyTCM v <+> ":"
+                      , nest 2 $ prettyTCM t ] ]
+      reportSDoc "tc.check.internal" 60 $ sep
+        [ "checking internal with DB indices"
+        , nest 2 $ sep [ pretty v <+> ":"
+                      , nest 2 $ pretty t ] ]
+      ctx <- getContextTelescope
+      unless (null ctx) $ reportSDoc "tc.check.internal" 30 $ sep
+        [ "In context"
+        , nest 2 $ sep [ prettyTCM ctx ] ]
+
     -- Bring projection-like funs in post-fix form,
     -- (even lone ones by default).
     v <- elimViewAction action =<< preAction action t v
@@ -147,6 +160,9 @@ instance CheckInternal Term where
 
         unless (usableCohesion d) $
           typeError $ VariableIsOfUnusableCohesion n (getCohesion d)
+
+        unless (usablePolarity d) $
+          typeError $ VariableIsOfUnusablePolarity n (getModalPolarity d)
 
         reportSDoc "tc.check.internal" 30 $ fsep
           [ "variable" , prettyTCM (var i) , "has type" , prettyTCM (unDom d)
@@ -165,10 +181,12 @@ instance CheckInternal Term where
       Con c ci vs -> do
         -- We need to fully apply the constructor to make getConType work!
         fullyApplyCon c vs t $ \ _d _dt _pars a vs' tel t -> do
-          Con c ci vs2 <- checkSpine action a (Con c ci) vs' cmp t
-          -- Strip away the extra arguments
-          return $ applySubst (strengthenS impossible (size tel))
-            $ Con c ci $ take (length vs) vs2
+          checkSpine action a (Con c ci) vs' cmp t >>= \case
+            Con c ci vs2 ->
+              -- Strip away the extra arguments
+              return $ applySubst (strengthenS impossible (size tel))
+                $ Con c ci $ take (length vs) vs2
+            _ -> __IMPOSSIBLE__
       Lit l      -> do
         lt <- litType l
         compareType cmp lt t
@@ -191,11 +209,17 @@ instance CheckInternal Term where
             -- Preserve NoAbs
             goInside = case b of
               Abs{}   -> addContext $ (absName b,) $
-                applyWhen experimental (mapRelevance irrToNonStrict) a
+                inverseApplyPolarity (withStandardLock UnusedPolarity) $
+                applyWhen experimental (mapRelevance irrelevantToShapeIrrelevant) a
               NoAbs{} -> id
-        a <- mkDom <$> checkInternal' action (unEl $ unDom a) CmpLeq (sort sa)
+        a <- applyWhenM (optPolarity <$> pragmaOptions) (applyPolarityToContext negativePolarity) $
+               mkDom <$> checkInternal' action (unEl $ unDom a) CmpLeq (sort sa)
         v' <- goInside $ Pi a . mkRng <$> checkInternal' action (unEl $ unAbs b) CmpLeq (sort sb)
         s' <- sortOf v -- Issue #6205: do not use v' since it might not be valid syntax
+        reportSDoc "tc.check.internal" 30 $
+          "checking if sort" <+> prettyTCM s' <+>
+          "of pi type" <+> prettyTCM v <+>
+          "fits in given sort" <+> prettyTCM s
         compareSort cmp s' s
         return v'
       Sort s     -> do
@@ -203,6 +227,10 @@ instance CheckInternal Term where
         s <- inferInternal' action s
         s' <- inferUnivSort s
         s'' <- shouldBeSort t
+        reportSDoc "tc.check.internal" 30 $
+          "checking if sort" <+> prettyTCM s' <+>
+          "of universe type" <+> prettyTCM v <+>
+          "fits in" <+> prettyTCM t
         compareSort cmp s' s''
         return $ Sort s
       Level l    -> do
@@ -325,6 +353,12 @@ checkSpine action a hd es cmp t = do
                    , nest 4 $ prettyTCM es <+> ":"
                    , nest 2 $ prettyTCM t ] ]
   (t' , es') <- inferSpine action a hd es
+  reportSDoc "tc.check.internal" 30 $ sep
+    [ "checking if "
+    , prettyTCM t'
+    , "is a subtype of"
+    , prettyTCM t
+    ]
   coerceSize (compareType cmp) (hd es) t' t
   return $ hd es'
 

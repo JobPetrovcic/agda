@@ -1,3 +1,6 @@
+-- {-# OPTIONS_GHC -Wunused-imports #-}  -- no, because of liftA2
+{-# OPTIONS_GHC -Wunused-matches #-}
+{-# OPTIONS_GHC -Wunused-binds #-}
 
 -- | Tools for patterns in concrete syntax.
 
@@ -17,7 +20,7 @@ import Agda.Utils.AffineHole
 import Agda.Utils.Functor
 import Agda.Utils.Impossible
 import Agda.Utils.List
-import Agda.Utils.List1  ( List1, pattern (:|) )
+import Agda.Utils.List1  ( List1, pattern (:|), (<|) )
 import Agda.Utils.List2  ( List2 )
 import Agda.Utils.Maybe
 import Agda.Utils.Singleton
@@ -77,9 +80,9 @@ instance IsWithP p => IsWithP (Named n p) where
 --
 -- (This view discards 'PatInfo'.)
 data LHSPatternView
-  = LHSAppP  [NamedArg Pattern]
+  = LHSAppP  (List1 (NamedArg Pattern))
       -- ^ Application patterns (non-empty list).
-  | LHSWithP [Pattern]
+  | LHSWithP (List1 Pattern)
       -- ^ With patterns (non-empty list).
       --   These patterns are not prefixed with 'WithP'.
 
@@ -91,22 +94,22 @@ lhsPatternView :: [NamedArg Pattern] -> Maybe (LHSPatternView, [NamedArg Pattern
 lhsPatternView [] = Nothing
 lhsPatternView (p0 : ps) =
   case namedArg p0 of
-    WithP _i p   -> Just (LHSWithP (p : map namedArg ps1), ps2)
+    WithP _i p   -> Just (LHSWithP (p :| map namedArg ps1), ps2)
       where
       (ps1, ps2) = spanJust isWithP ps
     -- If the next pattern is an application pattern, collect more of these
-    _ -> Just (LHSAppP (p0 : ps1), ps2)
+    _ -> Just (LHSAppP (p0 :| ps1), ps2)
       where
       (ps1, ps2) = span (isNothing . isWithP) ps
 
 -- | Add applicative patterns (non-projection / non-with patterns) to the right.
-lhsCoreApp :: LHSCore -> [NamedArg Pattern] -> LHSCore
+lhsCoreApp :: LHSCore -> List1 (NamedArg Pattern) -> LHSCore
 lhsCoreApp (LHSEllipsis r core) ps = LHSEllipsis r $ lhsCoreApp core ps
-lhsCoreApp core ps = core { lhsPats = lhsPats core ++ ps }
+lhsCoreApp core ps = core { lhsPats = lhsPats core ++ List1.toList ps }
 
 -- | Add with-patterns to the right.
-lhsCoreWith :: LHSCore -> [Pattern] -> LHSCore
-lhsCoreWith (LHSWith core wps []) wps' = LHSWith core (wps ++ wps') []
+lhsCoreWith :: LHSCore -> List1 Pattern -> LHSCore
+lhsCoreWith (LHSWith core wps []) wps' = LHSWith core (wps <> wps') []
 lhsCoreWith core                  wps' = LHSWith core wps' []
 
 -- | Append patterns to 'LHSCore', separating with patterns from the rest.
@@ -169,8 +172,8 @@ class CPatternLike p where
   traverseCPatternA = traverse . traverseCPatternA
 
   -- | Traverse pattern.
-  traverseCPatternM
-    :: Monad m => (Pattern -> m Pattern)  -- ^ @pre@: Modification before recursion.
+  traverseCPatternM :: Monad m
+    => (Pattern -> m Pattern)  -- ^ @pre@: Modification before recursion.
     -> (Pattern -> m Pattern)  -- ^ @post@: Modification after recursion.
     -> p -> m p
 
@@ -193,12 +196,12 @@ instance CPatternLike Pattern where
       ParenP _ p      -> foldrCPattern f p
       AsP _ _ p       -> foldrCPattern f p
       WithP _ p       -> foldrCPattern f p
-      RecP _ ps       -> foldrCPattern f ps
+      RecP _ _ ps     -> foldrCPattern f ps
       EllipsisP _ mp  -> foldrCPattern f mp
       -- Nonrecursive cases:
       IdentP _ _      -> mempty
       WildP _         -> mempty
-      DotP _ _        -> mempty
+      DotP _ _ _      -> mempty
       AbsurdP _       -> mempty
       LitP _ _        -> mempty
       QuoteP _        -> mempty
@@ -214,12 +217,12 @@ instance CPatternLike Pattern where
       ParenP    r p       -> ParenP r      <$> traverseCPatternA f p
       AsP       r x p     -> AsP r x       <$> traverseCPatternA f p
       WithP     r p       -> WithP r       <$> traverseCPatternA f p
-      RecP      r ps      -> RecP r        <$> traverseCPatternA f ps
+      RecP  kwr r ps      -> RecP kwr r    <$> traverseCPatternA f ps
       EllipsisP r mp      -> EllipsisP r   <$> traverseCPatternA f mp
       -- Nonrecursive cases:
       IdentP _ _      -> pure p0
       WildP _         -> pure p0
-      DotP _ _        -> pure p0
+      DotP _ _ _      -> pure p0
       AbsurdP _       -> pure p0
       LitP _ _        -> pure p0
       QuoteP _        -> pure p0
@@ -237,12 +240,12 @@ instance CPatternLike Pattern where
       ParenP    r p       -> ParenP r      <$> traverseCPatternM pre post p
       AsP       r x p     -> AsP r x       <$> traverseCPatternM pre post p
       WithP     r p       -> WithP r       <$> traverseCPatternM pre post p
-      RecP      r ps      -> RecP r        <$> traverseCPatternM pre post ps
+      RecP  kwr r ps      -> RecP kwr r    <$> traverseCPatternM pre post ps
       EllipsisP r mp      -> EllipsisP r   <$> traverseCPatternM pre post mp
       -- Nonrecursive cases:
       IdentP _ _      -> return p0
       WildP _         -> return p0
-      DotP _ _        -> return p0
+      DotP _ _ _      -> return p0
       AbsurdP _       -> return p0
       LitP _ _        -> return p0
       QuoteP _        -> return p0
@@ -309,7 +312,7 @@ patternQNames p = foldCPattern f p `appEndo` []
   f = \case
     IdentP _ x     -> Endo (x :)
     OpAppP _ x _ _ -> Endo (x :)
-    AsP _ x _      -> mempty  -- x must be a bound name, can't be a constructor!
+    AsP _ _x _     -> mempty  -- _x must be a bound name, can't be a constructor!
     AppP _ _       -> mempty
     WithP _ _      -> mempty
     RawAppP _ _    -> mempty
@@ -317,11 +320,11 @@ patternQNames p = foldCPattern f p `appEndo` []
     ParenP _ _     -> mempty
     WildP _        -> mempty
     AbsurdP _      -> mempty
-    DotP _ _       -> mempty
+    DotP _ _ _     -> mempty
     LitP _ _       -> mempty
     QuoteP _       -> mempty
     InstanceP _ _  -> mempty
-    RecP _ _       -> mempty
+    RecP _ _ _     -> mempty
     EqualP _ _     -> mempty
     EllipsisP _ _  -> mempty
 
@@ -354,16 +357,17 @@ hasEllipsis' = traverseCPatternA $ \ p mp ->
     EllipsisP _ Nothing -> OneHole id p
     _                   -> mp
 
+-- | Reconstruct the ellipsis, used in printing (AbstractToConcrete).
 reintroduceEllipsis :: ExpandedEllipsis -> Pattern -> Pattern
 reintroduceEllipsis (ExpandedEllipsis r k) p | hasWithPatterns p =
   let (args, wargs) = splitEllipsis k $ List1.toList $ patternAppView p
       (hd,args') = fromMaybe __IMPOSSIBLE__ $ uncons args
-      core = foldl AppP (namedArg hd) args
+      core = foldl AppP (namedArg hd) args'
   in foldl AppP (EllipsisP r $ Just $ core) wargs
 reintroduceEllipsis _ p = p
 
 splitEllipsis :: (IsWithP p) => Int -> [p] -> ([p],[p])
-splitEllipsis k [] = ([] , [])
+splitEllipsis _ [] = ([] , [])
 splitEllipsis k (p:ps)
   | isJust (isWithP p) = if
       | k == 0    -> ([] , p:ps)
@@ -381,7 +385,7 @@ splitEllipsis k (p:ps)
 patternAppView :: Pattern -> List1 (NamedArg Pattern)
 patternAppView = \case
     AppP p arg      -> patternAppView p `List1.appendList` [arg]
-    OpAppP _ x _ ps -> defaultNamedArg (IdentP True x) :| ps
+    OpAppP _ x _ ps -> defaultNamedArg (IdentP True x) <| ps
     ParenP _ p      -> patternAppView p
     RawAppP _ _     -> __IMPOSSIBLE__
     p               -> singleton $ defaultNamedArg p

@@ -3,20 +3,16 @@
 -- uses of projection functions.
 
 module Agda.TypeChecking.RecordPatterns
-  ( translateRecordPatterns
-  , translateCompiledClauses
+  ( translateCompiledClauses
   , translateSplitTree
   , recordPatternToProjections
   , recordRHSToCopatterns
   ) where
 
 import Control.Arrow          ( first, second )
-import Control.Monad          ( forM, join, unless, when, zipWithM )
-import Control.Monad.Fix      ( mfix )
 import Control.Monad.IO.Class ( MonadIO(..) )
 import Control.Monad.Reader   ( MonadReader(..), ReaderT(..), runReaderT )
 import Control.Monad.State    ( MonadState(..), StateT(..), runStateT )
-import Control.Monad.Trans    ( lift )
 
 import qualified Data.List as List
 import Data.Maybe
@@ -27,10 +23,12 @@ import Agda.Syntax.Common.Pretty (Pretty(..), prettyShow)
 import Agda.Syntax.Common
 import Agda.Syntax.Internal as I
 import Agda.Syntax.Internal.Pattern as I
+import Agda.Syntax.Info
 
 import Agda.TypeChecking.CompiledClause
 import Agda.TypeChecking.Coverage.SplitTree
 import Agda.TypeChecking.Datatypes
+import Agda.TypeChecking.Functions ( etaExpandClause )
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Pretty hiding (pretty)
 import Agda.TypeChecking.Records
@@ -40,6 +38,7 @@ import Agda.TypeChecking.Telescope
 
 import Agda.Interaction.Options
 
+import qualified Agda.Utils.SmallSet as SmallSet
 import Agda.Utils.Either
 import Agda.Utils.Function
 import Agda.Utils.Functor
@@ -134,25 +133,35 @@ getEtaAndArity SplitCatchall = return (False, 1)
 
 translateCompiledClauses
   :: forall m. (HasConstInfo m, MonadChange m)
-  => CompiledClauses -> m CompiledClauses
-translateCompiledClauses cc = ignoreAbstractMode $ do
+  => QName
+  -> CompiledClauses
+  -> m CompiledClauses
+translateCompiledClauses defn cc = ignoreAbstractMode $ do
   reportSDoc "tc.cc.record" 20 $ vcat
     [ "translate record patterns in compiled clauses"
     , nest 2 $ return $ pretty cc
     ]
+
   cc <- loop cc
   reportSDoc "tc.cc.record" 20 $ vcat
     [ "translated compiled clauses (no eta record patterns):"
     , nest 2 $ return $ pretty cc
     ]
-  cc <- recordExpressionsToCopatterns cc
-  reportSDoc "tc.cc.record" 20 $ vcat
-    [ "translated compiled clauses (record expressions to copatterns):"
-    , nest 2 $ return $ pretty cc
-    ]
-  return cc
-  where
 
+  -- If the function these clauses belong to is marked INLINE then we do
+  -- not perform record expression to copattern translation.
+  isinl <- isInlineFun . theDef <$> getConstInfo defn
+  if
+    | isinl -> cc <$ do
+      reportSDoc "tc.cc.record" 20 $ "record expressions to copatterns skipped because" <+> prettyTCM defn <+> "is inline"
+    | otherwise -> do
+      cc <- recordExpressionsToCopatterns cc
+      reportSDoc "tc.cc.record" 20 $ vcat
+        [ "translated compiled clauses (record expressions to copatterns):"
+        , nest 2 $ return $ pretty cc
+        ]
+      pure cc
+  where
     loop :: CompiledClauses -> m (CompiledClauses)
     loop cc = case cc of
       Fail{}    -> return cc
@@ -167,10 +176,10 @@ translateCompiledClauses cc = ignoreAbstractMode $ do
                        , etaBranch      = eta
                        , litBranches    = litMap
                        , fallThrough    = fT
-                       , catchAllBranch = catchAll
+                       , catchallBranch = catchall
                        , lazyMatch      = lazy } = do
 
-      catchAll <- traverse loop catchAll
+      catchall <- traverse loop catchall
       litMap   <- traverse loop litMap
       (conMap, eta) <- do
         let noEtaCase = (, Nothing) <$> (traverse . traverse) loop conMap
@@ -191,24 +200,8 @@ translateCompiledClauses cc = ignoreAbstractMode $ do
                         , etaBranch      = eta
                         , litBranches    = litMap
                         , fallThrough    = fT
-                        , catchAllBranch = catchAll
+                        , catchallBranch = catchall
                         }
-
-{- UNUSED
-instance Monoid CompiledClauses where
-  mempty = __IMPOSSIBLE__
-  mappend (Case n c) (Case n' c') | n == n' = Case n $ mappend c c'
-  mappend _ _ = __IMPOSSIBLE__
-
-mergeCatchAll :: CompiledClauses -> Maybe CompiledClauses -> CompiledClauses
-mergeCatchAll cc ca = maybe cc (mappend cc) ca
-{-
-  case (cc, ca) of
-    (_       , Nothing) -> cc
-    (Case n c, Just (Case n' c')) | n == n' -> Case n $ mappend c c'
-    _                   -> __IMPOSSIBLE__ -- this would mean non-determinism
--}
--}
 
 
 -- | Transform definitions returning record values to use copatterns instead.
@@ -242,10 +235,10 @@ recordRHSToCopatterns ::
      forall m. (MonadChange m, PureTCM m)
   => Clause
   -> m [Clause]
-recordRHSToCopatterns cl = do
+recordRHSToCopatterns cl0 = do
   reportSLn "tc.inline.con" 40 $ "enter recordRHSToCopatterns"
 
-  case cl of
+  etaExpandClause cl0 >>= \case
 
     -- RHS must be fully applied coinductive constructor/record expression.
     cl@Clause{ namedClausePats = ps
@@ -258,7 +251,7 @@ recordRHSToCopatterns cl = do
 
           -- Only expand constructors labelled @{-# INLINE c #-}@.
       -> inlineConstructor c >>= \case
-        Nothing  -> return [cl]
+        Nothing  -> return [cl0]
         Just eta -> do
 
           mt <- traverse reduce mt
@@ -282,6 +275,12 @@ recordRHSToCopatterns cl = do
 
               mt' :: Maybe (Arg Type) <- fuse <$> traverse (traverse inst) mt
 
+              reportSDoc "tc.inline.con" 50 $ vcat
+                [ "for field" <+> prettyTCM (unArg f) <+> ": "
+                , "  mt  =" <+> prettyTCM mt
+                , "  mt' =" <+> prettyTCM mt'
+                ]
+
               -- Make clause ... .f = v
               return cl
                 { namedClausePats = ps ++ [ unnamed . ProjP ProjSystem <$> f ]
@@ -290,7 +289,7 @@ recordRHSToCopatterns cl = do
                 }
 
     -- Otherwise: no change.
-    cl -> return [cl]
+    _ -> return [cl0]
 
   where
     -- @Nothing@ means do not inline, @Just eta@ means inline.
@@ -311,7 +310,7 @@ recordExpressionsToCopatterns
 recordExpressionsToCopatterns = \case
     Case i bs -> Case i <$> traverse recordExpressionsToCopatterns bs
     cc@Fail{} -> return cc
-    cc@(Done xs (Con c ConORec es)) -> do  -- don't translate if using the record /constructor/
+    cc@(Done no clrec xs (Con c co es)) | co `elem` [ConORec, ConORecWhere] -> do  -- don't translate if using the record /constructor/
       let vs = map unArg $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
       irrProj <- optIrrelevantProjections <$> pragmaOptions
       getConstructorInfo (conName c) >>= \ case
@@ -325,123 +324,19 @@ recordExpressionsToCopatterns = \case
                 traverse recordExpressionsToCopatterns $ Branches
                   { projPatterns   = True
                   , conBranches    = Map.fromListWith __IMPOSSIBLE__ $
-                      zipWith (\ f v -> (unDom f, WithArity 0 $ Done xs v)) fs vs
+                      zipWith (\ f v -> (unDom f, WithArity 0 $ Done no clrec xs v)) fs vs
                   , etaBranch      = Nothing
                   , litBranches    = Map.empty
-                  , catchAllBranch = Nothing
+                  , catchallBranch = Nothing
                   , fallThrough    = Nothing
                   , lazyMatch      = False
                   }
         _ -> return cc
     cc@Done{} -> return cc
 
--- UNUSED Liang-Ting Chen 2019-07-16
----- | @replaceByProjections i projs cc@ replaces variables @i..i+n-1@
-----   (counted from left) by projections @projs_1 i .. projs_n i@.
-----
-----   If @n==0@, we matched on a zero-field record, which means that
-----   we are actually introduce a new variable, increasing split
-----   positions greater or equal to @i@ by one.
-----   Otherwise, we have to lower
-----
---replaceByProjections :: Arg Int -> [QName] -> CompiledClauses -> CompiledClauses
---replaceByProjections (Arg ai i) projs cc =
---  let n = length projs
---
---      loop :: Int -> CompiledClauses -> CompiledClauses
---      loop i cc = case cc of
---        Case j cs
---
---        -- if j < i, we leave j untouched, but we increase i by the number
---        -- of variables replacing j in the branches
---          | unArg j < i -> Case j $ loops i cs
---
---        -- if j >= i then we shrink j by (n-1)
---          | otherwise   -> Case (j <&> \ k -> k - (n-1)) $ fmap (loop i) cs
---
---        Done xs v ->
---        -- we have to delete (n-1) variables from xs
---        -- and instantiate v suitably with the projections
---          let (xs0,xs1,xs2)     = cutSublist i n xs
---              names | null xs1  = ["r"]
---                    | otherwise = map unArg xs1
---              x                 = Arg ai $ foldr1 appendArgNames names
---              xs'               = xs0 ++ x : xs2
---              us                = map (\ p -> Var 0 [Proj ProjSystem p]) (reverse projs)
---              -- go from level (i + n - 1) to index (subtract from |xs|-1)
---              index             = length xs - (i + n)
---          in  Done xs' $ applySubst (liftS (length xs2) $ us ++# raiseS 1) v
---          -- The body is NOT guarded by lambdas!
---          -- WRONG: underLambdas i (flip apply) (map defaultArg us) v
---
---        Fail -> Fail
---
---      loops :: Int -> Case CompiledClauses -> Case CompiledClauses
---      loops i bs@Branches{ conBranches    = conMap
---                         , litBranches    = litMap
---                         , catchAllBranch = catchAll } =
---        bs{ conBranches    = fmap (\ (WithArity n c) -> WithArity n $ loop (i + n - 1) c) conMap
---          , litBranches    = fmap (loop (i - 1)) litMap
---          , catchAllBranch = fmap (loop i) catchAll
---          }
---  in  loop i cc
-
--- UNUSED Liang-Ting 2019-07-16
----- | Check if a split is on a record constructor, and return the projections
-----   if yes.
---isRecordCase :: Case c -> TCM (Maybe ([QName], c))
---isRecordCase (Branches { conBranches = conMap
---                       , litBranches = litMap
---                       , catchAllBranch = Nothing })
---  | Map.null litMap
---  , [(con, WithArity _ br)] <- Map.toList conMap = do
---    isRC <- isRecordConstructor con
---    case isRC of
---      Just (r, Record { recFields = fs }) -> return $ Just (map unArg fs, br)
---      Just (r, _) -> __IMPOSSIBLE__
---      Nothing -> return Nothing
---isRecordCase _ = return Nothing
-
 ---------------------------------------------------------------------------
 -- * Record pattern translation for split trees
 ---------------------------------------------------------------------------
---UNUSED Liang-Ting Chen 2019-07-16
----- | Split tree annotation.
---data RecordSplitNode = RecordSplitNode
---  { _splitTag           :: SplitTag -- ^ Constructor name/literal for this branch.
---  , _splitArity         :: Int      -- ^ Arity of the constructor.
---  , _splitRecordPattern :: Bool     -- ^ Should we translate this split away?
---  }
-
--- | Split tree annotated for record pattern translation.
---type RecordSplitTree  = SplitTree' RecordSplitNode
---type RecordSplitTrees = SplitTrees' RecordSplitNode
-
---UNUSED Liang-Ting Chen 2019-07-16
----- | Bottom-up procedure to annotate split tree.
---recordSplitTree :: SplitTree -> TCM RecordSplitTree
---recordSplitTree = snd <.> loop
---  where
---
---    loop :: SplitTree -> TCM ([Bool], RecordSplitTree)
---    loop = \case
---      SplittingDone n -> return (replicate n True, SplittingDone n)
---      SplitAt i ts    -> do
---        (xs, ts) <- loops (unArg i) ts
---        return (xs, SplitAt i ts)
---
---    loops :: Int -> SplitTrees -> TCM ([Bool], RecordSplitTrees)
---    loops i ts = do
---      (xss, ts) <- unzip <$> do
---        forM ts $ \ (c, t) -> do
---          (xs, t) <- loop t
---          (isRC, n) <- getEtaAndArity c
---          let (xs0, rest) = splitAt i xs
---              (xs1, xs2)  = splitAt n rest
---              x           = isRC && and xs1
---              xs'         = xs0 ++ x : xs2
---          return (xs, (RecordSplitNode c n x, t))
---      return (foldl1 (zipWith (&&)) xss, ts)
 
 -- | Bottom-up procedure to record-pattern-translate split tree.
 translateSplitTree :: SplitTree -> TCM SplitTree
@@ -469,7 +364,7 @@ translateSplitTree = snd <.> loop
         return (xs, t')
 
     -- @loops i ts = return (x, xs, ts')@ cf. @loop@
-    -- @x@ says wether at arg @i@ we have a record pattern split
+    -- @x@ says whether at arg @i@ we have a record pattern split
     -- that can be removed
     loops :: Int -> SplitTrees -> TCM (Bool, [Bool], SplitTrees)
     loops i ts = do
@@ -516,385 +411,3 @@ instance DropFrom (c, SplitTree' c) where
 
 instance DropFrom a => DropFrom [a] where
   dropFrom i n ts = map (dropFrom i n) ts
-
-{-
--- | Check if a split is on a record constructor, and return the projections
---   if yes.
-isRecordSplit :: SplitTrees -> TCM (Maybe ([QName], c))
-isRecordSplit (Branches { conBranches = conMap
-                       , litBranches = litMap
-                       , catchAllBranch = Nothing })
-  | Map.null litBranches
-  , [(con,br)] <- Map.toList conMap = do
-    isRC <- isRecordConstructor con
-    case isRC of
-      Just (r, Record { recFields = fs }) -> return $ Just (map unArg fs, br)
-      Just (r, _) -> __IMPOSSIBLE__
-      Nothing -> return Nothing
-isRecordSplit _ = return Nothing
-
--}
-
-
----------------------------------------------------------------------------
--- * Record pattern translation for function definitions
----------------------------------------------------------------------------
-
--- | Replaces pattern matching on record constructors with uses of
--- projection functions. Does not remove record constructor patterns
--- which have sub-patterns containing non-record constructor or
--- literal patterns.
-
-translateRecordPatterns :: Clause -> TCM Clause
-translateRecordPatterns clause = do
-  -- ps: New patterns, in left-to-right order, in the context of the
-  -- old RHS.
-
-  -- s: Partial substitution taking the old pattern variables
-  -- (including dot patterns; listed from left to right) to terms in
-  -- the context of the new RHS.
-
-  -- cs: List of changes, with types in the context of the old
-  -- telescope.
-
-  (ps, s, cs) <- runRecPatM $ translatePatterns $ unnumberPatVars $ namedClausePats clause
-
-  let -- Number of variables + dot patterns in new clause.
-      noNewPatternVars = size cs
-
-      s'   = reverse s
-      mkSub s = s ++# raiseS noNewPatternVars
-
-      -- Substitution used to convert terms in the old RHS's
-      -- context to terms in the new RHS's context.
-      rhsSubst = mkSub s' -- NB:: Defined but not used
-
-      -- Substitution used to convert terms in the old telescope's
-      -- context to terms in the new RHS's context.
-      perm = fromMaybe __IMPOSSIBLE__ $ clausePerm clause
-      rhsSubst' = mkSub $ permute (reverseP perm) s'
-      -- TODO: Is it OK to replace the definition above with the
-      -- following one?
-      --
-      --   rhsSubst' = mkSub $ permute (clausePerm clause) s
-
-      -- The old telescope, flattened and in textual left-to-right
-      -- order (i.e. the type signature for the variable which occurs
-      -- first in the list of patterns comes first).
-      flattenedOldTel =
-        permute (invertP __IMPOSSIBLE__ $ compactP perm) $
-        zip (teleNames $ clauseTel clause) $
-        flattenTel $
-        clauseTel clause
-
-      -- The new telescope, still flattened, with types in the context
-      -- of the new RHS, in textual left-to-right order, and with
-      -- Nothing in place of dot patterns.
-      substTel = map . fmap . second . applySubst
-      newTel' =
-        substTel rhsSubst' $
-        translateTel cs $
-        flattenedOldTel
-
-      -- Permutation taking the new variable and dot patterns to the
-      -- new telescope.
-      newPerm = adjustForDotPatterns $
-                  reorderTel_ $ map (maybe __DUMMY_DOM__ snd) newTel'
-        -- It is important that __DUMMY_DOM__ does not mention any variable
-        -- (see the definition of reorderTel).
-        where
-        isDotP n = case List.genericIndex cs n of
-                     Left DotP{} -> True
-                     _           -> False
-
-        adjustForDotPatterns (Perm n is) =
-          Perm n (filter (not . isDotP) is)
-
-      -- Substitution used to convert terms in the new RHS's context
-      -- to terms in the new telescope's context.
-      lhsSubst' = renaming impossible (reverseP newPerm)
-
-      -- Substitution used to convert terms in the old telescope's
-      -- context to terms in the new telescope's context.
-      lhsSubst = applySubst lhsSubst' rhsSubst'
-
-      -- The new telescope.
-      newTel =
-        uncurry unflattenTel . unzip $
-        map (fromMaybe __IMPOSSIBLE__) $
-        permute newPerm $
-        substTel lhsSubst' $
-        newTel'
-
-      -- New clause.
-      c = clause
-            { clauseTel       = newTel
-            , namedClausePats = numberPatVars __IMPOSSIBLE__ newPerm $ applySubst lhsSubst ps
-            , clauseBody      = applySubst lhsSubst $ clauseBody clause
-            }
-
-  reportSDoc "tc.lhs.recpat" 20 $ vcat
-      [ "Original clause:"
-      , nest 2 $ inTopContext $ vcat
-        [ "delta =" <+> prettyTCM (clauseTel clause)
-        , "pats  =" <+> text (show $ clausePats clause)
-        ]
-      , "Intermediate results:"
-      , nest 2 $ vcat
-        [ "ps        =" <+> text (show ps)
-        , "s         =" <+> prettyTCM s
-        , "cs        =" <+> prettyTCM cs
-        , "flattenedOldTel =" <+> (text . show) flattenedOldTel
-        , "newTel'   =" <+> (text . show) newTel'
-        , "newPerm   =" <+> prettyTCM newPerm
-        ]
-      ]
-
-  reportSDoc "tc.lhs.recpat" 20 $ vcat
-        [ "lhsSubst' =" <+> (text . show) lhsSubst'
-        , "lhsSubst  =" <+> (text . show) lhsSubst
-        , "newTel  =" <+> prettyTCM newTel
-        ]
-
-  reportSDoc "tc.lhs.recpat" 10 $
-    escapeContext impossible (size $ clauseTel clause) $ vcat
-      [ "Translated clause:"
-      , nest 2 $ vcat
-        [ "delta =" <+> prettyTCM (clauseTel c)
-        , "ps    =" <+> text (show $ clausePats c)
-        , "body  =" <+> text (show $ clauseBody c)
-        , "body  =" <+> addContext (clauseTel c) (maybe "_|_" prettyTCM (clauseBody c))
-        ]
-      ]
-
-  return c
-
-------------------------------------------------------------------------
--- Record pattern monad
-
--- | A monad used to translate record patterns.
---
--- The state records the number of variables produced so far, the
--- reader records the total number of variables produced by the entire
--- computation. Functions using this monad need to be sufficiently
--- lazy in the reader component.
-
-newtype RecPatM a = RecPatM (TCMT (ReaderT Nat (StateT Nat IO)) a)
-  deriving (Functor, Applicative, Monad,
-            MonadIO, MonadTCM, HasOptions,
-            MonadTCEnv, MonadTCState)
-
--- | Runs a computation in the 'RecPatM' monad.
-
-runRecPatM :: RecPatM a -> TCM a
-runRecPatM (RecPatM m) =
-  mapTCMT (\m -> do
-             (x, noVars) <- mfix $ \ ~(_, noVars) ->
-                              runStateT (runReaderT m noVars) 0
-             return x)
-          m
-
--- | Returns the next pattern variable, and the corresponding term.
-
-nextVar :: RecPatM (Pattern, Term)
-nextVar = RecPatM $ do
-  n <- lift get
-  lift $ put $ succ n
-  noVars <- lift ask
-  return (varP "r", var $ noVars - n - 1)
-
-------------------------------------------------------------------------
--- Types used to record changes to a clause
-
--- | @VarPat@ stands for variable patterns, and @DotPat@ for dot
--- patterns.
-
-data Kind = VarPat | DotPat
-  deriving Eq
-
--- | @'Left' p@ means that a variable (corresponding to the pattern
--- @p@, a variable or dot pattern) should be kept unchanged. @'Right'
--- (n, x, t)@ means that @n 'VarPat'@ variables, and @n 'DotPat'@ dot
--- patterns, should be removed, and a new variable, with the name @x@,
--- inserted instead. The type of the new variable is @t@.
-
-type Change  = Either Pattern (Kind -> Nat, ArgName, Dom Type)
-type Changes = [Change]
-
-instance Pretty (Kind -> Nat) where
-  pretty f =
-    ("(VarPat:" P.<+> P.text (show $ f VarPat) P.<+>
-    "DotPat:"  P.<+> P.text (show $ f DotPat)) <> ")"
-
-instance PrettyTCM (Kind -> Nat) where
-  prettyTCM = return . pretty
-
-instance PrettyTCM Change where
-  prettyTCM (Left  p) = prettyTCM p
-  prettyTCM (Right (f, x, t)) = "Change" <+> prettyTCM f <+> text x <+> prettyTCM t
-
--- | Record pattern trees.
-
-data RecordTree
-  = Leaf Pattern
-    -- ^ Corresponds to variable and dot patterns; contains the
-    -- original pattern.
-  | RecCon (Arg Type) [(Term -> Term, RecordTree)]
-    -- ^ @RecCon t args@ stands for a record constructor application:
-    -- @t@ is the type of the application, and the list contains a
-    -- projection function and a tree for every argument.
-
-------------------------------------------------------------------------
--- Record pattern trees
-
--- | @projections t@ returns a projection for every non-dot leaf
--- pattern in @t@. The term is the composition of the projection
--- functions from the leaf to the root.
---
--- Every term is tagged with its origin: a variable pattern or a dot
--- pattern.
-
-projections :: RecordTree -> [(Term -> Term, Kind)]
-projections (Leaf (DotP{})) = [(id, DotPat)]
-projections (Leaf (VarP{})) = [(id, VarPat)]
-projections (Leaf _)        = __IMPOSSIBLE__
-projections (RecCon _ args) =
-  concatMap (\ (p, t) -> map (first (. p)) $ projections t)
-            args
-
--- | Converts a record tree to a single pattern along with information
--- about the deleted pattern variables.
-
-removeTree :: RecordTree -> RecPatM (Pattern, [Term], Changes)
-removeTree tree = do
-  (pat, x) <- nextVar
-  let ps = projections tree
-      s  = map (\(p, _) -> p x) ps
-
-      count k = length $ filter ((== k) . snd) ps
-
-  return $ case tree of
-    Leaf p     -> (p,   s, [Left p])
-    RecCon t _ -> (pat, s, [Right (count, "r", domFromArg t)])
-
-------------------------------------------------------------------------
--- Translation of patterns
-
--- | Removes record constructors from patterns.
---
--- Returns the following things:
---
--- * The new pattern.
---
--- * A substitution which maps the /old/ pattern variables (in the
---   order they occurred in the pattern; not including dot patterns)
---   to terms (either the new name of the variable, or a projection
---   applied to a new pattern variable).
---
--- * A list explaining the changes to the variables bound in the
---   pattern.
---
--- Record patterns containing non-record constructor patterns are not
--- translated (though their sub-patterns may be).
---
--- Example: The pattern @rec1 (con1 a) (rec2 b c) (rec3 d)@ should
--- yield the pattern @rec1 (con1 x) y z@, along with a substitution
--- similar to @[x, proj2-1 y, proj2-2 y, proj3-1 z]@.
---
--- This function assumes that literals are never of record type.
-
-translatePattern :: Pattern -> RecPatM (Pattern, [Term], Changes)
-translatePattern p@(ConP c ci ps)
-  -- Andreas, 2015-05-28 only translate implicit record patterns
-  | conPRecord ci , PatOSystem <- patOrigin (conPInfo ci) = do
-      r <- recordTree p
-      case r of
-        Left  r -> r
-        Right t -> removeTree t
-  | otherwise = do
-      (ps, s, cs) <- translatePatterns ps
-      return (ConP c ci ps, s, cs)
-translatePattern p@(DefP o q ps) = do
-      (ps, s, cs) <- translatePatterns ps
-      return (DefP o q ps, s, cs)
-translatePattern p@VarP{} = removeTree (Leaf p)
-translatePattern p@DotP{} = removeTree (Leaf p)
-translatePattern p@LitP{} = return (p, [], [])
-translatePattern p@ProjP{}= return (p, [], [])
-translatePattern p@IApplyP{}= return (p, [], [])
-
-translatePatterns :: [NamedArg Pattern] -> RecPatM ([NamedArg Pattern], [Term], Changes)
-translatePatterns ps = do
-  (ps', ss, cs) <- unzip3 <$> mapM (translatePattern . namedArg) ps
-  return (zipWith (\p -> fmap (p <$)) ps' ps, concat ss, concat cs)
-
--- | Traverses a pattern and returns one of two things:
---
--- * If there is no non-record constructor in the pattern, then
---   @'Right' ps@ is returned, where @ps@ contains one projection for
---   every variable in the input pattern (in the order they are
---   encountered).
---
--- * Otherwise the output is a computation returning the same kind of
---   result as that coming from 'translatePattern'. (Computations are
---   returned rather than values to ensure that variable numbers are
---   allocated in the right order.)
---
--- Assumes that literals are never of record type.
-
-recordTree ::
-  Pattern ->
-  RecPatM (Either (RecPatM (Pattern, [Term], Changes)) RecordTree)
--- Andreas, 2015-05-28 only translate implicit record patterns
-recordTree p@(ConP c ci ps) | conPRecord ci , PatOSystem <- patOrigin (conPInfo ci) = do
-  let t = fromMaybe __IMPOSSIBLE__ $ conPType ci
-  rs <- mapM (recordTree . namedArg) ps
-  case allRight rs of
-    Nothing ->
-      return $ Left $ do
-        (ps', ss, cs) <- unzip3 <$> mapM (either id removeTree) rs
-        return (ConP c ci (ps' `withNamedArgsFrom` ps),
-                concat ss, concat cs)
-    Just ts -> liftTCM $ do
-      t <- reduce t
-      reportSDoc "tc.rec" 45 $ vcat
-        [ "recordTree: "
-        , nest 2 $ "constructor pattern " <+> prettyTCM p <+> " has type " <+> prettyTCM t
-        ]
-      -- Andreas, 2018-03-03, see #2989:
-      -- The content of an @Arg@ might not be reduced (if @Arg@ is @Irrelevant@).
-      fields <- getRecordTypeFields =<< reduce (unArg t)
---      let proj p = \x -> Def (unArg p) [defaultArg x]
-      let proj p = (`applyE` [Proj ProjSystem $ unDom p])
-      return $ Right $ RecCon t $ zip (map proj fields) ts
-recordTree p@(ConP _ ci _) = return $ Left $ translatePattern p
-recordTree p@DefP{} = return $ Left $ translatePattern p
-recordTree p@VarP{} = return (Right (Leaf p))
-recordTree p@DotP{} = return (Right (Leaf p))
-recordTree p@LitP{} = return $ Left $ translatePattern p
-recordTree p@ProjP{}= return $ Left $ translatePattern p
-recordTree p@IApplyP{}= return $ Left $ translatePattern p
-
-------------------------------------------------------------------------
--- Translation of the clause telescope and body
-
--- | Translates the telescope.
-
-translateTel
-  :: Changes
-     -- ^ Explanation of how the telescope should be changed. Types
-     -- should be in the context of the old telescope.
-  -> [(ArgName, Dom Type)]
-     -- ^ Old telescope, flattened, in textual left-to-right
-     -- order.
-  -> [Maybe (ArgName, Dom Type)]
-     -- ^ New telescope, flattened, in textual left-to-right order.
-     -- 'Nothing' is used to indicate the locations of dot patterns.
-translateTel (Left (DotP{}) : rest)   tel = Nothing : translateTel rest tel
-translateTel (Right (n, x, t) : rest) tel = Just (x, t) :
-                                              translateTel rest
-                                                (drop (n VarPat) tel)
-translateTel (Left _ : rest) (t : tel)    = Just t : translateTel rest tel
-translateTel []              []           = []
-translateTel (Left _ : _)    []           = __IMPOSSIBLE__
-translateTel []              (_ : _)      = __IMPOSSIBLE__

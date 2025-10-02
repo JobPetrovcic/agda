@@ -37,8 +37,13 @@ The GHC backend can be invoked from the command line using the flag
 
 .. code-block:: bash
 
-  agda --compile [--compile-dir=<DIR>] [--ghc-flag=<FLAG>]
-    [--ghc-strict-data] [--ghc-strict] <FILE>.agda
+  agda --compile
+    [--compile-dir=<DIR>]
+    [--ghc-flag=<FLAG>]
+    [--ghc-strict-data]
+    [--ghc-strict]
+    [--ghc-trace]
+    <FILE>.agda
 
 When the flag :option:`--ghc-strict-data` is used, inductive data and record
 constructors are compiled to constructors with strict arguments.
@@ -62,6 +67,11 @@ Options
      Then invoke ``ghc`` (or the compiler given by :option:`--with-compiler`) on the main file,
      unless option :option:`--ghc-dont-call-ghc` is given.
 
+.. option:: --with-compiler={PATH}
+
+     Set ``PATH`` as the executable to call to compile the backend's
+     output, default: ``ghc``.
+
 .. option:: --ghc-dont-call-ghc
 
      Only produce Haskell files, skip the compilation to binary.
@@ -78,6 +88,12 @@ Options
 
      Generate strict Haskell code.
 
+.. option:: --ghc-trace
+
+     Instrument the code to trace function calls,
+     inserting a ``Debug.Trace.trace`` statement at the beginning of each function.
+
+See :ref:`compilation-options` for options common to the compiler backends.
 
 Pragmas
 ^^^^^^^
@@ -140,26 +156,32 @@ typically faster and less readable.
 The :option:`--js-minify` flag makes the generated JavaScript code
 smaller and less readable.
 
-Agda can currently generate either CommonJS (used by NodeJS) flavour modules or
-AMD (for in-browser usage) flavour modules which can be toggled by :option:`--js-cjs`
-(default) and :option:`--js-amd` flags.
+Agda generates JavaScript modules in CommonJS style by default (:option:`--js-cjs`),
+but can also generate modules in ES6 style (:option:`--js-es6`) or AMD style (:option:`--js-amd`).
 
 Options
 ~~~~~~~
 
 .. option:: --js
 
-     Compile to JavaScript, placing translation of module :samp:`{M}` into file :samp:`jAgda.{M}.js`.
+     Compile to JavaScript, placing translation of module :samp:`{M}` into file :samp:`jAgda.{M}.js`
+     (or :samp:`jAgda.{M}.mjs`, if the option :option:`--js-es6` is passed).
      The files will be placed into the root directory of the compiled Agda project,
      or into the directory given by :option:`--compile-dir`.
 
+.. option:: --js-es6
+
+    .. versionadded:: 2.8.0
+
+    Produce ES6 style modules (supported natively by browsers and NodeJS since 2020).
+
 .. option:: --js-amd
 
-     Produce AMD style modules.
+     Produce AMD style modules (for in-browser usage with a wrapper like `require.js`).
 
 .. option:: --js-cjs
 
-     Produce CommonJS style modules.
+     Produce CommonJS style modules (supported natively by NodeJS).
      This is the default.
 
 .. option:: --js-minify
@@ -175,6 +197,7 @@ Options
      Except for the main module, run the generated modules through ``node``,
      to verify absence of syntax errors.
 
+See :ref:`compilation-options` for options common to the compiler backends.
 
 Optimizations
 -------------

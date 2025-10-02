@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -Wunused-binds #-}
+
 -- | Main module for JS backend.
 
 module Agda.Compiler.JS.Compiler where
@@ -9,7 +11,9 @@ import Control.Monad.Trans
 
 import Data.Char     ( isSpace )
 import Data.Foldable ( forM_ )
+import Data.Functor  ( (<&>) )
 import Data.List     ( dropWhileEnd, elemIndex, intercalate, partition )
+import Data.Maybe    ( listToMaybe )
 import Data.Set      ( Set )
 
 import qualified Data.Set as Set
@@ -23,7 +27,7 @@ import System.Environment ( setEnv )
 import System.FilePath    ( splitFileName, (</>) )
 import System.Process     ( callCommand )
 
-import Paths_Agda
+import Agda.Setup         ( getDataDir )
 
 import Agda.Interaction.Options
 
@@ -45,6 +49,7 @@ import Agda.TypeChecking.Reduce ( instantiateFull )
 import Agda.TypeChecking.Substitute as TC ( TelV(..), raise, subst )
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Telescope ( telViewPath )
+import Agda.TypeChecking.Warnings  ( warning )
 
 import Agda.Utils.FileName ( isNewerThan )
 import Agda.Utils.Function ( iterate' )
@@ -52,7 +57,7 @@ import Agda.Utils.List ( downFrom, headWithDefault )
 import Agda.Utils.List1 ( List1, pattern (:|) )
 import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Maybe ( boolToMaybe, catMaybes, caseMaybeM, fromMaybe, whenNothing )
-import Agda.Utils.Monad ( ifM, when )
+import Agda.Utils.Monad ( ifM, when, whenM )
 import Agda.Utils.Null  ( null )
 import Agda.Syntax.Common.Pretty (prettyShow, render)
 import qualified Agda.Syntax.Common.Pretty as P
@@ -66,9 +71,9 @@ import Agda.Compiler.ToTreeless
 import Agda.Compiler.Treeless.EliminateDefaults
 import Agda.Compiler.Treeless.EliminateLiteralPatterns
 import Agda.Compiler.Treeless.GuardsToPrims
-import Agda.Compiler.Treeless.Erase ( computeErasedConstructorArgs )
+import Agda.Compiler.Treeless.Erase ( computeErasedConstructorArgs, isErasable )
 import Agda.Compiler.Treeless.Subst ()
-import Agda.Compiler.Backend (Backend(..), Backend'(..), Recompile(..))
+import Agda.Compiler.Backend (Backend,Backend_boot(..), Backend',Backend'_boot(..), Recompile(..))
 
 import Agda.Compiler.JS.Syntax
   ( Exp(Self,Local,Global,Undefined,Null,String,Char,Integer,Double,Lambda,Object,Array,Apply,Lookup,If,BinOp,PlainJS),
@@ -77,7 +82,7 @@ import Agda.Compiler.JS.Syntax
   , JSQName
   )
 import Agda.Compiler.JS.Substitution
-  ( curriedLambda, curriedApply, emp, apply )
+  ( curriedLambda, curriedApply, emp, apply, substShift )
 import qualified Agda.Compiler.JS.Pretty as JSPretty
 import Agda.Compiler.JS.Pretty (JSModuleStyle(..))
 
@@ -109,6 +114,8 @@ jsBackend' = Backend'
       -- @data@/@record@, you might want to tell the treeless compiler
       -- not to erase these types even if they have no content,
       -- to get a stable interface.
+  , backendInteractTop    = Nothing
+  , backendInteractHole   = Nothing
   }
 
 --- Options ---
@@ -144,6 +151,7 @@ jsCommandLineFlags =
     -- Minification is described at https://en.wikipedia.org/wiki/Minification_(programming)
     , Option [] ["js-minify"] (NoArg enableMin) "minify generated JS code"
     , Option [] ["js-verify"] (NoArg enableVerify) "except for main module, run generated JS modules through `node` (needs to be in PATH)"
+    , Option [] ["js-es6"] (NoArg setES6) "use ES6 module style for JS"
     , Option [] ["js-cjs"] (NoArg setCJS) "use CommonJS module style (default)"
     , Option [] ["js-amd"] (NoArg setAMD) "use AMD module style for JS"
     ]
@@ -152,23 +160,15 @@ jsCommandLineFlags =
     enableOpt    o = pure o{ optJSOptimize = True }
     enableMin    o = pure o{ optJSMinify   = True }
     enableVerify o = pure o{ optJSVerify   = True }
+    setES6       o = pure o{ optJSModuleStyle = JSES6 }
     setCJS       o = pure o{ optJSModuleStyle = JSCJS }
     setAMD       o = pure o{ optJSModuleStyle = JSAMD }
 
 --- Top-level compilation ---
 
 jsPreCompile :: JSOptions -> TCM JSOptions
-jsPreCompile opts = do
-  cubical <- optCubical <$> pragmaOptions
-  let notSupported s =
-        typeError $ GenericError $
-          "Compilation of code that uses " ++ s ++ " is not supported."
-  case cubical of
-    Nothing      -> return ()
-    Just CErased -> notSupported "--erased-cubical"
-    Just CFull   -> notSupported "--cubical"
-
-  return opts
+jsPreCompile opts = opts <$ do
+  mapM_ (typeError . CubicalCompilationNotSupported) =<< cubicalOption
 
 -- | After all modules have been compiled, copy RTE modules and verify compiled modules.
 
@@ -184,6 +184,7 @@ jsPostCompile opts _ ms = do
     let fname = case optJSModuleStyle opts of
           JSCJS -> "agda-rts.js"
           JSAMD -> "agda-rts.amd.js"
+          JSES6 -> "agda-rts.mjs"
         srcPath = dataDir </> "JS" </> fname
         compPath = compDir </> fname
     copyIfChanged srcPath compPath
@@ -197,7 +198,7 @@ jsPostCompile opts _ ms = do
     liftIO $ setEnv "NODE_PATH" compDir
 
     forM_ ms $ \ Module{ modName, callMain } -> do
-      jsFile <- outFile modName
+      jsFile <- outFile (optJSModuleStyle opts) modName
       reportSLn "compile.js.verify" 30 $ unwords [ "Considering JS module:" , jsFile ]
 
       -- Since we do not run a JS program for real, we skip all modules that could
@@ -205,7 +206,9 @@ jsPostCompile opts _ ms = do
       -- Atm, modules whose compilation was skipped are also skipped during verification
       -- (they appear here as main modules).
       whenNothing callMain $ do
-        let cmd = unwords [ "node", "-", "<", jsFile ]
+        -- node needs to see whether the extension is .js or .mjs,
+        -- so we pass input explicitly, not via stdin
+        let cmd = unwords [ "node", jsFile ]
         reportSLn "compile.js.verify" 20 $ unwords [ "calling:", cmd ]
         liftIO $ callCommand cmd
 
@@ -220,8 +223,8 @@ data JSModuleEnv = JSModuleEnv
 jsPreModule ::
   JSOptions -> IsMain -> TopLevelModuleName -> Maybe FilePath ->
   TCM (Recompile JSModuleEnv Module)
-jsPreModule _opts _ m mifile = do
-  cubical <- optCubical <$> pragmaOptions
+jsPreModule opts _ m mifile = do
+  cubical <- cubicalOption
   let compile = case cubical of
         -- Code that uses --cubical is not compiled.
         Just CFull   -> False
@@ -229,6 +232,10 @@ jsPreModule _opts _ m mifile = do
         Nothing      -> True
   ifM uptodate noComp (yesComp compile)
   where
+    outFile_ = do
+      m <- curMName
+      outFile (optJSModuleStyle opts) (jsMod m)
+
     uptodate = case mifile of
       Nothing -> pure False
       Just ifile -> liftIO =<< isNewerThan <$> outFile_ <*> pure ifile
@@ -285,8 +292,9 @@ jsMod :: TopLevelModuleName -> GlobalId
 jsMod m =
   GlobalId (prefix : map T.unpack (List1.toList (moduleNameParts m)))
 
-jsFileName :: GlobalId -> String
-jsFileName (GlobalId ms) = intercalate "." ms ++ ".js"
+jsFileName :: JSModuleStyle -> GlobalId -> String
+jsFileName JSES6 (GlobalId ms) = intercalate "." ms ++ ".mjs" -- Hint that file is ES6, not old js
+jsFileName _     (GlobalId ms) = intercalate "." ms ++  ".js"
 
 jsMember :: Name -> MemberId
 jsMember n
@@ -391,11 +399,15 @@ definition kit (q,d) = do
 -- | Ensure that there is at most one pragma for a name.
 checkCompilerPragmas :: QName -> TCM ()
 checkCompilerPragmas q =
-  caseMaybeM (getUniqueCompilerPragma jsBackendName q) (return ()) $ \ (CompilerPragma r s) ->
-  setCurrentRange r $ case words s of
-    "=" : _ -> return ()
-    _       -> genericDocError $ P.sep [ "Badly formed COMPILE JS pragma. Expected",
-                                         "{-# COMPILE JS <name> = <js> #-}" ]
+  caseMaybeM (getUniqueCompilerPragma jsBackendName q) (return ()) $ \ (CompilerPragma r s) -> do
+  setCurrentRange r do
+    -- Issue #3545: Warn user about ignored COMPILE pragma for defined functions.
+    getConstInfo q <&> theDef >>= \case
+      FunctionDefn{} -> whenM (isErasable q) $ warning $ PragmaCompileErased jsBackendName q
+      _ -> return()
+    -- If the pragma is not of the form "q = bla", complain.
+    when (listToMaybe (words s) /= Just "=") do
+      typeError $ JSBackendError BadCompilePragma
 
 defJSDef :: Definition -> Maybe String
 defJSDef def =
@@ -432,7 +444,8 @@ definition' kit q d t ls =
     Function{} | otherwise -> do
 
       reportSDoc "compile.js" 5 $ "compiling fun:" <+> prettyTCM q
-      caseMaybeM (toTreeless T.EagerEvaluation q) (pure Nothing) $ \ treeless -> do
+      let mTreeless = toTreeless T.EagerEvaluation q
+      caseMaybeM mTreeless (pure Nothing) $ \ treeless -> do
         used <- fromMaybe [] <$> getCompiledArgUse q
         funBody <- eliminateCaseDefaults =<<
           eliminateLiteralPatterns
@@ -440,21 +453,7 @@ definition' kit q d t ls =
         reportSDoc "compile.js" 30 $ " compiled treeless fun:" <+> pretty funBody
         reportSDoc "compile.js" 40 $ " argument usage:" <+> (text . show) used
 
-        let (body, given) = lamView funBody
-              where
-                lamView :: T.TTerm -> (T.TTerm, Int)
-                lamView (T.TLam t) = (+ 1) <$> lamView t
-                lamView t = (t, 0)
-
-            -- number of eta expanded args
-            etaN = length $ dropWhileEnd (== ArgUsed) $ drop given used
-
-            unusedN = length $ filter (== ArgUnused) used
-
-        funBody' <- compileTerm kit
-                  $ iterate' (given + etaN - unusedN) T.TLam
-                  $ eraseLocalVars (map (== ArgUnused) used)
-                  $ T.mkTApp (raise etaN body) (T.TVar <$> downFrom etaN)
+        funBody' <- compileTerm kit funBody
 
         reportSDoc "compile.js" 30 $ " compiled JS fun:" <+> (text . show) funBody'
         return $
@@ -484,40 +483,72 @@ definition' kit q d t ls =
         return Nothing
 
     Constructor{} | Just e <- defJSDef d -> plainJS e
+    -- Implements Scott-Encoding of constructor definitions
+    -- (see the note "Implementing data types")
     Constructor{conData = p, conPars = nc} -> do
       TelV tel _ <- telViewPath t
-      let np = length (telToList tel) - nc
-      erased <- getErasedConArgs q
-      let nargs = np - length (filter id erased)
+      let nargs = length (telToList tel) - nc
           args = [ Local $ LocalId $ nargs - i | i <- [0 .. nargs-1] ]
       d <- getConstInfo p
       let l = List1.last ls
-      case theDef d of
-        Record { recFields = flds } -> ret $ curriedLambda nargs $
-          if optJSOptimize (fst kit)
-            then Lambda 1 $ Apply (Local (LocalId 0)) args
-            else Object $ Map.singleton l $ Lambda 1 $ Apply (Lookup (Local (LocalId 0)) l) args
-        dt -> do
-          i <- index
-          ret $ curriedLambda (nargs + 1) $ Apply (Lookup (Local (LocalId 0)) i) args
-          where
-            index :: TCM MemberId
-            index
-              | Datatype{} <- dt
-              , optJSOptimize (fst kit) = do
-                  q  <- canonicalName q
-                  cs <- mapM canonicalName $ defConstructors dt
-                  case q `elemIndex` cs of
-                    Just i  -> return $ MemberIndex i (mkComment l)
-                    Nothing -> __IMPOSSIBLE_VERBOSE__ $ unwords [ "Constructor", prettyShow q, "not found in", prettyShow cs ]
-              | otherwise = return l
-            mkComment (MemberId s) = Comment s
-            mkComment _ = mempty
+      ret
+        $ curriedLambda nargs
+        $ (case theDef d of
+              Record {} -> Object . Map.singleton l
+              dt -> id)
+        $  Lambda 1 $ Apply (Lookup (Local (LocalId 0)) l) args
 
     AbstractDefn{} -> __IMPOSSIBLE__
   where
     ret = return . Just . Export ls
-    plainJS = return . Just . Export ls . PlainJS
+    plainJS = ret . PlainJS
+
+-- Implementing data types
+--------------------------
+
+-- Data types are implemented using a variant of Scott Encoding,
+-- which uses JavaScript dicts instead of some lambda-expressions
+
+-- For example, given the data type
+--
+--      data Foo : Set where
+--        c1 : Foo
+--        c2 : X -> Y -> Foo
+--        c3 : Foo -> Foo
+--
+-- here is how "Foo" is compiled:
+--
+--  * A constructor definition, e.g.
+--
+--        c2 : X -> Y -> Foo
+--
+--    compiles to
+--
+--        exports["Foo"]["c2"] = x => y => k => k["c2"](x,y)
+--
+--  * A constructor application, e.g.
+--
+--        c2 x y
+--
+--    compiles to
+--
+--        exports["Foo"]["c2"](x)(y)
+--
+--  * A case split, e.g.
+--
+--        case p of
+--          (c1    ) -> E1
+--          (c2 x y) -> E2
+--          (c3 f  ) -> E3
+--
+--    compiles to
+--
+--        p(
+--          { "c1": ()    => E1
+--          , "c2": (x,y) => E2
+--          , "c3": f     => E3
+--          })
+
 
 compileTerm :: EnvWithOpts -> T.TTerm -> TCM Exp
 compileTerm kit t = go t
@@ -547,47 +578,31 @@ compileTerm kit t = go t
         return $ Object $ Map.fromListWith __IMPOSSIBLE__
           [(flatName, PlainJS evalThunk)
           ,(MemberId "__flat_helper", Lambda 0 x)]
-      T.TApp t' xs | Just f <- getDef t' -> do
-        used <- case f of
-          Left  q -> fromMaybe [] <$> getCompiledArgUse q
-          Right c -> map (\ b -> if b then ArgUnused else ArgUsed) <$> getErasedConArgs c
-            -- Andreas, 2021-02-10 NB: could be @map (bool ArgUsed ArgUnused)@
-            -- but I find it unintuitive that 'bool' takes the 'False'-branch first.
-        let given = length xs
-
-            -- number of eta expanded args
-            etaN = length $ dropWhile (== ArgUsed) $ reverse $ drop given used
-
-            args = filterUsed used $
-                     raise etaN xs ++ (T.TVar <$> downFrom etaN)
-
-        curriedLambda etaN <$> (curriedApply <$> go (raise etaN t') <*> mapM go args)
-
       T.TApp t xs -> do
             curriedApply <$> go t <*> mapM go xs
       T.TLam t -> Lambda 1 <$> go t
-      -- TODO This is not a lazy let, but it should be...
-      T.TLet t e -> apply <$> (Lambda 1 <$> go e) <*> traverse go [t]
+      -- `let x = t in e` is compiled to `(x => e[x()/x])(() => t)` so that `t`
+      -- is only evaluated inside the body
+      T.TLet t e -> do
+        t' <- Lambda 0 <$> go t
+        e' <- substShift 1 1 [Apply (Local (LocalId 0)) []] <$> go e
+        return $ Apply (Lambda 1 e') [t']
       T.TLit l -> return $ literal l
-      T.TCon q -> do
-        d <- getConstInfo q
-        qname q
+      -- Implements Scott-Encoding of constructor applications
+      -- (see the note "Implementing data types")
+      T.TCon q -> qname q
+    -- Implements Scott-Encoding of case splits
+    -- (see the note "Implementing data types")
       T.TCase sc ct def alts | T.CTData dt <- T.caseType ct -> do
         dt <- getConstInfo dt
         alts' <- traverse (compileAlt kit) alts
-        let cs  = defConstructors $ theDef dt
-            obj = Object $ Map.fromListWith __IMPOSSIBLE__ [(snd x, y) | (x, y) <- alts']
-            arr = mkArray [headWithDefault (mempty, Null) [(Comment s, y) | ((c', MemberId s), y) <- alts', c' == c] | c <- cs]
+        let obj = Object $ Map.fromListWith __IMPOSSIBLE__ alts'
         case (theDef dt, defJSDef dt) of
           (_, Just e) -> do
             return $ apply (PlainJS e) [Local (LocalId sc), obj]
-          (Record{}, _) | optJSOptimize (fst kit) -> do
-            return $ apply (Local $ LocalId sc) [snd $ headWithDefault __IMPOSSIBLE__ alts']
           (Record{}, _) -> do
             memId <- visitorName $ recCon $ theDef dt
             return $ apply (Lookup (Local $ LocalId sc) memId) [obj]
-          (Datatype{}, _) | optJSOptimize (fst kit) -> do
-            return $ curriedApply (Local (LocalId sc)) [arr]
           (Datatype{}, _) -> do
             return $ curriedApply (Local (LocalId sc)) [obj]
           _ -> __IMPOSSIBLE__
@@ -601,17 +616,8 @@ compileTerm kit t = go t
       T.TError T.TMeta{}      -> return Undefined
       T.TCoerce t -> go t
 
-    getDef (T.TDef f) = Just (Left f)
-    getDef (T.TCon c) = Just (Right c)
-    getDef (T.TCoerce x) = getDef x
-    getDef _ = Nothing
-
     unit = return Null
 
-    mkArray xs
-        | 2 * length (filter ((== Null) . snd) xs) <= length xs = Array xs
-        | otherwise = Object $ Map.fromListWith __IMPOSSIBLE__
-            [ (MemberIndex i c, x) | (i, (c, x)) <- zip [0..] xs, x /= Null ]
 
 compilePrim :: T.TPrim -> Exp
 compilePrim p =
@@ -643,24 +649,18 @@ compilePrim p =
         unOp js  = curriedLambda 1 $ apply (PlainJS js) [local 0]
         primEq   = curriedLambda 2 $ BinOp (local 1) "===" (local 0)
 
-
-compileAlt :: EnvWithOpts -> T.TAlt -> TCM ((QName, MemberId), Exp)
+-- Implements Scott-Encoding of case split cases
+-- (see the note "Implementing data types")
+compileAlt :: EnvWithOpts -> T.TAlt -> TCM (MemberId, Exp)
 compileAlt kit = \case
-  T.TACon con ar body -> do
-    erased <- getErasedConArgs con
-    let nargs = ar - length (filter id erased)
+  T.TACon con nargs body -> do
     memId <- visitorName con
-    body <- Lambda nargs <$> compileTerm kit (eraseLocalVars erased body)
-    return ((con, memId), body)
+    body <- Lambda nargs <$> compileTerm kit body
+    return (memId, body)
   _ -> __IMPOSSIBLE__
 
-eraseLocalVars :: [Bool] -> T.TTerm -> T.TTerm
-eraseLocalVars [] x = x
-eraseLocalVars (False: es) x = eraseLocalVars es x
-eraseLocalVars (True: es) x = eraseLocalVars es (TC.subst (length es) T.TErased x)
-
 visitorName :: QName -> TCM MemberId
-visitorName q = do (m,ls) <- global q; return (List1.last ls)
+visitorName q = List1.last . snd <$> global q
 
 flatName :: MemberId
 flatName = MemberId "flat"
@@ -721,22 +721,17 @@ litmeta (MetaId m h) =
 
 writeModule :: Bool -> JSModuleStyle -> Module -> TCM ()
 writeModule minify ms m = do
-  out <- outFile (modName m)
+  out <- outFile ms (modName m)
   liftIO (writeFile out (JSPretty.prettyShow minify ms m))
 
-outFile :: GlobalId -> TCM FilePath
-outFile m = do
+outFile :: JSModuleStyle -> GlobalId -> TCM FilePath
+outFile ms m = do
   mdir <- compileDir
-  let (fdir, fn) = splitFileName (jsFileName m)
+  let (fdir, fn) = splitFileName (jsFileName ms m)
   let dir = mdir </> fdir
       fp  = dir </> fn
   liftIO $ createDirectoryIfMissing True dir
   return fp
-
-outFile_ :: TCM FilePath
-outFile_ = do
-  m <- curMName
-  outFile (jsMod m)
 
 -- | Primitives implemented in the JS Agda RTS.
 --
@@ -866,11 +861,6 @@ primitives = Set.fromList
   , builtin_glueU
   , builtin_unglueU
   , builtinFaceForall
-  , PrimDepIMin
-  , PrimIdFace
-  , PrimIdPath
-  , builtinIdElim
-  , builtinConId
   -- , builtinGlue                   -- missing
   -- , builtin_glue                  -- missing
   -- , builtin_unglue                -- missing

@@ -5,7 +5,6 @@ module Agda.TypeChecking.Reduce
  ( Instantiate, instantiate', instantiate, instantiateWhen
  -- Recursive meta instantiation
  , InstantiateFull, instantiateFull', instantiateFull
- , instantiateFullExceptForDefinitions
  -- Check for meta (no reduction)
  , IsMeta, isMeta
  -- Reduction and blocking
@@ -16,7 +15,7 @@ module Agda.TypeChecking.Reduce
  , unfoldCorecursion, unfoldCorecursionE
  , unfoldDefinitionE, unfoldDefinitionStep
  , unfoldInlined
- , appDef', appDefE'
+ , appDefE_, appDef', appDefE'
  , abortIfBlocked, ifBlocked, isBlocked, fromBlocked, blockOnError
  -- Simplification
  , Simplify, simplify, simplifyBlocked'
@@ -25,8 +24,7 @@ module Agda.TypeChecking.Reduce
  , slowNormaliseArgs
  ) where
 
-import Control.Monad ( (>=>), void )
-import Control.Monad.Except
+import Control.Monad.Except ( MonadError(..) )
 
 import Data.List ( intercalate )
 import Data.Maybe
@@ -41,6 +39,7 @@ import Agda.Interaction.Options
 
 import Agda.Syntax.Position
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Syntax.Internal
 import Agda.Syntax.Internal.MetaVars
 import Agda.Syntax.Scope.Base (Scope)
@@ -64,9 +63,9 @@ import {-# SOURCE #-} Agda.TypeChecking.Opacity
 import Agda.Utils.Functor
 import Agda.Utils.Lens
 import Agda.Utils.List
+import Agda.Utils.List1 (List1)
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.Monad
-import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Utils.Size
 import Agda.Utils.Tuple
 import qualified Agda.Utils.SmallSet as SmallSet
@@ -154,8 +153,9 @@ blockOnError blocker f
   | otherwise               = f `catchError` \case
     TypeError{}         -> throwError $ PatternErr blocker
     PatternErr blocker' -> throwError $ PatternErr $ unblockOnEither blocker blocker'
-    err@Exception{}     -> throwError err
+    GenericException{}  -> __IMPOSSIBLE__
     err@IOException{}   -> throwError err
+    ParserError{}       -> __IMPOSSIBLE__
 
 -- | Instantiate something.
 --   Results in an open meta variable or a non meta.
@@ -168,6 +168,7 @@ class Instantiate t where
   instantiate' = traverse instantiate'
 
 instance Instantiate t => Instantiate [t]
+instance Instantiate t => Instantiate (List1 t)
 instance Instantiate t => Instantiate (Map k t)
 instance Instantiate t => Instantiate (Maybe t)
 instance Instantiate t => Instantiate (Strict.Maybe t)
@@ -213,9 +214,7 @@ instance Instantiate Term where
          _ | Just m' <- mvTwin mv, blocking ->
            instantiate' (MetaV m' es)
 
-         Open -> return t
-
-         OpenInstance -> return t
+         OpenMeta _ -> return t
 
          BlockedConst u
            | blocking  -> instantiate' . unBrave $
@@ -290,6 +289,9 @@ instance Instantiate a => Instantiate (Closure a) where
         x <- enterClosure cl instantiate'
         return $ cl { clValue = x }
 
+instance Instantiate ProblemConstraint where
+  instantiate' (PConstr p u c) = PConstr p u <$> instantiate' c
+
 instance Instantiate Constraint where
   instantiate' (ValueCmp cmp t u v) = do
     (t,u,v) <- instantiate' (t,u,v)
@@ -302,7 +304,8 @@ instance Instantiate Constraint where
   instantiate' (LevelCmp cmp u v)   = uncurry (LevelCmp cmp) <$> instantiate' (u,v)
   instantiate' (SortCmp cmp a b)    = uncurry (SortCmp cmp) <$> instantiate' (a,b)
   instantiate' (UnBlock m)          = return $ UnBlock m
-  instantiate' (FindInstance m cs)  = FindInstance m <$> mapM instantiate' cs
+  instantiate' (FindInstance r m cs)   = FindInstance r m <$> mapM instantiate' cs
+  instantiate' (ResolveInstanceHead q) = return $ ResolveInstanceHead q
   instantiate' (IsEmpty r t)        = IsEmpty r <$> instantiate' t
   instantiate' (CheckSizeLtSat t)   = CheckSizeLtSat <$> instantiate' t
   instantiate' c@CheckFunDef{}      = return c
@@ -329,7 +332,7 @@ instance Instantiate EqualityView where
     <$> instantiate' t
   instantiate' (IdiomType t)            = IdiomType
     <$> instantiate' t
-  instantiate' (EqualityType s eq l t a b) = EqualityType
+  instantiate' (EqualityType r s eq l t a b) = EqualityType r
     <$> instantiate' s
     <*> return eq
     <*> mapM instantiate' l
@@ -414,11 +417,14 @@ class Reduce t where
   reduce'  t = ignoreBlocking <$> reduceB' t
   reduceB' t = notBlocked <$> reduce' t
 
+  {-# MINIMAL reduce' | reduceB' #-}
+
 instance Reduce Type where
     reduce'  (El s t) = workOnTypes $ El s <$> reduce' t
     reduceB' (El s t) = workOnTypes $ fmap (El s) <$> reduceB' t
 
 instance Reduce Sort where
+    -- Does not return a 'NotBlocked' 'PiSort', 'FunSort', or 'UnivSort'.
     reduceB' s = do
       s <- instantiate' s
       let done | MetaS x _ <- s = return $ blocked x s
@@ -437,10 +443,9 @@ instance Reduce Sort where
               Right s -> reduceB' s
         FunSort s1 s2 -> reduceB' (s1 , s2) >>= \case
           Blocked b (s1',s2') -> return $ Blocked b $ FunSort s1' s2'
-          NotBlocked _ (s1',s2') -> do
-            case funSort' s1' s2' of
-              Left b -> return $ Blocked b $ FunSort s1' s2'
-              Right s -> reduceB' s
+          NotBlocked _ (s1',s2') -> funSortM' s1' s2' >>= \case
+            Left b -> return $ Blocked b $ FunSort s1' s2'
+            Right s -> reduceB' s
         UnivSort s1 -> reduceB' s1 >>= \case
           Blocked b s1' -> return $ Blocked b $ UnivSort s1'
           NotBlocked _ s1' -> case univSort' s1' of
@@ -450,11 +455,8 @@ instance Reduce Sort where
         Inf _ _    -> done
         SizeUniv   -> done
         LockUniv   -> done
-        LevelUniv  -> do
-          levelUniverseEnabled <- isLevelUniverseEnabled
-          if levelUniverseEnabled
-          then done
-          else return $ notBlocked (mkType 0)
+        LevelUniv  -> ifM isLevelUniverseEnabled done $
+          return $ notBlocked (mkType 0)
         IntervalUniv -> done
         MetaS x es -> done
         DefS d es  -> done -- postulated sorts do not reduce
@@ -486,9 +488,9 @@ instance Reduce t => Reduce (Maybe t) where
 
 instance Reduce t => Reduce (Arg t) where
     reduce' a = case getRelevance a of
-      Irrelevant -> return a             -- Don't reduce' irr. args!?
-                                         -- Andreas, 2018-03-03, caused #2989.
-      _          -> traverse reduce' a
+      Irrelevant{} -> return a             -- Don't reduce' irr. args!?
+                                           -- Andreas, 2018-03-03, caused #2989.
+      _ -> traverse reduce' a
 
     reduceB' t = traverse id <$> traverse reduceB' t
 
@@ -664,7 +666,7 @@ unfoldDefinitionStep v0 f es =
       -- are not unfolded unless explicitly permitted.
       dontUnfold = or
         [ defNonterminating info && SmallSet.notMember NonTerminatingReductions allowed
-        , defTerminationUnconfirmed info && SmallSet.notMember UnconfirmedReductions allowed
+        -- , defTerminationUnconfirmed info && SmallSet.notMember UnconfirmedReductions allowed
         , prp == Right True
         , isIrrelevant info
         , not defOk
@@ -834,7 +836,8 @@ reduceHead v = do -- ignoreAbstractMode $ do
         _                               -> return $ notBlocked v
     _ -> return $ notBlocked v
 
--- | Unfold a single inlined function.
+-- | Unfold as many copies as possible, and then potentially a single
+-- inline function.
 unfoldInlined :: PureTCM m => Term -> m Term
 unfoldInlined v = do
   inTypes <- viewTC eWorkingOnTypes
@@ -842,8 +845,14 @@ unfoldInlined v = do
     _ | inTypes -> return v -- Don't inline in types (to avoid unfolding of goals)
     Def f es -> do
       info <- getConstInfo f
-      let def = theDef info
-          irr = isIrrelevant $ defArgInfo info
+
+      let
+        def = theDef info
+        irr = isIrrelevant $ defArgInfo info
+        continue
+          | defCopy info = fmap notBlocked . unfoldInlined
+          | otherwise    = return . notBlocked
+
       case def of
         Function{} ->
           reportSLn "tc.inline" 90 $
@@ -854,12 +863,13 @@ unfoldInlined v = do
             , "funCompiled = " ++ prettyShow (funCompiled def)
             ]
         _ -> pure ()
-      case def of   -- Only for simple definitions with no pattern matching (TODO: maybe copatterns?)
+
+      case def of -- Only for simple definitions with no pattern matching (TODO: maybe copatterns?)
         Function{ funCompiled = Just Done{} }
-          | def ^. funInline , not irr -> do
-              reportSLn "tc.inline" 70 $ "asking to inline " ++ prettyShow f
-              liftReduce $
-                ignoreBlocking <$> unfoldDefinitionE (return . notBlocked) (Def f []) f es
+          | (defCopy info || def ^. funInline), not irr -> do
+            reportSLn "tc.inline" 70 $ "asking to inline " ++ prettyShow f
+            liftReduce $
+              ignoreBlocking <$> unfoldDefinitionE continue (Def f []) f es
         _ -> return v
     _ -> return v
 
@@ -921,13 +931,24 @@ appDefE'' v cls rewr es = traceSDoc "tc.reduce" 90 ("appDefE' v = " <+> pretty v
               nvars = size $ clauseTel cl
           -- if clause is underapplied, skip to next clause
           if length es < npats then goCls cls es else do
+            allowedReductions <- asksTC envAllowedReductions
             let (es0, es1) = splitAt npats es
             (m, es0) <- matchCopatterns pats es0
             let es = es0 ++ es1
             case m of
-              No         -> goCls cls es
-              DontKnow b -> rewrite b (applyE v) rewr es
+              No               -> goCls cls es
+              -- Szumi, 2024-03-29, issue #7181:
+              -- If a lazy match is stuck and all non-lazy matches are conclusive,
+              -- then reduction should not be stuck on the current clause and it
+              -- should be fine to continue matching on the next clause.
+              -- This assumes it's impossible for a lazy match to be stuck if
+              -- all non-lazy matches succeed.
+              DontKnow OnlyLazy _ -> goCls cls es
+              DontKnow NonLazy  b -> rewrite b (applyE v) rewr es
               Yes simpl vs -- vs is the subst. for the variables bound in body
+                | couldBeRecursive (clauseRecursive cl)
+                , RecursiveReductions `SmallSet.notMember` allowedReductions ->
+                    return $ NoReduction __IMPOSSIBLE__
                 | Just w <- body -> do -- clause has body?
                     -- TODO: let matchPatterns also return the reduced forms
                     -- of the original arguments!
@@ -946,6 +967,9 @@ instance Reduce Telescope where
   reduce' EmptyTel          = return EmptyTel
   reduce' (ExtendTel a tel) = ExtendTel <$> reduce' a <*> reduce' tel
 
+instance Reduce ProblemConstraint where
+  reduce' (PConstr p u c) = PConstr p u <$> reduce' c
+
 instance Reduce Constraint where
   reduce' (ValueCmp cmp t u v) = do
     (t,u,v) <- reduce' (t,u,v)
@@ -958,7 +982,8 @@ instance Reduce Constraint where
   reduce' (LevelCmp cmp u v)    = uncurry (LevelCmp cmp) <$> reduce' (u,v)
   reduce' (SortCmp cmp a b)     = uncurry (SortCmp cmp) <$> reduce' (a,b)
   reduce' (UnBlock m)           = return $ UnBlock m
-  reduce' (FindInstance m cs)   = FindInstance m <$> mapM reduce' cs
+  reduce' (FindInstance r m cs)   = FindInstance r m <$> mapM reduce' cs
+  reduce' (ResolveInstanceHead q) = return $ ResolveInstanceHead q
   reduce' (IsEmpty r t)         = IsEmpty r <$> reduce' t
   reduce' (CheckSizeLtSat t)    = CheckSizeLtSat <$> reduce' t
   reduce' c@CheckFunDef{}       = return c
@@ -988,7 +1013,7 @@ instance Reduce EqualityView where
     <$> reduce' t
   reduce' (IdiomType t)            = IdiomType
     <$> reduce' t
-  reduce' (EqualityType s eq l t a b) = EqualityType
+  reduce' (EqualityType r s eq l t a b) = EqualityType r
     <$> reduce' s
     <*> return eq
     <*> mapM reduce' l
@@ -1074,8 +1099,8 @@ instance Simplify t => Simplify (Type' t) where
 instance Simplify Sort where
     simplify' s = do
       case s of
-        PiSort a s1 s2 -> piSort <$> simplify' a <*> simplify' s1 <*> simplify' s2
-        FunSort s1 s2 -> funSort <$> simplify' s1 <*> simplify' s2
+        PiSort a s1 s2 -> uncurry3 piSortM =<< simplify' (a, s1, s2)
+        FunSort s1 s2 -> uncurry funSortM =<< simplify' (s1, s2)
         UnivSort s -> univSort <$> simplify' s
         Univ u s   -> Univ u <$> simplify' s
         Inf _ _    -> return s
@@ -1124,7 +1149,8 @@ instance Simplify Constraint where
   simplify' (LevelCmp cmp u v)    = uncurry (LevelCmp cmp) <$> simplify' (u,v)
   simplify' (SortCmp cmp a b)     = uncurry (SortCmp cmp) <$> simplify' (a,b)
   simplify' (UnBlock m)           = return $ UnBlock m
-  simplify' (FindInstance m cs)   = FindInstance m <$> mapM simplify' cs
+  simplify' (FindInstance r m cs)   = FindInstance r m <$> mapM simplify' cs
+  simplify' (ResolveInstanceHead q) = return $ ResolveInstanceHead q
   simplify' (IsEmpty r t)         = IsEmpty r <$> simplify' t
   simplify' (CheckSizeLtSat t)    = CheckSizeLtSat <$> simplify' t
   simplify' c@CheckFunDef{}       = return c
@@ -1167,7 +1193,7 @@ instance Simplify EqualityView where
     <$> simplify' t
   simplify' (IdiomType t)            = IdiomType
     <$> simplify' t
-  simplify' (EqualityType s eq l t a b) = EqualityType
+  simplify' (EqualityType r s eq l t a b) = EqualityType r
     <$> simplify' s
     <*> return eq
     <*> mapM simplify' l
@@ -1185,9 +1211,10 @@ class Normalise t where
   default normalise' :: (t ~ f a, Traversable f, Normalise a) => t -> ReduceM t
   normalise' = traverse normalise'
 
--- boring instances:
+-- Functor instances:
 
 instance Normalise t => Normalise [t]
+instance Normalise t => Normalise (List1 t)
 instance Normalise t => Normalise (Map k t)
 instance Normalise t => Normalise (Maybe t)
 instance Normalise t => Normalise (Strict.Maybe t)
@@ -1196,7 +1223,10 @@ instance Normalise t => Normalise (Strict.Maybe t)
 -- Elim' not included since it contains Arg
 instance Normalise t => Normalise (Named name t)
 instance Normalise t => Normalise (IPBoundary' t)
+instance Normalise t => Normalise (Ranged t)
 instance Normalise t => Normalise (WithHiding t)
+
+-- more boring instances:
 
 instance (Normalise a, Normalise b) => Normalise (a,b) where
     normalise' (x,y) = (,) <$> normalise' x <*> normalise' y
@@ -1224,8 +1254,8 @@ instance Normalise Sort where
     normalise' s = do
       s <- reduce' s
       case s of
-        PiSort a s1 s2 -> piSort <$> normalise' a <*> normalise' s1 <*> normalise' s2
-        FunSort s1 s2 -> funSort <$> normalise' s1 <*> normalise' s2
+        PiSort a s1 s2 -> uncurry3 piSortM =<< normalise' (a, s1, s2)
+        FunSort s1 s2 -> uncurry funSortM =<< normalise' (s1, s2)
         UnivSort s -> univSort <$> normalise' s
         Univ u s   -> Univ u <$> normalise' s
         Inf _ _    -> return s
@@ -1305,7 +1335,8 @@ instance Normalise Constraint where
   normalise' (LevelCmp cmp u v)    = uncurry (LevelCmp cmp) <$> normalise' (u,v)
   normalise' (SortCmp cmp a b)     = uncurry (SortCmp cmp) <$> normalise' (a,b)
   normalise' (UnBlock m)           = return $ UnBlock m
-  normalise' (FindInstance m cs)   = FindInstance m <$> mapM normalise' cs
+  normalise' (FindInstance r m cs)   = FindInstance r m <$> mapM normalise' cs
+  normalise' (ResolveInstanceHead q) = return $ ResolveInstanceHead q
   normalise' (IsEmpty r t)         = IsEmpty r <$> normalise' t
   normalise' (CheckSizeLtSat t)    = CheckSizeLtSat <$> normalise' t
   normalise' c@CheckFunDef{}       = return c
@@ -1348,7 +1379,7 @@ instance Normalise EqualityView where
     <$> normalise' t
   normalise' (IdiomType t)            = IdiomType
     <$> normalise' t
-  normalise' (EqualityType s eq l t a b) = EqualityType
+  normalise' (EqualityType r s eq l t a b) = EqualityType r
     <$> normalise' s
     <*> return eq
     <*> mapM normalise' l
@@ -1371,6 +1402,7 @@ class InstantiateFull t where
 -- Traversables (doesn't include binders like Abs, Tele):
 
 instance InstantiateFull t => InstantiateFull [t]
+instance InstantiateFull t => InstantiateFull (List1 t)
 instance InstantiateFull t => InstantiateFull (HashMap k t)
 instance InstantiateFull t => InstantiateFull (Map k t)
 instance InstantiateFull t => InstantiateFull (Maybe t)
@@ -1436,8 +1468,8 @@ instance InstantiateFull Sort where
         s <- instantiate' s
         case s of
             Univ u n   -> Univ u <$> instantiateFull' n
-            PiSort a s1 s2 -> piSort <$> instantiateFull' a <*> instantiateFull' s1 <*> instantiateFull' s2
-            FunSort s1 s2 -> funSort <$> instantiateFull' s1 <*> instantiateFull' s2
+            PiSort a s1 s2 -> uncurry3 piSortM =<< instantiateFull' (a, s1, s2)
+            FunSort s1 s2 -> uncurry funSortM =<< instantiateFull' (s1, s2)
             UnivSort s -> univSort <$> instantiateFull' s
             Inf _ _    -> return s
             SizeUniv   -> return s
@@ -1506,6 +1538,9 @@ instance (Subst a, InstantiateFull a) => InstantiateFull (Abs a) where
 instance (InstantiateFull t, InstantiateFull e) => InstantiateFull (Dom' t e) where
     instantiateFull' (Dom i n b tac x) = Dom i n b <$> instantiateFull' tac <*> instantiateFull' x
 
+instance InstantiateFull ContextEntry where
+  instantiateFull' (CtxVar x a) = CtxVar x <$> instantiateFull' a
+
 instance InstantiateFull LetBinding where
   instantiateFull' (LetBinding o v t) = LetBinding o <$> instantiateFull' v <*> instantiateFull' t
 
@@ -1545,7 +1580,8 @@ instance InstantiateFull Constraint where
     LevelCmp cmp u v    -> uncurry (LevelCmp cmp) <$> instantiateFull' (u,v)
     SortCmp cmp a b     -> uncurry (SortCmp cmp) <$> instantiateFull' (a,b)
     UnBlock m           -> return $ UnBlock m
-    FindInstance m cs   -> FindInstance m <$> mapM instantiateFull' cs
+    FindInstance r m cs -> FindInstance r m <$> mapM instantiateFull' cs
+    ResolveInstanceHead q -> return $ ResolveInstanceHead q
     IsEmpty r t         -> IsEmpty r <$> instantiateFull' t
     CheckSizeLtSat t    -> CheckSizeLtSat <$> instantiateFull' t
     c@CheckFunDef{}     -> return c
@@ -1565,7 +1601,11 @@ instance InstantiateFull CompareAs where
   instantiateFull' AsTypes       = return AsTypes
 
 instance InstantiateFull Signature where
-  instantiateFull' (Sig a b c) = uncurry3 Sig <$> instantiateFull' (a, b, c)
+  instantiateFull' (Sig a b c d) = Sig
+    <$> instantiateFull' a
+    <*> instantiateFull' b
+    <*> instantiateFull' c
+    <*> pure d             -- The instance table only stores names
 
 instance InstantiateFull Section where
   instantiateFull' (Section tel) = Section <$> instantiateFull' tel
@@ -1602,7 +1642,7 @@ instance InstantiateFull NLPSort where
   instantiateFull' PIntervalUniv = return PIntervalUniv
 
 instance InstantiateFull RewriteRule where
-  instantiateFull' (RewriteRule q gamma f ps rhs t c) =
+  instantiateFull' (RewriteRule q gamma f ps rhs t c top) =
     RewriteRule q
       <$> instantiateFull' gamma
       <*> pure f
@@ -1610,6 +1650,7 @@ instance InstantiateFull RewriteRule where
       <*> instantiateFull' rhs
       <*> instantiateFull' t
       <*> pure c
+      <*> pure top
 
 instance InstantiateFull DisplayForm where
   instantiateFull' (Display n ps v) = uncurry (Display n) <$> instantiateFull' (ps, v)
@@ -1668,18 +1709,18 @@ instance InstantiateFull a => InstantiateFull (Case a) where
       <*> pure lz
 
 instance InstantiateFull CompiledClauses where
-  instantiateFull' (Fail xs)   = return $ Fail xs
-  instantiateFull' (Done m t)  = Done m <$> instantiateFull' t
-  instantiateFull' (Case n bs) = Case n <$> instantiateFull' bs
+  instantiateFull' = \case
+    Fail xs        -> return $ Fail xs
+    Done no mr m t -> Done no mr m <$> instantiateFull' t
+    Case n bs      -> Case n <$> instantiateFull' bs
 
 instance InstantiateFull Clause where
-    instantiateFull' (Clause rl rf tel ps b t catchall exact recursive unreachable ell wm) =
+    instantiateFull' (Clause rl rf tel ps b t catchall recursive unreachable ell wm) =
        Clause rl rf <$> instantiateFull' tel
        <*> instantiateFull' ps
        <*> instantiateFull' b
        <*> instantiateFull' t
        <*> return catchall
-       <*> return exact
        <*> return recursive
        <*> return unreachable
        <*> return ell
@@ -1702,47 +1743,27 @@ instance InstantiateFull RemoteMetaVariable where
     <*> instantiateFull' c
 
 instance InstantiateFull Interface where
-  instantiateFull' i = do
-    defs <- instantiateFull' (i ^. intSignature . sigDefinitions)
-    instantiateFullExceptForDefinitions'
-      (set (intSignature . sigDefinitions) defs i)
-
--- | Instantiates everything except for definitions in the signature.
-
-instantiateFullExceptForDefinitions' :: Interface -> ReduceM Interface
-instantiateFullExceptForDefinitions'
-  (Interface h s ft ms mod tlmod scope inside sig metas display userwarn
-     importwarn b foreignCode highlighting libPragmas filePragmas
-     usedOpts patsyns warnings partialdefs oblocks onames) =
-  Interface h s ft ms mod tlmod scope inside
-    <$> ((\s r -> Sig { _sigSections     = s
-                      , _sigDefinitions  = sig ^. sigDefinitions
-                      , _sigRewriteRules = r
-                      })
-         <$> instantiateFull' (sig ^. sigSections)
-         <*> instantiateFull' (sig ^. sigRewriteRules))
-    <*> instantiateFull' metas
-    <*> instantiateFull' display
-    <*> return userwarn
-    <*> return importwarn
-    <*> instantiateFull' b
-    <*> return foreignCode
-    <*> return highlighting
-    <*> return libPragmas
-    <*> return filePragmas
-    <*> return usedOpts
-    <*> return patsyns
-    <*> return warnings
-    <*> return partialdefs
-    <*> return oblocks
-    <*> return onames
-
--- | Instantiates everything except for definitions in the signature.
-
-instantiateFullExceptForDefinitions ::
-  MonadReduce m => Interface -> m Interface
-instantiateFullExceptForDefinitions =
-  liftReduce . instantiateFullExceptForDefinitions'
+  instantiateFull'
+    (Interface h s ft ms mod tlmod scope inside sig _ display userwarn
+         importwarn b foreignCode highlighting libPragmas filePragmas
+         usedOpts patsyns warnings partialdefs oblocks onames) = do
+    Interface h s ft ms mod tlmod scope inside
+      <$!> instantiateFull' sig
+      <*!> pure mempty               -- remote metas are dropped
+      <*!> instantiateFull' display
+      <*!> return userwarn
+      <*!> return importwarn
+      <*!> instantiateFull' b
+      <*!> return foreignCode
+      <*!> return highlighting
+      <*!> return libPragmas
+      <*!> return filePragmas
+      <*!> return usedOpts
+      <*!> return patsyns
+      <*!> return warnings
+      <*!> return partialdefs
+      <*!> return oblocks
+      <*!> return onames
 
 instance InstantiateFull a => InstantiateFull (Builtin a) where
     instantiateFull' (Builtin t) = Builtin <$> instantiateFull' t
@@ -1758,7 +1779,7 @@ instance InstantiateFull EqualityView where
     <$> instantiateFull' t
   instantiateFull' (IdiomType t)            = IdiomType
     <$> instantiateFull' t
-  instantiateFull' (EqualityType s eq l t a b) = EqualityType
+  instantiateFull' (EqualityType r s eq l t a b) = EqualityType r
     <$> instantiateFull' s
     <*> return eq
     <*> mapM instantiateFull' l

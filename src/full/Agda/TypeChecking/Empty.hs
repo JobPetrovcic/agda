@@ -7,10 +7,7 @@ module Agda.TypeChecking.Empty
   , checkEmptyTel
   ) where
 
-import Control.Monad        ( void )
 import Control.Monad.Except ( MonadError(..) )
-
-import Data.Semigroup
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
@@ -45,7 +42,6 @@ instance Semigroup ErrorNonEmpty where
 
 instance Monoid ErrorNonEmpty where
   mempty  = Fail
-  mappend = (Data.Semigroup.<>)
 
 -- | Ensure that a type is empty.
 --   This check may be postponed as emptiness constraint.
@@ -60,12 +56,12 @@ ensureEmptyType r t = caseEitherM (checkEmptyType r t) failure return
   failure Fail              = typeError $ ShouldBeEmpty t []
 
 -- | Check whether a type is empty.
-isEmptyType :: Type -> TCM Bool
-isEmptyType ty = isRight <$> checkEmptyType noRange ty
+isEmptyType :: MonadTCM tcm => Type -> tcm Bool
+isEmptyType ty = liftTCM $ isRight <$> checkEmptyType noRange ty
 
 -- | Check whether some type in a telescope is empty.
-isEmptyTel :: Telescope -> TCM Bool
-isEmptyTel tel = isRight <$> checkEmptyTel noRange tel
+isEmptyTel :: MonadTCM tcm => Telescope -> tcm Bool
+isEmptyTel tel = liftTCM $ isRight <$> checkEmptyTel noRange tel
 
 -- Either the type is possibly non-empty (Left err) or it is really empty
 -- (Right ()).
@@ -100,8 +96,8 @@ checkEmptyType range t = do
 
     -- If t is a record type, see if any of the field types is empty
     Right (r, pars, def) -> do
-      if | NoEta{} <- recEtaEquality def -> return $ Left Fail
-         | otherwise -> void <$> do checkEmptyTel range $ recTel def `apply` pars
+      if not (isEtaRecordDef def) then return $ Left Fail else
+         void <$> do checkEmptyTel range $ _recTel def `apply` pars
 
 -- | Check whether one of the types in the given telescope is constructor-less
 --   and if yes, return its index in the telescope (0 = leftmost).

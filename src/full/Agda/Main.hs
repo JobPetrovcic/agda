@@ -12,23 +12,29 @@ import Control.Monad.Except   ( MonadError(..), ExceptT(..), runExceptT )
 import Control.Monad.IO.Class ( MonadIO(..) )
 
 import qualified Data.List as List
+import Data.Function          ( (&) )
+import Data.Functor
 import Data.Maybe
+import qualified Data.Set as Set
+import qualified Data.Text as T
 
-import System.Environment
-import System.Exit
-import System.Console.GetOpt
+import System.Environment ( getArgs, getProgName )
+import System.Exit ( exitSuccess, ExitCode )
+import System.FilePath ( takeFileName )
+import Agda.Utils.GetOpt
 import qualified System.IO as IO
 
-import Paths_Agda            ( getDataDir )
-
+import Agda.Interaction.BuildLibrary (buildLibrary, printAccumulatedWarnings)
 import Agda.Interaction.CommandLine
-import Agda.Interaction.ExitCode (AgdaError(..), exitSuccess, exitAgdaWith)
+import Agda.Interaction.ExitCode as ExitCode (AgdaError(..), exitSuccess, exitAgdaWith)
+import Agda.Interaction.Highlighting.LaTeX.Backend (latexBackendName)
 import Agda.Interaction.Options
-import Agda.Interaction.Options.Help (Help (..))
+import Agda.Interaction.Options.BashCompletion (bashComplete, printedOptions)
+import Agda.Interaction.Options.Help (Help (..), helpTopicUsage)
 import Agda.Interaction.EmacsTop (mimicGHCi)
 import Agda.Interaction.JSONTop (jsonREPL)
 import Agda.Interaction.FindFile ( SourceFile(SourceFile) )
-import qualified Agda.Interaction.Imports as Imp
+import Agda.Interaction.Imports qualified as Imp
 
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Errors
@@ -40,18 +46,23 @@ import Agda.TypeChecking.Pretty
 import Agda.Compiler.Backend
 import Agda.Compiler.Builtin
 
-import Agda.VersionCommit
+import Agda.Setup ( getAgdaAppDir, getDataDir, setup )
+import Agda.Setup.EmacsMode
+
+import Agda.Version (version)
+import Agda.VersionCommit ( versionWithCommitInfo )
 
 import qualified Agda.Utils.Benchmark as UtilsBench
 import qualified Agda.Syntax.Common.Pretty.ANSI as ANSI
 import qualified Agda.Syntax.Common.Pretty as P
 import Agda.Utils.FileName (absolute, filePath, AbsolutePath)
 import Agda.Utils.String
+import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Null
 
 import Agda.Utils.Impossible
-import Agda.Interaction.Library (getAgdaAppDir)
+import Agda.Utils.Function (applyWhen)
 
 -- | The main function
 runAgda :: [Backend] -> IO ()
@@ -59,66 +70,100 @@ runAgda backends = runAgda' $ builtinBackends ++ backends
 
 -- | The main function without importing built-in backends
 runAgda' :: [Backend] -> IO ()
-runAgda' backends = runTCMPrettyErrors $ do
-  progName <- liftIO getProgName
-  argv     <- liftIO getArgs
-  let (z, warns) = runOptM $ parseBackendOptions backends argv defaultOptions
-  mapM_ (warning . OptionWarning) warns
-  conf     <- liftIO $ runExceptT $ do
-    (bs, opts) <- ExceptT $ pure z
-    -- The absolute path of the input file, if provided
-    inputFile <- liftIO $ mapM absolute $ optInputFile opts
-    mode      <- getMainMode bs inputFile opts
-    return (bs, opts, mode)
+runAgda' backends = do
+  getArgs >>= \case
+
+    -- Special mode of operation for @--bash-complete@.
+    "--bash-complete" : args ->
+      case bashComplete trunc args of
+        Right s -> putStr s
+        Left err -> do
+          putStrLn err
+          exitAgdaWith ExitCode.OptionError
+      where
+        -- Truncate to max 50 completion suggestions.
+        trunc = Just 50
+
+    -- Ordinary entrypoint.
+    args -> runAgdaArgs backends args
+
+runAgdaArgs :: [Backend] -> [String] -> IO ()
+runAgdaArgs backends args = do
+  progName <- getProgName
+  let (conf, warns) = runOptM $ parseBackendOptions backends args defaultOptions
 
   case conf of
-    Left err -> liftIO $ optionError err
-    Right (bs, opts, mode) -> do
+    Left err -> optionError err
+    Right (bs, opts) -> do
 
-      when (optTransliterate opts) $ liftIO $ do
-        -- When --interaction or --interaction-json is used, then we
-        -- use UTF-8 when writing to stdout (and when reading from
-        -- stdin).
-        if optGHCiInteraction opts || optJSONInteraction opts
-        then optionError $
-               "The option --transliterate must not be combined with " ++
-               "--interaction or --interaction-json"
-        else do
-          -- Transliterate unsupported code points.
-          enc <- IO.mkTextEncoding
-                   (show IO.localeEncoding ++ "//TRANSLIT")
-          IO.hSetEncoding IO.stdout enc
-          IO.hSetEncoding IO.stderr enc
+      -- Setup Agda if requested
+      when (optSetup opts) $ Agda.Setup.setup True
 
-      case mode of
-        MainModePrintHelp hp     -> liftIO $ printUsage bs hp
-        MainModePrintVersion o   -> liftIO $ printVersion bs o
-        MainModePrintAgdaDataDir -> liftIO $ printAgdaDataDir
-        MainModePrintAgdaAppDir  -> liftIO $ printAgdaAppDir
-        MainModeRun interactor   -> do
+      -- Print information as requested
+      whenJust (optPrintVersion opts) $ printVersion bs
+      whenJust (optPrintHelp    opts) $ printUsage   bs
+      when (optPrintAgdaAppDir  opts) $ printAgdaAppDir
+      when (optPrintAgdaDataDir opts) $ printAgdaDataDir
+      when (optPrintOptions     opts) $ printOptions
+
+      -- Setup emacs mode
+      when (EmacsModeSetup `Set.member` optEmacsMode opts) do
+        unless (optSetup opts) $ Agda.Setup.setup False
+        setupDotEmacs $ takeFileName progName
+
+      -- Compile emacs mode
+      when (EmacsModeCompile `Set.member` optEmacsMode opts) do
+        unless (optSetup opts) $ Agda.Setup.setup False
+        compileElispFiles
+
+      -- Locate emacs mode
+      when (EmacsModeLocate `Set.member` optEmacsMode opts) do
+        unless (optSetup opts) $ Agda.Setup.setup False
+        printEmacsModeFile
+
+      -- The absolute path of the input file, if provided
+      inputFile <- liftIO $ mapM absolute $ optInputFile opts
+
+      (runExceptT $ getInteractor bs inputFile opts) >>= \case
+        Left err -> optionError err
+        Right Nothing -> do
+          let
+            something = or
+              [ opts & optSetup
+              , opts & optPrintVersion & isJust
+              , opts & optPrintHelp    & isJust
+              , opts & optPrintAgdaAppDir
+              , opts & optPrintAgdaDataDir
+              , opts & optPrintOptions
+              , opts & optEmacsMode    & not . null
+              ]
+          -- if no task was given to Agda
+          unless something $ optionError "No task given."
+
+        Right (Just interactor) -> do
+         unless (optSetup opts) $ Agda.Setup.setup False
+
+         runTCMPrettyErrors do
+
+          mapM_ (warning . OptionWarning) warns
+
+          when (optTransliterate opts) $ liftIO $ do
+            -- When --interaction or --interaction-json is used, then we
+            -- use UTF-8 when writing to stdout (and when reading from
+            -- stdin).
+            if optGHCiInteraction opts || optJSONInteraction opts
+            then optionError $
+                   "The option --transliterate must not be combined with " ++
+                   "--interaction or --interaction-json"
+            else do
+              -- Transliterate unsupported code points.
+              enc <- IO.mkTextEncoding (show IO.localeEncoding ++ "//TRANSLIT")
+              IO.hSetEncoding IO.stdout enc
+              IO.hSetEncoding IO.stderr enc
+
           setTCLens stBackends bs
           runAgdaWithOptions interactor progName opts
 
--- | Main execution mode
-data MainMode
-  = MainModeRun (Interactor ())
-  | MainModePrintHelp Help
-  | MainModePrintVersion PrintAgdaVersion
-  | MainModePrintAgdaDataDir
-  | MainModePrintAgdaAppDir
-
--- | Determine the main execution mode to run, based on the configured backends and command line options.
--- | This is pure.
-getMainMode :: MonadError String m => [Backend] -> Maybe AbsolutePath -> CommandLineOptions -> m MainMode
-getMainMode configuredBackends maybeInputFile opts
-  | Just hp <- optPrintHelp opts    = return $ MainModePrintHelp hp
-  | Just o  <- optPrintVersion opts = return $ MainModePrintVersion o
-  | optPrintAgdaDataDir opts        = return $ MainModePrintAgdaDataDir
-  | optPrintAgdaAppDir opts         = return $ MainModePrintAgdaAppDir
-  | otherwise = do
-      mi <- getInteractor configuredBackends maybeInputFile opts
-      -- If there was no selection whatsoever (e.g. just invoked "agda"), we just show help and exit.
-      return $ maybe (MainModePrintHelp GeneralHelp) MainModeRun mi
 
 type Interactor a
     -- Setup/initialization action.
@@ -129,42 +174,80 @@ type Interactor a
     -- Main transformed action.
     -> TCM a
 
+-- | Major mode of operation, not including the standard mode (checking the given main module).
 data FrontendType
-  = FrontEndEmacs
-  | FrontEndJson
+  = FrontEndInteraction InteractionFormat
+      -- ^ @--interaction@ or @--interaction-json@.
   | FrontEndRepl
+      -- ^ @--interactive@.
+  | FrontEndBuildLibrary
+      -- ^ @--build-library@.
 
--- Emacs mode. Note that it ignores the "check" action because it calls typeCheck directly.
-emacsModeInteractor :: Interactor ()
-emacsModeInteractor setup _check = mimicGHCi setup
+data InteractionFormat
+  = InteractionEmacs
+      -- ^ @--interaction@.
+  | InteractionJson
+      -- ^ @--interaction-json@.
 
--- JSON mode. Note that it ignores the "check" action because it calls typeCheck directly.
-jsonModeInteractor :: Interactor ()
-jsonModeInteractor setup _check = jsonREPL setup
+pattern FrontEndEmacs :: FrontendType
+pattern FrontEndEmacs = FrontEndInteraction InteractionEmacs
 
--- The deprecated repl mode.
+pattern FrontEndJson :: FrontendType
+pattern FrontEndJson  = FrontEndInteraction InteractionJson
+
+{-# COMPLETE FrontEndBuildLibrary, FrontEndEmacs, FrontEndJson, FrontEndRepl #-}
+
+buildLibraryInteractor :: Interactor ()
+buildLibraryInteractor setup _check = do setup; buildLibrary
+
+-- | Emacs/JSON mode. Note that it ignores the "check" action because it calls typeCheck directly.
+interactionInteractor :: InteractionFormat -> Interactor ()
+interactionInteractor InteractionEmacs setup _check = mimicGHCi setup
+interactionInteractor InteractionJson  setup _check = jsonREPL  setup
+
+-- | The (deprecated) repl mode.
 replInteractor :: Maybe AbsolutePath -> Interactor ()
 replInteractor = runInteractionLoop
 
--- The interactor to use when there are no frontends or backends specified.
+-- | The interactor to use when there are no frontends or backends specified.
 defaultInteractor :: AbsolutePath -> Interactor ()
 defaultInteractor file setup check = do setup; void $ check file
 
 getInteractor :: MonadError String m => [Backend] -> Maybe AbsolutePath -> CommandLineOptions -> m (Maybe (Interactor ()))
-getInteractor configuredBackends maybeInputFile opts =
-  case (maybeInputFile, enabledFrontends, enabledBackends) of
-    (Just inputFile, [],             _:_) -> return $ Just $ backendInteraction inputFile enabledBackends
-    (Just inputFile, [],              []) -> return $ Just $ defaultInteractor inputFile
-    (Nothing,        [],              []) -> return Nothing -- No backends, frontends, or input files specified.
-    (Nothing,        [],             _:_) -> throwError $ concat ["No input file specified for ", enabledBackendNames]
-    (_,              _:_,            _:_) -> throwError $ concat ["Cannot mix ", enabledFrontendNames, " with ", enabledBackendNames]
-    (_,              _:_:_,           []) -> throwError $ concat ["Must not specify multiple ", enabledFrontendNames]
-    (_,              [fe],            []) | optOnlyScopeChecking opts -> errorFrontendScopeChecking fe
-    (_,              [FrontEndRepl],  []) -> return $ Just $ replInteractor maybeInputFile
-    (Nothing,        [FrontEndEmacs], []) -> return $ Just $ emacsModeInteractor
-    (Nothing,        [FrontEndJson],  []) -> return $ Just $ jsonModeInteractor
-    (Just inputFile, [FrontEndEmacs], []) -> errorFrontendFileDisallowed inputFile FrontEndEmacs
-    (Just inputFile, [FrontEndJson],  []) -> errorFrontendFileDisallowed inputFile FrontEndJson
+getInteractor configuredBackends maybeInputFile opts = do
+
+  case enabledFrontends of
+    _:_:_ -> throwError $ concat ["Must not specify multiple ", enabledFrontendNames]
+
+    -- standard mode of operation
+    [] -> do
+      case (maybeInputFile, enabledBackends) of
+        (Just inputFile, _:_) -> return $ Just $ backendInteraction inputFile enabledBackends
+        (Just inputFile,  []) -> return $ Just $ defaultInteractor inputFile
+        (Nothing,         []) -> return Nothing -- No backends, frontends, or input files specified.
+        (Nothing,        _:_) -> throwError $ concat ["No input file specified for ", enabledBackendNames]
+
+    -- special mode of operation
+    [fe] -> do
+      case fe of
+        -- --interactive
+        FrontEndRepl -> do
+          noBackends fe
+          notJustScopeChecking fe
+          return $ Just $ replInteractor maybeInputFile
+        -- --interaction(-json)
+        FrontEndInteraction i -> do
+          noBackends fe
+          notJustScopeChecking fe
+          noInputFile fe
+          return $ Just $ interactionInteractor i
+        -- --build-library
+        FrontEndBuildLibrary -> do
+          noBackends fe  -- Issue #8024: Backends are not supported yet.
+          unless (optUseLibs opts) $
+            throwError "--build-library cannot be combined with --no-libraries"
+          noInputFile fe
+          return $ Just buildLibraryInteractor
   where
     -- NOTE: The notion of a backend being "enabled" *just* refers to this top-level interaction mode selection. The
     -- interaction/interactive front-ends may still invoke available backends even if they are not "enabled".
@@ -174,17 +257,23 @@ getInteractor configuredBackends maybeInputFile opts =
       [ [ FrontEndRepl  | optInteractive     opts ]
       , [ FrontEndEmacs | optGHCiInteraction opts ]
       , [ FrontEndJson  | optJSONInteraction opts ]
+      , [ FrontEndBuildLibrary | optBuildLibrary opts ]
       ]
     -- Constructs messages like "(no backend)", "backend ghc", "backends (ghc, ocaml)"
     pluralize w []  = concat ["(no ", w, ")"]
     pluralize w [x] = concat [w, " ", x]
     pluralize w xs  = concat [w, "s (", List.intercalate ", " xs, ")"]
-    enabledBackendNames  = pluralize "backend" [ backendName b | Backend b <- enabledBackends ]
+    enabledBackendNames  = pluralize "backend" [ T.unpack $ backendName b | Backend b <- enabledBackends ]
     enabledFrontendNames = pluralize "frontend" (frontendFlagName <$> enabledFrontends)
     frontendFlagName = ("--" ++) . \case
       FrontEndEmacs -> "interaction"
       FrontEndJson -> "interaction-json"
       FrontEndRepl -> "interactive"
+      FrontEndBuildLibrary -> "build-library"
+    noBackends fe = unless (null enabledBackends) $
+      throwError $ concat ["Cannot mix ", frontendFlagName fe, " with ", enabledBackendNames]
+    noInputFile fe = whenJust maybeInputFile \ inputFile -> errorFrontendFileDisallowed inputFile fe
+    notJustScopeChecking = when (optOnlyScopeChecking opts) . errorFrontendScopeChecking
     errorFrontendScopeChecking fe = throwError $
       concat ["The --only-scope-checking flag cannot be combined with ", frontendFlagName fe]
     errorFrontendFileDisallowed inputFile fe = throwError $
@@ -233,36 +322,45 @@ runAgdaWithOptions interactor progName opts = do
                      then Imp.ScopeCheck
                      else Imp.TypeCheck
 
-          result <- Imp.typeCheckMain mode =<< Imp.parseSource (SourceFile inputFile)
+          src <- srcFromPath inputFile
+          result <- Imp.typeCheckMain mode =<< Imp.parseSource src
 
           unless (crMode result == ModuleScopeChecked) $
-            unlessNullM (applyFlagsToTCWarnings (crWarnings result)) $ \ ws ->
-              typeError $ NonFatalErrors ws
+            Imp.raiseNonFatalErrors result
 
           let i = crInterface result
           reportSDoc "main" 50 $ pretty i
 
-          -- Print accumulated warnings
-          unlessNullM (tcWarnings . classifyWarnings <$> getAllWarnings AllWarnings) $ \ ws -> do
-            let banner = text $ "\n" ++ delimiter "All done; warnings encountered"
-            alwaysReportSDoc "warning" 1 $
-              vcat $ punctuate "\n" $ banner : (prettyTCM <$> ws)
-
+          printAccumulatedWarnings
           return result
-
 
 
 -- | Print usage information.
 printUsage :: [Backend] -> Help -> IO ()
 printUsage backends hp = do
   progName <- getProgName
-  putStr $ usage standardOptions_ progName hp
-  when (hp == GeneralHelp) $ mapM_ (putStr . backendUsage) backends
-
-backendUsage :: Backend -> String
-backendUsage (Backend b) =
-  usageInfo ("\n" ++ backendName b ++ " backend options") $
-    map void (commandLineFlags b)
+  putStr $ unlines
+    [ "Agda version " ++ version
+    , ""
+    , "Usage: " ++ progName ++ " [OPTIONS...] [FILE]"
+    ]
+  case hp of
+    GeneralHelp -> do
+      forM_ optionGroups \ (header, opts) -> do
+        usage header opts
+      forM_ backends \ (Backend b) -> do
+        let
+          opts = applyWhen (backendName b == latexBackendName)
+            (++ map void (snd latexPragmaOptions))
+            (map void (commandLineFlags b))
+            -- NB: @map void@ to make the 'OptDescr' types match.
+        usage (T.unpack (backendName b) ++ " backend options") opts
+    HelpFor topic -> putStr $ helpTopicUsage topic
+  where
+    fmt h = "\n" ++ h ++ ":\n"
+    width = 40
+    usage :: String -> [OptDescr a] -> IO ()
+    usage header opts = putStr $ usageInfo width (fmt header) opts
 
 -- | Print version information.
 printVersion :: [Backend] -> PrintAgdaVersion -> IO ()
@@ -272,7 +370,7 @@ printVersion backends PrintAgdaVersion = do
   unless (null flags) $
     mapM_ putStrLn $ ("Built with flags (cabal -f)" :) $ map bullet flags
   mapM_ putStrLn
-    [ bullet $ name ++ " backend version " ++ ver
+    [ bullet $ T.unpack $ T.unwords [ name, "backend version", ver ]
     | Backend Backend'{ backendName = name, backendVersion = Just ver } <- backends ]
   where
   bullet = (" - " ++)
@@ -293,6 +391,16 @@ printVersion backends PrintAgdaVersion = do
 #ifdef DEBUG_SERIALISATION
     "debug-serialisation: extra debug info during serialisation into '.agdai' files" :
 #endif
+#ifdef USE_XDG_DATA_HOME
+    concat
+      [ "use-xdg-data-home: install and locate data files under $XDG_DATA_HOME/agda/"
+      , "$AGDA_VERSION" -- , versionWithCommitInfo
+           -- Andreas, 2025-06-28, we could put in the actual version here
+           -- but I think the text is clearer in the generic form
+      , " by default instead of the location defined by Cabal"
+      ]
+    :
+#endif
     []
 
 printAgdaDataDir :: IO ()
@@ -301,12 +409,15 @@ printAgdaDataDir = putStrLn =<< getDataDir
 printAgdaAppDir :: IO ()
 printAgdaAppDir = putStrLn =<< getAgdaAppDir
 
+printOptions :: IO ()
+printOptions = mapM_ putStrLn printedOptions
+
 -- | What to do for bad options.
 optionError :: String -> IO ()
 optionError err = do
   prog <- getProgName
   putStrLn $ "Error: " ++ err ++ "\nRun '" ++ prog ++ " --help' for help on command line options."
-  exitAgdaWith OptionError
+  exitAgdaWith ExitCode.OptionError
 
 -- | Run a TCM action in IO; catch and pretty print errors.
 
@@ -330,12 +441,12 @@ runTCMPrettyErrors tcm = do
           `catchError` \err -> do
             s2s <- prettyTCWarnings' =<< getAllWarningsOfTCErr err
             s1  <- prettyError err
-            ANSI.putDoc (P.vcat s2s P.$+$ s1)
+            ANSI.putDocLn $ P.vsep $ s2s ++ [ s1 ]
             liftIO $ do
               helpForLocaleError err
             return (Just TCMError)
       ) `catchImpossible` \e -> do
-          liftIO $ putStr $ E.displayException e
+          printException e
           return (Just ImpossibleError)
     ) `E.catches`
         -- Catch all exceptions except for those of type ExitCode
@@ -345,7 +456,7 @@ runTCMPrettyErrors tcm = do
         [ E.Handler $ \(e :: ExitCode)         -> E.throw e
         , E.Handler $ \(e :: E.AsyncException) -> E.throw e
         , E.Handler $ \(e :: E.SomeException)  -> do
-            liftIO $ putStr $ E.displayException e
+            printException e
             return $ Right (Just UnknownError)
         ]
   case r of
@@ -357,6 +468,15 @@ runTCMPrettyErrors tcm = do
         putStrLn $ tcErrString err
         helpForLocaleError err
       exitAgdaWith UnknownError
+  where
+    printException e = liftIO $ putStr $
+      -- Andreas, 2024-07-03, issue #7299
+      -- Regression in base-4.20: printing of exception produces trailing whitespace.
+      -- https://gitlab.haskell.org/ghc/ghc/-/issues/25052
+#if MIN_VERSION_base(4,20,0)
+      rtrim $
+#endif
+      E.displayException e
 
 -- | If the error is an IO error, and the error message suggests that
 -- the problem is related to locales or code pages, print out some

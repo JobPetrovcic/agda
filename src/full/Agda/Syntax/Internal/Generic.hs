@@ -6,6 +6,7 @@ module Agda.Syntax.Internal.Generic where
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
 import Agda.Utils.Functor
+import Agda.Utils.List1 (List1)
 
 -- | Generic term traversal.
 --
@@ -57,6 +58,7 @@ instance TermLike a => TermLike (Elim' a)      where
 instance TermLike a => TermLike (Arg a)        where
 instance TermLike a => TermLike (Dom a)        where
 instance TermLike a => TermLike [a]            where
+instance TermLike a => TermLike (List1 a)      where
 instance TermLike a => TermLike (Maybe a)      where
 instance TermLike a => TermLike (Blocked a)    where
 instance TermLike a => TermLike (Abs a)        where
@@ -155,7 +157,7 @@ instance TermLike EqualityView where
       <$> traverseTermM f t
     IdiomType t -> IdiomType
       <$> traverseTermM f t
-    EqualityType s eq l t a b -> EqualityType s eq
+    EqualityType r s eq l t a b -> EqualityType r s eq
       <$> traverse (traverseTermM f) l
       <*> traverseTermM f t
       <*> traverseTermM f a
@@ -164,7 +166,7 @@ instance TermLike EqualityView where
   foldTerm f = \case
     OtherType t -> foldTerm f t
     IdiomType t -> foldTerm f t
-    EqualityType s eq l t a b -> foldTerm f (l ++ [t, a, b])
+    EqualityType _r _s _eq l t a b -> foldTerm f (l ++ [t, a, b])
 
 -- | Put it in a monad to make it possible to do strictly.
 copyTerm :: (TermLike a, Monad m) => a -> m a

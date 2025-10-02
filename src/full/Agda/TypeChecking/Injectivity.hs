@@ -41,18 +41,15 @@ Projection patterns (@ProjP@) are excluded because metas cannot occupy their pla
 module Agda.TypeChecking.Injectivity where
 
 import Control.Applicative
-import Control.Monad
-import Control.Monad.Except
-import Control.Monad.Fail
-import Control.Monad.State
-import Control.Monad.Reader
-import Control.Monad.Trans.Maybe
+import Control.Monad.Except       ( MonadError )
+import Control.Monad.State        ( evalStateT, MonadState, gets, put )
+import Control.Monad.Reader       ( runReaderT, MonadReader, ask )
+import Control.Monad.Trans.Maybe  ( MaybeT(MaybeT), runMaybeT )
 
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.Maybe
 import Data.Traversable hiding (for)
-import Data.Semigroup ((<>))
 import Data.Foldable (fold)
 
 import qualified Agda.Syntax.Abstract.Name as A
@@ -63,6 +60,7 @@ import Agda.Syntax.Internal.Pattern
 import Agda.TypeChecking.Datatypes
 import Agda.TypeChecking.Irrelevance (isIrrelevantOrPropM)
 import Agda.TypeChecking.Monad
+import Agda.TypeChecking.Patterns.Match (properlyMatching')
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope.Path
 import Agda.TypeChecking.Reduce
@@ -81,7 +79,7 @@ import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Permutation
 import Agda.Syntax.Common.Pretty ( prettyShow )
-import qualified Agda.Utils.ProfileOptions as Profile
+import qualified Agda.Interaction.Options.ProfileOptions as Profile
 
 import Agda.Utils.Impossible
 
@@ -145,7 +143,7 @@ isUnstableDef qn = do
     , builtin_glue
     , builtin_glueU ]
   case theDef defn of
-    _ | any (Just qn ==) prims -> pure True
+    _ | (Just qn) `elem` prims -> pure True
     Function{funIsKanOp = Just _} -> pure True
     _ -> pure False
 
@@ -200,12 +198,11 @@ updateHeads f m = joinHeadMaps <$> mapM f' (Map.toList m)
   where f' (h, c) = (`Map.singleton` c) <$> f h c
 
 checkInjectivity :: QName -> [Clause] -> TCM FunctionInverse
-checkInjectivity f cs0
-  | not (any properlyMatchingClause cs) = do
+checkInjectivity f cs0 = do
+    ifM (anyM properlyMatchingClause cs) {-then-} (checkInjectivity' f cs) {-else-} do
       reportSLn "tc.inj.check.pointless" 35 $
         "Injectivity of " ++ prettyShow (A.qnameToConcrete f) ++ " would be pointless."
       return NotInjective
-  | otherwise = checkInjectivity' f cs
   where
     -- We can filter out absurd clauses.
     cs = filter (isJust . clauseBody) cs0
@@ -213,7 +210,7 @@ checkInjectivity f cs0
     -- these could be catch-all clauses.
     -- However, we need at least one proper match to get injectivity started.
     properlyMatchingClause =
-      any (properlyMatching' False False . namedArg) . namedClausePats
+      anyM (properlyMatching' False False . namedArg) . namedClausePats
 
 -- | Precondition: all the given clauses are non-absurd and contain a proper match.
 checkInjectivity' :: QName -> [Clause] -> TCM FunctionInverse
@@ -318,7 +315,7 @@ functionInverse
 functionInverse = \case
   Def f es -> do
     inv <- defInverse <$> getConstInfo f
-    cubical <- optCubical <$> pragmaOptions
+    cubical <- cubicalOption
     case inv of
       NotInjective -> return NoInv
       Inverse m -> maybe NoInv (Inv f es) <$> (traverse (checkOverapplication es) =<< instantiateVarHeads f es m)
@@ -461,9 +458,9 @@ invertFunction cmp blk (Inv f blkArgs hdMap) hd fallback err success = do
                 ]
               return RollBackMetas
   where
-    nextMeta :: (MonadState [Term] m, MonadFail m) => m Term
+    nextMeta :: (MonadState [Term] m) => m Term
     nextMeta = do
-      m : ms <- get
+      (m, ms) <- gets (fromMaybe __IMPOSSIBLE__ . uncons)
       put ms
       return m
 
@@ -473,18 +470,18 @@ invertFunction cmp blk (Inv f blkArgs hdMap) hd fallback err success = do
       return $ applySubst sub v
 
     metaElim
-      :: (MonadState [Term] m, MonadReader Substitution m, HasConstInfo m, MonadFail m)
+      :: (MonadState [Term] m, MonadReader Substitution m, HasConstInfo m)
       => Arg DeBruijnPattern -> m Elim
     metaElim (Arg _ (ProjP o p))  = Proj o <$> getOriginalProjection p
     metaElim (Arg info p)         = Apply . Arg info <$> metaPat p
 
     metaArgs
-      :: (MonadState [Term] m, MonadReader Substitution m, MonadFail m)
+      :: (MonadState [Term] m, MonadReader Substitution m)
       => [NamedArg DeBruijnPattern] -> m Args
     metaArgs args = mapM (traverse $ metaPat . namedThing) args
 
     metaPat
-      :: (MonadState [Term] m, MonadReader Substitution m, MonadFail m)
+      :: (MonadState [Term] m, MonadReader Substitution m)
       => DeBruijnPattern -> m Term
     metaPat (DotP _ v)       = dotP v
     metaPat (VarP _ _)       = nextMeta

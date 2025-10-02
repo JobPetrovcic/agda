@@ -1,4 +1,5 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
 
 -- | This module defines the names of all builtin and primitives used in Agda.
 --
@@ -75,8 +76,6 @@ data BuiltinId
   | BuiltinNothing
   | BuiltinJust
   | BuiltinIO
-  | BuiltinId
-  | BuiltinReflId
   | BuiltinPath
   | BuiltinPathP
   | BuiltinIntervalUniv
@@ -237,9 +236,12 @@ data BuiltinId
   | BuiltinAgdaTCMFormatErrorParts
   | BuiltinAgdaTCMDebugPrint
   | BuiltinAgdaTCMNoConstraints
+  | BuiltinAgdaTCMWorkOnTypes
   | BuiltinAgdaTCMRunSpeculative
   | BuiltinAgdaTCMExec
+  | BuiltinAgdaTCMCheckFromString
   | BuiltinAgdaTCMGetInstances
+  | BuiltinAgdaTCMSolveInstances
   | BuiltinAgdaTCMPragmaForeign
   | BuiltinAgdaTCMPragmaCompile
   | BuiltinAgdaBlocker
@@ -294,8 +296,6 @@ instance IsBuiltin BuiltinId where
     BuiltinNothing                           -> "NOTHING"
     BuiltinJust                              -> "JUST"
     BuiltinIO                                -> "IO"
-    BuiltinId                                -> "ID"
-    BuiltinReflId                            -> "REFLID"
     BuiltinPath                              -> "PATH"
     BuiltinPathP                             -> "PATHP"
     BuiltinIntervalUniv                      -> "CUBEINTERVALUNIV"
@@ -456,9 +456,12 @@ instance IsBuiltin BuiltinId where
     BuiltinAgdaTCMFormatErrorParts           -> "AGDATCMFORMATERRORPARTS"
     BuiltinAgdaTCMDebugPrint                 -> "AGDATCMDEBUGPRINT"
     BuiltinAgdaTCMNoConstraints              -> "AGDATCMNOCONSTRAINTS"
+    BuiltinAgdaTCMWorkOnTypes                -> "AGDATCMWORKONTYPES"
     BuiltinAgdaTCMRunSpeculative             -> "AGDATCMRUNSPECULATIVE"
     BuiltinAgdaTCMExec                       -> "AGDATCMEXEC"
+    BuiltinAgdaTCMCheckFromString            -> "AGDATCMCHECKFROMSTRING"
     BuiltinAgdaTCMGetInstances               -> "AGDATCMGETINSTANCES"
+    BuiltinAgdaTCMSolveInstances             -> "AGDATCMSOLVEINSTANCES"
     BuiltinAgdaTCMPragmaForeign              -> "AGDATCMPRAGMAFOREIGN"
     BuiltinAgdaTCMPragmaCompile              -> "AGDATCMPRAGMACOMPILE"
     BuiltinAgdaBlocker                       -> "AGDABLOCKER"
@@ -484,8 +487,6 @@ builtinsNoDef =
   sizeBuiltins ++
    -- builtinConId,
   [ builtinIntervalUniv
-  , builtinId
-  , builtinReflId
   , builtinInterval
   , builtinPartial
   , builtinPartialP
@@ -526,7 +527,6 @@ builtinNat, builtinSuc, builtinZero, builtinNatPlus, builtinNatMinus,
   builtinSub, builtinSubIn,
   builtinEquiv, builtinEquivFun, builtinEquivProof,
   builtinTranspProof,
-  builtinId, builtinReflId,
   builtinSizeUniv, builtinSize, builtinSizeLt,
   builtinSizeSuc, builtinSizeInf, builtinSizeMax,
   builtinInf, builtinSharp, builtinFlat,
@@ -580,9 +580,12 @@ builtinNat, builtinSuc, builtinZero, builtinNatPlus, builtinNatMinus,
   builtinAgdaTCMAskNormalisation, builtinAgdaTCMAskReconstructed,
   builtinAgdaTCMAskExpandLast, builtinAgdaTCMAskReduceDefs,
   builtinAgdaTCMNoConstraints,
+  builtinAgdaTCMWorkOnTypes,
   builtinAgdaTCMRunSpeculative,
   builtinAgdaTCMExec,
+  builtinAgdaTCMCheckFromString,
   builtinAgdaTCMGetInstances,
+  builtinAgdaTCMSolveInstances,
   builtinAgdaTCMPragmaForeign,
   builtinAgdaTCMPragmaCompile
   :: BuiltinId
@@ -617,8 +620,6 @@ builtinMaybe                             = BuiltinMaybe
 builtinNothing                           = BuiltinNothing
 builtinJust                              = BuiltinJust
 builtinIO                                = BuiltinIO
-builtinId                                = BuiltinId
-builtinReflId                            = BuiltinReflId
 builtinPath                              = BuiltinPath
 builtinPathP                             = BuiltinPathP
 builtinIntervalUniv                      = BuiltinIntervalUniv
@@ -779,9 +780,12 @@ builtinAgdaTCMAskReduceDefs              = BuiltinAgdaTCMAskReduceDefs
 builtinAgdaTCMFormatErrorParts           = BuiltinAgdaTCMFormatErrorParts
 builtinAgdaTCMDebugPrint                 = BuiltinAgdaTCMDebugPrint
 builtinAgdaTCMNoConstraints              = BuiltinAgdaTCMNoConstraints
+builtinAgdaTCMWorkOnTypes                = BuiltinAgdaTCMWorkOnTypes
 builtinAgdaTCMRunSpeculative             = BuiltinAgdaTCMRunSpeculative
 builtinAgdaTCMExec                       = BuiltinAgdaTCMExec
+builtinAgdaTCMCheckFromString            = BuiltinAgdaTCMCheckFromString
 builtinAgdaTCMGetInstances               = BuiltinAgdaTCMGetInstances
+builtinAgdaTCMSolveInstances             = BuiltinAgdaTCMSolveInstances
 builtinAgdaTCMPragmaForeign              = BuiltinAgdaTCMPragmaForeign
 builtinAgdaTCMPragmaCompile              = BuiltinAgdaTCMPragmaCompile
 builtinAgdaBlocker                       = BuiltinAgdaBlocker
@@ -799,9 +803,7 @@ builtinById = flip M.lookup m where
 -- | A primitive name, defined by the @primitive@ block.
 data PrimitiveId
   -- Cubical
-  = PrimConId
-  | PrimIdElim
-  | PrimIMin
+  = PrimIMin
   | PrimIMax
   | PrimINeg
   | PrimPartial
@@ -816,9 +818,6 @@ data PrimitiveId
   | PrimComp
   | PrimPOr
   | PrimTrans
-  | PrimDepIMin
-  | PrimIdFace
-  | PrimIdPath
   | PrimHComp
   --  Integer
   | PrimShowInteger
@@ -941,8 +940,6 @@ instance IsBuiltin PrimitiveId where
 
   getBuiltinId = \case
     -- Cubical
-    PrimConId                             -> "primConId"
-    PrimIdElim                            -> "primIdElim"
     PrimIMin                              -> "primIMin"
     PrimIMax                              -> "primIMax"
     PrimINeg                              -> "primINeg"
@@ -958,9 +955,6 @@ instance IsBuiltin PrimitiveId where
     PrimComp                              -> "primComp"
     PrimPOr                               -> "primPOr"
     PrimTrans                             -> "primTransp"
-    PrimDepIMin                           -> "primDepIMin"
-    PrimIdFace                            -> "primIdFace"
-    PrimIdPath                            -> "primIdPath"
     PrimHComp                             -> "primHComp"
     --  Integer
     PrimShowInteger                       -> "primShowInteger"
@@ -1066,15 +1060,12 @@ instance IsBuiltin PrimitiveId where
     PrimMetaToNatInjective                -> "primMetaToNatInjective"
     PrimLockUniv                          -> "primLockUniv"
 
-builtinConId, builtinIdElim, builtinSubOut,
+builtinSubOut,
   builtinIMin, builtinIMax, builtinINeg,
   builtinGlue, builtin_glue, builtin_unglue, builtin_glueU, builtin_unglueU,
   builtinFaceForall, builtinComp, builtinPOr,
-  builtinTrans,  builtinDepIMin,
-  builtinIdFace, builtinIdPath, builtinHComp, builtinLockUniv
+  builtinTrans,  builtinHComp, builtinLockUniv
   :: PrimitiveId
-builtinConId                             = PrimConId
-builtinIdElim                            = PrimIdElim
 builtinIMin                              = PrimIMin
 builtinIMax                              = PrimIMax
 builtinINeg                              = PrimINeg
@@ -1088,9 +1079,6 @@ builtinFaceForall                        = PrimFaceForall
 builtinComp                              = PrimComp
 builtinPOr                               = PrimPOr
 builtinTrans                             = PrimTrans
-builtinDepIMin                           = PrimDepIMin
-builtinIdFace                            = PrimIdFace
-builtinIdPath                            = PrimIdPath
 builtinHComp                             = PrimHComp
 builtinLockUniv                          = PrimLockUniv
 

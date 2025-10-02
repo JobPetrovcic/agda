@@ -36,8 +36,8 @@ import Control.Exception ( displayException )
 import Control.Monad.Except
 import Control.Monad.State
 
-import Data.Int
 import Data.Maybe ( listToMaybe )
+import Data.Word  ( Word32)
 
 import Agda.Interaction.Options.Warnings
 
@@ -45,6 +45,9 @@ import Agda.Syntax.Concrete.Attribute
 import Agda.Syntax.Position
 import Agda.Syntax.Parser.Tokens ( Keyword( KwMutual ) )
 
+import Agda.TypeChecking.Positivity.Occurrence ( pattern Mixed )
+
+import Agda.Utils.IO   ( showIOException )
 import Agda.Utils.List ( tailWithDefault )
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Syntax.Common.Pretty
@@ -103,7 +106,7 @@ data LayoutBlock
     deriving Show
 
 -- | A (layout) column.
-type Column = Int32
+type Column = Word32
 
 -- | Status of a layout column (see #1145).
 --   A layout column is 'Tentative' until we encounter a new line.
@@ -163,27 +166,47 @@ data ParseError
     }
   deriving Show
 
+instance NFData ParseError where
+  rnf = \case
+    ParseError _f _r inp tok msg  -> rnf inp `seq` rnf tok `seq` rnf msg
+    OverlappingTokensError _r     -> ()
+    InvalidExtensionError _r exts -> rnf exts
+    ReadFileError _r _err         -> ()
+
 -- | Warnings for parsing.
 data ParseWarning
   -- | Parse errors that concern a range in a file.
   = OverlappingTokensWarning
-    { warnRange    :: !(Range' SrcFile)
-                      -- ^ The range of the bigger overlapping token
+    { warnRange :: !(Range' SrcFile)
+        -- ^ The range of the bigger overlapping token.
     }
+  | MisplacedAttributes Range String
+      -- ^ The 'String' is the error message.
+  | UnknownPolarity Range String
+      -- ^ Unknown polarity, ignored.
+  | UnknownAttribute Range String
+      -- ^ Unknown attribute, ignored.
+      --   The 'Range' includes the "@", the 'String' not.
   | UnsupportedAttribute Range !(Maybe String)
-    -- ^ Unsupported attribute.
+      -- ^ Unsupported attribute.
   | MultipleAttributes Range !(Maybe String)
-    -- ^ Multiple attributes.
+      -- ^ Multiple attributes.
   deriving Show
 
 instance NFData ParseWarning where
   rnf (OverlappingTokensWarning _) = ()
+  rnf (MisplacedAttributes _ s)    = rnf s
+  rnf (UnknownPolarity _ s)        = rnf s
+  rnf (UnknownAttribute _ s)       = rnf s
   rnf (UnsupportedAttribute _ s)   = rnf s
   rnf (MultipleAttributes _ s)     = rnf s
 
 parseWarningName :: ParseWarning -> WarningName
 parseWarningName = \case
   OverlappingTokensWarning{} -> OverlappingTokensWarning_
+  MisplacedAttributes{}      -> MisplacedAttributes_
+  UnknownPolarity{}          -> UnknownPolarity_
+  UnknownAttribute{}         -> UnknownAttribute_
   UnsupportedAttribute{}     -> UnsupportedAttribute_
   MultipleAttributes{}       -> MultipleAttributes_
 
@@ -223,23 +246,25 @@ parseWarning w =
 
 instance Pretty ParseError where
   pretty ParseError{errPos,errSrcFile,errMsg,errPrevToken,errInput} = vcat
-      [ (pretty (errPos { srcFile = errSrcFile }) <> colon) <+>
-        text errMsg
-      , text $ errPrevToken ++ "<ERROR>"
-      , text $ take 30 errInput ++ "..."
+      [ (pretty errPos{ srcFile = errSrcFile } <> colon) <+> "error: [ParseError]"
+      , if not $ null errMsg then text errMsg else sep
+          -- Happy errors have no message, so we print the context instead
+          [ text $ errPrevToken ++ "<ERROR>"
+          , text $ take 30 errInput ++ "..."
+          ]
       ]
   pretty OverlappingTokensError{errRange} = vcat
-      [ (pretty errRange <> colon) <+>
-        "Multi-line comment spans one or more literate text blocks."
+      [ (pretty errRange <> colon) <+> "error: [OverlappingTokensError]"
+      , "Multi-line comment spans one or more literate text blocks."
       ]
   pretty InvalidExtensionError{errPath,errValidExts} = vcat
-      [ (pretty errPath <> colon) <+>
-        "Unsupported extension."
+      [ (pretty errPath <> colon) <+> "error: [InvalidExtensionError]"
+      , "Unsupported extension."
       , "Supported extensions are:" <+> prettyList_ errValidExts
       ]
   pretty ReadFileError{errPath,errIOError} = vcat
       [ "Cannot read file" <+> pretty errPath
-      , "Error:" <+> text (displayException errIOError)
+      , "Error:" <+> text (showIOException errIOError)
       ]
 
 instance HasRange ParseError where
@@ -252,26 +277,38 @@ instance HasRange ParseError where
     errPathRange = posToRange p p
       where p = startPos $ Just $ errPath err
 
+-- | Does not include printing of the range.
+--
 instance Pretty ParseWarning where
-  pretty OverlappingTokensWarning{warnRange} = vcat
-      [ (pretty warnRange <> colon) <+>
-        "Multi-line comment spans one or more literate text blocks."
+  pretty = \case
+
+    OverlappingTokensWarning _r ->
+      "Multi-line comment spans one or more literate text blocks."
+
+    MisplacedAttributes _r s -> text s
+
+    UnknownPolarity _r s ->
+      "Replacing unknown polarity" <+> text s <+> "by" <+> pretty Mixed
+
+    UnknownAttribute _r s ->
+      "Ignoring unknown attribute:" <+> ("@" <> text s)
+
+    UnsupportedAttribute _r ms -> hsep
+      [ case ms of
+          Nothing -> "Attributes"
+          Just s  -> text s <+> "attributes"
+      , "are not supported here."
       ]
-  pretty (UnsupportedAttribute r s) = vcat
-    [ (pretty r <> colon) <+>
-      (case s of
-         Nothing -> "Attributes"
-         Just s  -> text s <+> "attributes") <+>
-      "are not supported here."
-    ]
-  pretty (MultipleAttributes r s) = vcat
-    [ (pretty r <> colon) <+>
-      "Multiple" <+>
-      maybe id (\s -> (text s <+>)) s "attributes (ignored)."
-    ]
+
+    MultipleAttributes _r ms -> hsep
+      [ "Multiple", pretty ms, "attributes (ignored)." ]
+
 
 instance HasRange ParseWarning where
   getRange OverlappingTokensWarning{warnRange} = warnRange
+  getRange (MisplacedAttributes r _)           = r
+  getRange (UnknownPolarity r _)               = r
+  getRange (UnknownAttribute r _)              = r
   getRange (UnsupportedAttribute r _)          = r
   getRange (MultipleAttributes r _)            = r
 

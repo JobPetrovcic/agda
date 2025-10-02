@@ -52,7 +52,7 @@ useNamesFromPattern ps tel = telFromList (zipWith ren ps telList ++ telRemaining
           | otherwise                  -> dom
 
 useNamesFromProblemEqs
-  :: forall m. PureTCM m
+  :: forall m. (PureTCM m, MonadFresh NameId m)
   => [ProblemEq] -> Telescope -> m Telescope
 useNamesFromProblemEqs eqs tel = addContext tel $ do
   names <- fst . getUserVariableNames tel . patternVariables <$> getLeftoverPatterns eqs
@@ -118,7 +118,7 @@ updateProblemRest st@(LHSState tel0 qs0 p@(Problem oldEqs ps ret) a psplit ixspl
     "insertImplicitPatternsT returned" <+> fsep (map prettyA ps)
   -- (Issue 734: Do only the necessary telView to preserve clause types as much as possible.)
   let m = length $ takeWhile (isNothing . A.isProjP) ps
-  (TelV gamma b, boundary) <- telViewUpToPathBoundaryP m $ unArg a
+  (TelV gamma b, boundary) <- telViewUpToPathBoundary' m $ unArg a
   forM_ (zip ps (telToList gamma)) $ \(p, a) ->
     unless (sameHiding p a) $ setCurrentRange p $ typeError WrongHidingInLHS
   let tel1      = useNamesFromPattern ps gamma

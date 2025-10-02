@@ -18,7 +18,7 @@ import qualified Data.IntSet as IntSet
 import Data.List (sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
-import Data.Semigroup (Endo(..), (<>))
+import Data.Semigroup ( Endo(..) )
 
 import Internal.Helpers
 import Internal.Interaction.Highlighting.Range ()
@@ -442,18 +442,21 @@ instance CoArbitrary Aspect where
   coarbitrary Background    = variant 8
   coarbitrary Markup        = variant 9
   coarbitrary Hole          = variant 10
+  coarbitrary (URL ref)     = variant 11 -- . coarbitrary ref -- TODO: CoArbitrary Text
 
 instance Arbitrary NameKind where
-  arbitrary = oneof $ [fmap Constructor arbitrary] ++
-                      map return [ Bound
-                                 , Datatype
-                                 , Field
-                                 , Function
-                                 , Module
-                                 , Postulate
-                                 , Primitive
-                                 , Record
-                                 ]
+  arbitrary = oneof $
+    fmap Constructor arbitrary :
+    map return
+      [ Bound
+      , Datatype
+      , Field
+      , Function
+      , Module
+      , Postulate
+      , Primitive
+      , Record
+      ]
 
   shrink Constructor{} = [Bound]
   shrink _             = []

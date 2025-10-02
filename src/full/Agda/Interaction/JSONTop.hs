@@ -14,7 +14,9 @@ import qualified Data.Set as Set
 
 import Agda.Interaction.AgdaTop
 import Agda.Interaction.Base
-         ( CommandState(..), CurrentFile(..), ComputeMode(..), Rewrite(..), OutputForm(..), OutputConstraint(..) )
+         ( CommandState(..), CurrentFile(..), ComputeMode(..), Rewrite(..)
+         , OutputConstraint_boot(..), OutputForm_boot(..))
+import Agda.Interaction.Output (OutputConstraint, OutputForm)
 import qualified Agda.Interaction.BasicOps as B
 import Agda.Interaction.EmacsTop
 import Agda.Interaction.JSON
@@ -30,7 +32,7 @@ import Agda.Syntax.Concrete.Name
 import Agda.Syntax.Internal
          ( telToList, Dom'(..), Dom, MetaId(..), ProblemId(..), Blocker(..), alwaysUnblock )
 import Agda.Syntax.Position
-         ( Range, rangeIntervals, Interval'(..), Position'(..), noRange )
+         ( Range, rangeIntervals, Interval'(..), Position'(..), noRange, posLine, posCol )
 import Agda.Syntax.Scope.Base
          ( WhyInScopeData(..) )
 
@@ -110,7 +112,7 @@ instance ToJSON (Position' ()) where
 instance EncodeTCM Range where
 instance ToJSON Range where
   toJSON = toJSON . map prettyInterval . rangeIntervals
-    where prettyInterval i = object [ "start" .= iStart i, "end" .= iEnd i ]
+    where prettyInterval (Interval f s e) = object [ "start" .= (f <$ s), "end" .= (f <$ e) ]
 
 instance EncodeTCM ProblemId where
 instance EncodeTCM MetaId    where
@@ -242,6 +244,9 @@ encodeOC f encPrettyTCM = \case
           [ "value"  #= encPrettyTCM v
           , "type"   #= encPrettyTCM t
           ]
+ ResolveInstanceOF q -> kind "ResolveInstanceOF"
+  [ "name"           @= encodePretty q
+  ]
  PTSInstance a b -> kind "PTSInstance"
   [ "constraintObjs" #= traverse f [a, b]
   ]
@@ -285,20 +290,27 @@ instance EncodeTCM Blocker where
   encodeTCM (UnblockOnAny us)    = kind "UnblockOnAny" [ "blockers" @= Set.toList us ]
 
 instance EncodeTCM DisplayInfo where
-  encodeTCM (Info_CompilationOk backend wes) = kind "CompilationOk"
-    [ "backend"           @= encodePretty backend
-    , "warnings"          #= encodeTCM (filterTCWarnings (tcWarnings wes))
-    , "errors"            #= encodeTCM (filterTCWarnings (nonFatalErrors wes))
-    ]
+  encodeTCM :: DisplayInfo -> TCM Value
+  encodeTCM (Info_CompilationOk backend wes) = do
+    ws <- filterTCWarnings (tcWarnings wes)
+    es <- filterTCWarnings (nonFatalErrors wes)
+    kind "CompilationOk"
+      [ "backend"           @= encodePretty backend
+      , "warnings"          #= encodeTCM ws
+      , "errors"            #= encodeTCM es
+      ]
   encodeTCM (Info_Constraints constraints) = kind "Constraints"
     [ "constraints"       #= forM constraints encodeTCM
     ]
-  encodeTCM (Info_AllGoalsWarnings (vis, invis) wes) = kind "AllGoalsWarnings"
-    [ "visibleGoals"      #= forM vis (\i -> withInteractionId (B.outputFormId $ OutputForm noRange [] alwaysUnblock i) $ encodeOC encodeTCM encodePrettyTCM i)
-    , "invisibleGoals"    #= forM invis (encodeOC encodeTCM encodePrettyTCM)
-    , "warnings"          #= encodeTCM (filterTCWarnings (tcWarnings wes))
-    , "errors"            #= encodeTCM (filterTCWarnings (nonFatalErrors wes))
-    ]
+  encodeTCM (Info_AllGoalsWarnings (vis, invis) wes) = do
+    ws <- filterTCWarnings (tcWarnings wes)
+    es <- filterTCWarnings (nonFatalErrors wes)
+    kind "AllGoalsWarnings"
+      [ "visibleGoals"      #= forM vis (\i -> withInteractionId (B.outputFormId $ OutputForm noRange [] alwaysUnblock i) $ encodeOC encodeTCM encodePrettyTCM i)
+      , "invisibleGoals"    #= forM invis (encodeOC encodeTCM encodePrettyTCM)
+      , "warnings"          #= encodeTCM ws
+      , "errors"            #= encodeTCM es
+      ]
   encodeTCM (Info_Time time) = kind "Time"
     [ "time"              @= time
     ]
@@ -364,8 +376,8 @@ instance EncodeTCM GoalTypeAux where
   encodeTCM GoalOnly = kind "GoalOnly" []
   encodeTCM (GoalAndHave expr _) = kind "GoalAndHave"
     [ "expr" #= encodePrettyTCM expr ]
-  encodeTCM (GoalAndElaboration term) = kind "GoalAndElaboration"
-    [ "term" #= encodePrettyTCM term ]
+  encodeTCM (GoalAndElaboration expr) = kind "GoalAndElaboration"
+    [ "term" #= encodePrettyTCM expr ]
 
 encodeGoalSpecific :: InteractionId -> GoalDisplayInfo -> TCM Value
 encodeGoalSpecific ii = go
@@ -394,15 +406,17 @@ encodeGoalSpecific ii = go
     ]
 
 instance EncodeTCM Info_Error where
-  encodeTCM (Info_GenericError err) = kind "Error"
-    [ "warnings"          #= (getAllWarningsOfTCErr err
-                            >>= encodeTCM . filterTCWarnings)
-    , "error"             #= encodeTCM err
-    ]
+  encodeTCM :: Info_Error -> TCM Value
+  encodeTCM (Info_GenericError err) = do
+    ws <- filterTCWarnings =<< getAllWarningsOfTCErr err
+    kind "Error"
+      [ "warnings"          #= encodeTCM ws
+      , "error"             #= encodeTCM err
+      ]
   encodeTCM err = kind "Error"
     [ "warnings"          @= ([] :: [String])
     , "error"             #= obj
-      [ "message"           #= showInfoError err
+      [ "message"         #= showInfoError err
       ]
     ]
 
@@ -459,6 +473,9 @@ instance EncodeTCM Response where
         [ "interactionPoint"  .= i
         , "expression"        .= P.prettyShow expr
         ]
+  encodeTCM (Resp_Mimer ii str) = kind "Mimer"
+    [ "solution" @= str
+    ]
 
 -- | Convert Response to an JSON value for interactive editor frontends.
 jsonifyResponse :: Response -> TCM ByteString

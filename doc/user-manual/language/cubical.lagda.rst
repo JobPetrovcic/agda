@@ -23,12 +23,6 @@
           ; equiv-proof
           ; _≃_
           ; primGlue )
-  open import Agda.Builtin.Cubical.Id public
-    using ( Id
-          ; conid
-          ; primIdElim
-          ; reflId
-          )
 
   open import Agda.Builtin.Sigma public
   open import Agda.Builtin.Bool public
@@ -112,7 +106,8 @@ the following to the top of a file (this assumes that the
 
   {-# OPTIONS --cubical #-}
 
-  open import Cubical.Core.Everything
+  open import Cubical.Core.Primitives
+  open import Cubical.Core.Glue
 
 Follow the instructions at https://github.com/agda/cubical to install the library.
 In order to make this library visible to Agda add
@@ -319,7 +314,7 @@ induction principle for paths:
 
 One subtle difference between paths and the propositional equality
 type of Agda is that the computation rule for ``J`` does not hold
-definitionally. If ``J`` is defined using pattern-matching as in the
+definitionally. If ``J`` is defined using pattern matching as in the
 Agda standard library then this holds, however as the path types are
 not inductively defined this does not hold for the above definition of
 ``J``. In particular, transport in a constant family is only the
@@ -662,7 +657,7 @@ datatypes with path constructors. For example the circle and `torus
     square : PathP (λ i → line1 i ≡ line1 i) line2 line2
 
 Functions out of higher inductive types can then be defined using
-pattern-matching:
+pattern matching:
 
 ::
 
@@ -693,7 +688,7 @@ cases are mixed up).
   c2t_bad (base   , loop j) = line1 j
   c2t_bad (loop i , loop j) = square i j
 
-Functions defined by pattern-matching on higher inductive types
+Functions defined by pattern matching on higher inductive types
 compute definitionally, for all constructors.
 
 ::
@@ -803,7 +798,7 @@ whereas ``uaβ`` only has one!
             (transportRefl _))))
 
 In more concrete situations, such as when the indices are constructors
-of some other inductive type, pattern-matching definitions will not
+of some other inductive type, pattern matching definitions will not
 compute when applied to transports. For specific unsupported cases, see
 :ref:`cubical-ix-matching`.
 
@@ -811,8 +806,8 @@ If the ``UnsupportedIndexedMatch`` warning is enabled (it is by default),
 Agda will print a warning for every definition whose computational
 behaviour could not be extended to cover transports. Internally,
 transports are represented by an additional constructor, and
-pattern-matching definitions must be extended to cover these
-constructors. To do this, the results of pattern-matching unification
+pattern matching definitions must be extended to cover these
+constructors. To do this, the results of pattern matching unification
 must be translated into an embedding (in the HoTT sense).
 **This is work-in-progress.**
 
@@ -826,7 +821,7 @@ For the day-to-day use of Cubical Agda, it is advisable to disable the
 What works, and what doesn't
 ----------------------------
 
-This section lists some of the common cases where pattern-matching
+This section lists some of the common cases where pattern matching
 unification produces something that can not be extended to cover
 transports, and the cases in which it can.
 
@@ -907,7 +902,7 @@ not generate a ``UnsupportedIndexedMatch`` warning.
   zeroNotSucEq ()
 
 Definitions whose elaboration involves using an equality derived from
-pattern-matching in a type in ``Setω`` can not be extended yet. The
+pattern matching in a type in ``Setω`` can not be extended yet. The
 following example is very artificial because it minimises
 `an example from the Cubical library <https://github.com/agda/cubical/blob/2131b6c08e32fdcf5b9292e5c6d6f23e4bf80fcd/Cubical/Structures/Macro.agda>`_.
 The point is that to extend ``test`` to cover transports, we would need
@@ -1144,27 +1139,3 @@ them more pleasant to use:
        → (Te : Partial φ (Σ[ T ∈ Set ℓ' ] T ≃ A))
        → Set ℓ'
   Glue A Te = primGlue A (λ x → Te x .fst) (λ x → Te x .snd)
-
-The ``Agda.Builtin.Cubical.Id`` exports the cubical identity types:
-
-.. code-block:: agda
-
-  postulate
-    Id : ∀ {ℓ} {A : Set ℓ} → A → A → Set ℓ
-
-  {-# BUILTIN ID           Id       #-}
-  {-# BUILTIN CONID        conid    #-}
-  {-# BUILTIN REFLID       reflId   #-}
-
-  primitive
-    primDepIMin : _
-    primIdFace : ∀ {ℓ} {A : Set ℓ} {x y : A} → Id x y → I
-    primIdPath : ∀ {ℓ} {A : Set ℓ} {x y : A} → Id x y → x ≡ y
-
-  primitive
-    primIdElim : ∀ {a c} {A : Set a} {x : A}
-                   (C : (y : A) → Id x y → Set c) →
-                   ((φ : I) (y : A [ φ ↦ (λ _ → x) ])
-                    (w : (x ≡ outS y) [ φ ↦ λ{ (φ = i1) _ → x } ]) →
-                    C (outS y) (conid φ (outS w))) →
-                   {y : A} (p : Id x y) → C y p

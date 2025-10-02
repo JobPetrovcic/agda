@@ -35,10 +35,12 @@ excluded-dirs:
   - std-lib
   - test/Succeed/LineEndings
   - examples/uptodate
+  - .direnv
 
 # Every matched filename is included unless it is matched by excluded-files.
 included-files:
   - "*.agda"
+  - "*.agda-lib"
   - "*.cabal"
   - "*.el"
   - "*.hs"

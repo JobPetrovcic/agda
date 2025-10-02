@@ -2,16 +2,13 @@
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE CPP                   #-}
 
-#if  __GLASGOW_HASKELL__ > 800
 {-# OPTIONS_GHC -Wno-error=orphans -Wno-error=partial-type-signatures #-}
-#endif
-{-# OPTIONS_GHC -fno-warn-orphans -fno-warn-partial-type-signatures #-}
+{-# OPTIONS_GHC -Wno-orphans -Wno-partial-type-signatures #-}
 
 module Internal.Utils.IntSet ( tests ) where
 
 import Agda.Utils.IntSet.Infinite as Inf
 import Test.QuickCheck
-import Data.Semigroup hiding (All)
 import qualified Data.Set as Set
 import Data.Foldable
 

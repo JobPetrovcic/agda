@@ -21,7 +21,6 @@ import Control.Monad
 import Control.Monad.Trans ( MonadIO(..), lift )
 import Control.Monad.Trans.Reader ( ReaderT(runReaderT), ask )
 
-import Data.Function ( on )
 import Data.Foldable (toList, concatMap)
 import Data.Maybe
 import qualified Data.IntMap as IntMap
@@ -50,8 +49,6 @@ import Text.Blaze.Html.Renderer.Text ( renderHtml )
   -- The imported operator (!) attaches an Attribute to an Html value
   -- The defined operator (!!) attaches a list of such Attributes
 
-import Paths_Agda
-
 import Agda.Interaction.Highlighting.Precise hiding (toList)
 
 import Agda.Syntax.Common
@@ -60,6 +57,8 @@ import Agda.Syntax.TopLevelModuleName
 import qualified Agda.TypeChecking.Monad as TCM
   ( Interface(..)
   )
+
+import Agda.Setup ( getDataFileName )
 
 import Agda.Utils.Function
 import Agda.Utils.List1 (String1, pattern (:|))
@@ -114,6 +113,7 @@ highlightOnlyCode HighlightAuto MdFileType    = True
 highlightOnlyCode HighlightAuto RstFileType   = True
 highlightOnlyCode HighlightAuto OrgFileType   = True
 highlightOnlyCode HighlightAuto TypstFileType = True
+highlightOnlyCode HighlightAuto TreeFileType  = True
 highlightOnlyCode HighlightAuto TexFileType   = False
 
 -- | Determine the generated file extension
@@ -128,6 +128,7 @@ highlightedFileExt hh ft
       TexFileType   -> "tex"
       OrgFileType   -> "org"
       TypstFileType -> "typ"
+      TreeFileType  -> "tree"
 
 -- | Options for HTML generation
 
@@ -307,6 +308,7 @@ code onlyCode fileType = mconcat . if onlyCode
          MdFileType    -> map mkMd . splitByMarkup
          AgdaFileType  -> map mkHtml
          OrgFileType   -> map mkOrg . splitByMarkup
+         TreeFileType  -> map mkMd . splitByMarkup
          -- Two useless cases, probably will never used by anyone
          TexFileType   -> map mkMd . splitByMarkup
          TypstFileType -> map mkMd . splitByMarkup

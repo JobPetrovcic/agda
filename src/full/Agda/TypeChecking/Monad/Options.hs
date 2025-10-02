@@ -14,6 +14,7 @@ import qualified Data.Graph as Graph
 import Data.List (sort)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 
 import System.Directory
 import System.FilePath
@@ -21,7 +22,7 @@ import System.FilePath
 import Agda.Syntax.Common
 import Agda.Syntax.TopLevelModuleName
 
-import Agda.TypeChecking.Monad.Debug (reportSDoc)
+import Agda.TypeChecking.Monad.Debug (reportSDoc, reportS)
 import Agda.TypeChecking.Warnings
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Imports
@@ -30,15 +31,17 @@ import Agda.TypeChecking.Monad.Benchmark
 import Agda.TypeChecking.Monad.Trace
 
 import Agda.Interaction.FindFile
-import Agda.Interaction.Options
+import Agda.Interaction.Options hiding (setPragmaOptions)
 import qualified Agda.Interaction.Options.Lenses as Lens
 import Agda.Interaction.Library
-import Agda.Interaction.Library.Base (libAbove, libFile)
+import Agda.Interaction.Library.Base (LibCache(LibCache), libAbove, libFile, runLibM)
 
 import Agda.Utils.FileName
 import qualified Agda.Utils.Graph.AdjacencyMap.Unidirectional as G
 import Agda.Utils.Lens
 import Agda.Utils.List
+import Agda.Utils.List1 (List1)
+import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Null
 import Agda.Syntax.Common.Pretty
 import Agda.Utils.Size
@@ -53,10 +56,28 @@ setPragmaOptions opts = do
   -- Check for unsafe pragma options if @--safe@ is on.
   when (Lens.getSafeMode opts) $
     unlessNull (unsafePragmaOptions opts) $ \ unsafe ->
-      warning $ SafeFlagPragma unsafe
+      warning $ SafeFlagPragma $ Set.fromList unsafe
 
   stPragmaOptions `setTCLens` opts
   updateBenchmarkingStatus
+
+-- | Check that that you don't turn on inconsistent options. For instance, if --a implies --b and
+--   you have both --a and --no-b. Only warn for things that have changed compared to the old
+--   options.
+checkPragmaOptionConsistency :: PragmaOptions -> PragmaOptions -> TCM ()
+checkPragmaOptionConsistency oldOpts newOpts = do
+  mapM_ check impliedPragmaOptions
+  where
+    -- Only warn if both flags are set explicitly (Value rather than Default)
+    check (ImpliesPragmaOption nameA valA flagA nameB valB flagB)
+      | flagA newOpts == flagA oldOpts
+      , flagB newOpts == flagB oldOpts  = pure () -- Nothing changed, don't check again.
+      | Value vA <- flagA newOpts, vA == valA
+      , Value vB <- flagB newOpts, vB /= valB = warning $ ConflictingPragmaOptions (nameA .= valA) (nameB .= valB)
+      | otherwise                 = pure ()
+      where
+        name .= True  = name
+        name .= False = "no-" ++ name
 
 -- | Sets the command line options (both persistent and pragma options
 -- are updated).
@@ -78,32 +99,36 @@ setCommandLineOptions'
   -> CommandLineOptions
   -> TCM ()
 setCommandLineOptions' root opts = do
-  -- Andreas, 2022-11-19: removed a call to checkOpts which did nothing.
+      -- Andreas, 2025-08-05, PR #8037
+      -- 'setLibraryPaths' below can fail,
+      -- and to print the error correctly
+      -- we need knowledge of the optDiagnosticsColor command line option.
+      -- Thus, we already set this option here.
+      -- Setting all the options here breaks the optAbsoluteIncludePaths logic.
+      modifyTC $ Lens.mapCommandLineOptions \ o -> o{ optDiagnosticsColour = optDiagnosticsColour opts }
+
+      -- Compute the set of include paths.
       incs <- case optAbsoluteIncludePaths opts of
         [] -> do
           opts' <- setLibraryPaths root opts
           let incs = optIncludePaths opts'
           setIncludeDirs incs root
-          getIncludeDirs
+          List1.toList <$> getIncludeDirs
         incs -> return incs
       modifyTC $ Lens.setCommandLineOptions opts{ optAbsoluteIncludePaths = incs }
       setPragmaOptions (optPragmaOptions opts)
-      updateBenchmarkingStatus
+      -- updateBenchmarkingStatus -- already included in setPragmaOptions
 
 libToTCM :: LibM a -> TCM a
 libToTCM m = do
-  cachedConfs <- useTC stProjectConfigs
-  cachedLibs  <- useTC stAgdaLibFiles
+  libCache <- useTC stLibCache
+  ((z, warns), libCache') <- liftIO $ runLibM m libCache
 
-  ((z, warns), (cachedConfs', cachedLibs')) <- liftIO $
-    (`runStateT` (cachedConfs, cachedLibs)) $ runWriterT $ runExceptT m
+  setTCLens stLibCache libCache'
 
-  modifyTCLens stProjectConfigs $ const cachedConfs'
-  modifyTCLens stAgdaLibFiles   $ const cachedLibs'
-
-  unless (null warns) $ warnings $ map LibraryWarning warns
+  List1.unlessNull warns \ warns -> warnings $ fmap LibraryWarning warns
   case z of
-    Left s  -> typeError $ GenericDocError s
+    Left s  -> typeError $ LibraryError s
     Right x -> return x
 
 -- | Returns the library files for a given file.
@@ -137,7 +162,7 @@ getAgdaLibFilesWithoutTopLevelModuleName
   -> TCM [AgdaLibFile]
 getAgdaLibFilesWithoutTopLevelModuleName f = do
   useLibs <- optUseLibs <$> commandLineOptions
-  if | useLibs   -> libToTCM $ mkLibM [] $ getAgdaLibFiles' root
+  if | useLibs   -> libToTCM $ getAgdaLibFile root
      | otherwise -> return []
   where
   root = takeDirectory $ filePath f
@@ -151,10 +176,7 @@ checkLibraryFileNotTooFarDown ::
   AgdaLibFile ->
   TCM ()
 checkLibraryFileNotTooFarDown m lib =
-  when (lib ^. libAbove < size m - 1) $ typeError $ GenericError $
-    "A .agda-lib file for " ++ prettyShow m ++
-    " must not be located in the directory " ++
-    takeDirectory (lib ^. libFile)
+  when (lib ^. libAbove < size m - 1) $ typeError $ LibTooFarDown m lib
 
 -- | Returns the library options for a given file.
 
@@ -205,14 +227,29 @@ addTrustedExecutables o = do
   -- or is a security risk.
   return o{ optTrustedExecutables = trustedExes }
 
+-- | Set pragma options without checking for consistency.
 setOptionsFromPragma :: OptionsPragma -> TCM ()
-setOptionsFromPragma ps = setCurrentRange (pragmaRange ps) $ do
+setOptionsFromPragma = setOptionsFromPragma' False
+
+-- | Set pragma options and check them for consistency.
+checkAndSetOptionsFromPragma :: OptionsPragma -> TCM ()
+checkAndSetOptionsFromPragma = setOptionsFromPragma' True
+
+setOptionsFromPragma' :: Bool -> OptionsPragma -> TCM ()
+setOptionsFromPragma' checkConsistency ps = setCurrentRange (pragmaRange ps) $ do
     opts <- commandLineOptions
     let (z, warns) = runOptM (parsePragmaOptions ps opts)
     mapM_ (warning . OptionWarning) warns
     case z of
-      Left err    -> typeError $ GenericError err
-      Right opts' -> setPragmaOptions opts'
+      Left err    -> typeError $ OptionError err
+      Right opts' -> do
+
+        -- Check consistency of implied options
+        when checkConsistency $ do
+          oldOpts <- pragmaOptions
+          checkPragmaOptionConsistency oldOpts opts'
+
+        setPragmaOptions opts'
 
 -- | Disable display forms.
 enableDisplayForms :: MonadTCEnv m => m a -> m a
@@ -233,12 +270,9 @@ displayFormsEnabled = asksTC envDisplayFormsEnabled
 -- Precondition: 'optAbsoluteIncludePaths' must be nonempty (i.e.
 -- 'setCommandLineOptions' must have run).
 
-getIncludeDirs :: HasOptions m => m [AbsolutePath]
+getIncludeDirs :: TCM (List1 AbsolutePath)
 getIncludeDirs = do
-  incs <- optAbsoluteIncludePaths <$> commandLineOptions
-  case incs of
-    [] -> __IMPOSSIBLE__
-    _  -> return incs
+  List1.fromListSafe __IMPOSSIBLE__ . optAbsoluteIncludePaths <$> commandLineOptions
 
 -- | Makes the given directories absolute and stores them as include
 -- directories.
@@ -257,24 +291,22 @@ setIncludeDirs incs root = do
   oldIncs <- getsTC Lens.getAbsoluteIncludePaths
 
   -- Add the current dir if no include path is given
-  incs <- return $ if null incs then ["."] else incs
+  incs <- return $ List1.fromListSafe (List1.singleton ".") incs
   -- Make paths absolute
-  incs <- return $  map (mkAbsolute . (filePath root </>)) incs
+  incs <- return $ fmap (mkAbsolute . (filePath root </>)) incs
 
   -- Andreas, 2013-10-30  Add default include dir
-      -- NB: This is an absolute file name, but
-      -- Agda.Utils.FilePath wants to check absoluteness anyway.
-  primdir <- liftIO $ mkAbsolute <$> getPrimitiveLibDir
+  primdir <- useTC stPrimitiveLibDir
       -- We add the default dir at the end, since it is then
       -- printed last in error messages.
       -- Might also be useful to overwrite default imports...
-  incs <- return $ nubOn id $ incs ++ [primdir]
+  incs <- return $ List1.fromListSafe __IMPOSSIBLE__ $ nubOn id $ List1.toList $ incs <> List1.singleton primdir
 
-  reportSDoc "setIncludeDirs" 10 $ return $ vcat
+  reportS "setIncludeDirs" 10 $ vcat
     [ "Old include directories:"
     , nest 2 $ vcat $ map pretty oldIncs
     , "New include directories:"
-    , nest 2 $ vcat $ map pretty incs
+    , nest 2 $ vcat $ fmap pretty incs
     ]
 
   -- Check whether the include dirs have changed.  If yes, reset state.
@@ -290,22 +322,18 @@ setIncludeDirs incs root = do
   -- up in a situation in which we use the contents of the file
   -- "old-path/M.agda", when the user actually meant
   -- "new-path/M.agda".
-  when (sort oldIncs /= sort incs) $ do
-    ho <- getInteractionOutputCallback
+  when (sort oldIncs /= sort (List1.toList incs)) $ do
     tcWarnings <- useTC stTCWarnings -- restore already generated warnings
-    projectConfs <- useTC stProjectConfigs  -- restore cached project configs & .agda-lib
-    agdaLibFiles <- useTC stAgdaLibFiles    -- files, since they use absolute paths
+    libCache   <- useTC stLibCache   -- restore cached project configs & .agda-lib files, since they use absolute paths
     decodedModules <- getDecodedModules
     (keptDecodedModules, modFile) <- modulesToKeep incs decodedModules
     resetAllState
     setTCLens stTCWarnings tcWarnings
-    setTCLens stProjectConfigs projectConfs
-    setTCLens stAgdaLibFiles agdaLibFiles
-    setInteractionOutputCallback ho
+    setTCLens stLibCache libCache
     setDecodedModules keptDecodedModules
-    setTCLens stModuleToSource modFile
+    setTCLens stModuleToSourceId modFile
 
-  Lens.putAbsoluteIncludePaths incs
+  Lens.putAbsoluteIncludePaths $ List1.toList incs
   where
   -- A decoded module is kept if its top-level module name is resolved
   -- to the same absolute path using the old and the new include
@@ -319,9 +347,9 @@ setIncludeDirs incs root = do
   -- ModuleToSource structure, constructed using the new include
   -- directories, is returned.
   modulesToKeep
-    :: [AbsolutePath]  -- New include directories.
+    :: List1 AbsolutePath -- New include directories.
     -> DecodedModules  -- Old decoded modules.
-    -> TCM (DecodedModules, ModuleToSource)
+    -> TCM (DecodedModules, ModuleToSourceId)
   modulesToKeep incs old = process Map.empty Map.empty modules
     where
     -- A graph with one node per module in old, and an edge from m to
@@ -359,8 +387,8 @@ setIncludeDirs incs root = do
       G.sccs' dependencyGraph
 
     process ::
-      Map TopLevelModuleName ModuleInfo -> ModuleToSource ->
-      [ModuleInfo] -> TCM (DecodedModules, ModuleToSource)
+      Map TopLevelModuleName ModuleInfo -> ModuleToSourceId ->
+      [ModuleInfo] -> TCM (DecodedModules, ModuleToSourceId)
     process !keep !modFile [] = return
       ( Map.fromList $
         Map.toList keep
@@ -373,7 +401,7 @@ setIncludeDirs incs root = do
         if not depsKept then return (keep, modFile) else do
         let t = iTopLevelModuleName $ miInterface m
         oldF            <- findFile' t
-        (newF, modFile) <- liftIO $ findFile'' incs t modFile
+        (newF, modFile) <- runStateT (findFile'_ incs t) modFile
         return $ case (oldF, newF) of
           (Right f1, Right f2) | f1 == f2 ->
             (Map.insert t m keep, modFile)

@@ -1,20 +1,24 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
+{-# OPTIONS_GHC -Wunused-binds #-}
 
 module Agda.Syntax.Concrete.Definitions.Monad where
 
 import Prelude hiding ( null )
 
-import Control.Monad        ( unless )
+import Control.Monad        ( )
 import Control.Monad.Except ( MonadError(..), ExceptT, runExceptT )
 import Control.Monad.Reader ( MonadReader, ReaderT, runReaderT )
-import Control.Monad.State  ( MonadState(..), modify, State, runState )
+import Control.Monad.State  ( MonadState(..), modify, State, StateT, runState )
 
 import Data.Bifunctor (second)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Maybe (catMaybes)
 
 import Agda.Syntax.Position
 import Agda.Syntax.Common hiding (TerminationCheck())
+import Agda.Syntax.Concrete ( WhereClause_ )
 import Agda.Syntax.Concrete.Name
 import Agda.Syntax.Concrete.Definitions.Types
 import Agda.Syntax.Concrete.Definitions.Errors
@@ -34,6 +38,9 @@ newtype Nice a = Nice { unNice :: ReaderT NiceEnv (ExceptT DeclarationException 
            , MonadReader NiceEnv, MonadState NiceState, MonadError DeclarationException
            )
 
+-- | Extension of the nicifier monad with state to process interleaved mutual blocks.
+type INice = StateT InterleavedState Nice
+
 -- | Run a Nicifier computation, return result and warnings
 --   (in chronological order).
 runNice :: NiceEnv -> Nice a -> (Either DeclarationException a, NiceWarnings)
@@ -49,6 +56,8 @@ instance Null a => Null (Nice a) where
 data NiceEnv = NiceEnv
   { safeButNotBuiltin :: Bool
        -- ^ We are in a module declared @--safe@ which is not a builtin module.
+  , checkingWhere     :: WhereClause_
+       -- ^ Are we checking a @where@ module?
   }
 
 -- | Nicifier state.
@@ -104,7 +113,7 @@ initNiceState = NiceState
   , _termChk  = TerminationCheck
   , _posChk   = YesPositivityCheck
   , _uniChk   = YesUniverseCheck
-  , _catchall = False
+  , _catchall = empty
   , _covChk   = YesCoverageCheck
   , niceWarn  = []
   , _nameId   = NameId 1 noModuleNameHash
@@ -165,13 +174,13 @@ forgetLoneSigs = loneSigs .= Map.empty
 checkLoneSigs :: LoneSigs -> Nice ()
 checkLoneSigs xs = do
   forgetLoneSigs
-  unless (Map.null xs) $ declarationWarning $ MissingDefinitions $
-    map (\s -> (loneSigName s , loneSigRange s)) $ Map.elems xs
+  List1.unlessNull (Map.elems xs) \ ss -> declarationWarning $ MissingDefinitions $
+    fmap (\s -> (loneSigName s , loneSigRange s)) ss
 
 -- | Ensure that all forward declarations have been given a definition,
 -- raising an error indicating *why* they would have had to have been
 -- defined.
-breakImplicitMutualBlock :: Range -> String -> Nice ()
+breakImplicitMutualBlock :: KwRange -> String -> Nice ()
 breakImplicitMutualBlock r why = do
   m <- use loneSigs
   List1.unlessNull (Map.elems m) $ \ xs ->
@@ -181,8 +190,11 @@ breakImplicitMutualBlock r why = do
 
 -- | Get names of lone function signatures, plus their unique names.
 
-loneFuns :: LoneSigs -> [(Name,Name)]
-loneFuns = map (second loneSigName) . filter (isFunName . loneSigKind . snd) . Map.toList
+loneFuns :: LoneSigs -> [(Name, Arg Name)]
+loneFuns ls = catMaybes $
+   Map.toList ls <&> \case
+    (x, LoneSig _ x' (FunName ai _ _)) -> Just (x, Arg ai x')
+    _ -> Nothing
 
 -- | Create a 'LoneSigs' map from an association list.
 
@@ -255,7 +267,7 @@ catchallPragma f e = f (_catchall e) <&> \ s -> e { _catchall = s }
 popCatchallPragma :: Nice Catchall
 popCatchallPragma = do
   ca <- use catchallPragma
-  catchallPragma .= False
+  catchallPragma .= empty
   return ca
 
 withCatchallPragma :: Catchall -> Nice a -> Nice a

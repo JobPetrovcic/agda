@@ -1,7 +1,5 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE ViewPatterns #-}
-
 module Agda.TypeChecking.Telescope where
 
 import Prelude hiding (null)
@@ -17,15 +15,15 @@ import Data.Maybe
 import Data.Monoid
 
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty ( Pretty )
 import Agda.Syntax.Internal
-import Agda.Syntax.Internal.Pattern
+import Agda.Syntax.Internal.Pattern ( patternToTerm )
 
 import Agda.TypeChecking.Monad.Builtin
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Free
-import Agda.TypeChecking.Warnings
 
 import Agda.Utils.CallStack ( withCallerCallStack )
 import Agda.Utils.Either
@@ -42,12 +40,39 @@ import qualified Agda.Utils.VarSet as VarSet
 
 import Agda.Utils.Impossible
 
--- | Flatten telescope: (Γ : Tel) -> [Type Γ]
+-- | Flatten telescope: @(Γ : Tel) -> [Type Γ]@.
+--
+-- 'flattenTel' is lazy in both the spine and values of
+-- the resulting list.
 flattenTel :: TermSubst a => Tele (Dom a) -> [Dom a]
-flattenTel EmptyTel          = []
-flattenTel (ExtendTel a tel) = raise (size tel + 1) a : flattenTel (absBody tel)
-
+flattenTel tel = loop (size tel) tel
+  where
+    loop ix EmptyTel = []
+    loop ix (ExtendTel a (Abs _ tel)) = raise ix a : loop (ix - 1) tel
+    loop ix (ExtendTel a (NoAbs _ tel)) = raise ix a : loop ix tel
 {-# SPECIALIZE flattenTel :: Telescope -> [Dom Type] #-}
+
+-- | Flatten telescope: @(Γ : Tel) -> [Type Γ]@ into a reversed list.
+--
+-- 'flattenRevTel' is lazy in both the spine and values of
+-- the resulting list.
+flattenRevTel :: TermSubst a => Tele (Dom a) -> [Dom a]
+flattenRevTel tel = loop (size tel) [] tel
+  where
+    loop ix acc EmptyTel = acc
+    loop ix acc (ExtendTel a (Abs _ tel)) = loop (ix - 1) (raise ix a : acc) tel
+    loop ix acc (ExtendTel a (NoAbs _ tel)) = loop ix (raise ix a : acc) tel
+{-# SPECIALIZE flattenRevTel :: Telescope -> [Dom Type] #-}
+
+-- | Turn a context into a flat telescope: all entries live in the whole context.
+-- @
+--    (Γ : Context) -> [Type Γ]
+-- @
+flattenContext :: Context -> [ContextEntry]
+flattenContext = loop 1 []
+  where
+    loop n tel []       = tel
+    loop n tel (ce:ctx) = loop (n + 1) (raise n ce : tel) ctx
 
 -- | Order a flattened telescope in the correct dependeny order: Γ ->
 --   Permutation (Γ -> Γ~)
@@ -96,11 +121,13 @@ teleNames :: Telescope -> [ArgName]
 teleNames = map (fst . unDom) . telToList
 
 teleArgNames :: Telescope -> [Arg ArgName]
-teleArgNames = map (argFromDom . fmap fst) . telToList
+teleArgNames = telToArgs
 
+-- | Convert a telescope to a list of 'Arg' in descending order.
 teleArgs :: (DeBruijn a) => Tele (Dom t) -> [Arg a]
 teleArgs = map argFromDom . teleDoms
 
+-- | Convert a telescope to a list of 'Dom' in descending order.
 teleDoms :: (DeBruijn a) => Tele (Dom t) -> [Dom a]
 teleDoms tel = zipWith (\ i dom -> deBruijnVar i <$ dom) (downFrom $ size l) l
   where l = telToList tel
@@ -122,7 +149,7 @@ teleNamedArgs = map namedArgFromDom . teleDoms
 --   Precondition: the two telescopes have the same length.
 tele2NamedArgs :: (DeBruijn a) => Telescope -> Telescope -> [NamedArg a]
 tele2NamedArgs tel0 tel =
-  [ Arg info (Named (Just $ WithOrigin Inserted $ unranged $ argNameToString argName) (debruijnNamedVar varName i))
+  [ Arg info (Named (Just $ WithOrigin Inserted $ unranged $ argNameToString argName) (deBruijnNamedVar varName i))
   | (i, Dom{domInfo = info, unDom = (argName,_)}, Dom{unDom = (varName,_)}) <- zip3 (downFrom $ size l) l0 l ]
   where
   l  = telToList tel
@@ -163,51 +190,74 @@ permuteTel perm tel =
       types = permute perm $ renameP impossible (flipP perm) $ flattenTel tel
   in  unflattenTel names types
 
+-- | Like 'permuteTel', but start with a context.
+--
+permuteContext :: Permutation -> Context -> Telescope
+permuteContext perm ctx = permuteTel perm $ contextToTel ctx
+
 -- | Recursively computes dependencies of a set of variables in a given
 --   telescope. Any dependencies outside of the telescope are ignored.
-varDependencies :: Telescope -> IntSet -> IntSet
-varDependencies tel = addLocks . allDependencies IntSet.empty
+--
+--   Note that 'varDependencies' considers a variable to depend on itself.
+varDependencies :: Telescope -> VarSet -> VarSet
+varDependencies tel = addLocks . allDependencies tel
   where
-    addLocks s | IntSet.null s = s
-               | otherwise = IntSet.union s $ IntSet.fromList $ filter (>= m) locks
+    addLocks :: VarSet -> VarSet
+    addLocks s =
+      case VarSet.lookupMin s of
+        Just m ->
+          let locks = catMaybes [ deBruijnView (unArg a) | (a :: Arg Term) <- teleArgs tel, IsLock{} <- pure (getLock a)]
+          -- 'teleArgs' returns indices in descending order, so both the
+          -- 'takeWhile' and 'insertsDesc' are safe.
+          in VarSet.insertsDesc (takeWhile (>= m) locks) s
+        Nothing ->
+          s
+
+    allDependencies :: Telescope -> VarSet -> VarSet
+    allDependencies tel vs = loop empty (flattenRevTel tel) (-1) vs
       where
-        locks = catMaybes [ deBruijnView (unArg a) | (a :: Arg Term) <- teleArgs tel, IsLock{} <- pure (getLock a)]
-        m = IntSet.findMin s
-    n  = size tel
-    ts = flattenTel tel
+        -- Idea here is to keep a set @work@ of variables that we still need
+        -- to get deps of. At each iteration, we skip backwards through the telescope
+        -- and add its direct dependencies to the work set. This only checks dependencies
+        -- of each variable once, as telescope elements can't depend on things later in the telescope.
+        loop :: VarSet -> [Dom Type] -> Int -> VarSet -> VarSet
+        loop !deps telRev prevIx work =
+          case VarSet.minView work of
+            Nothing -> deps
+            Just (ix, work) ->
+              case drop (ix - prevIx - 1) telRev of
+                [] ->
+                  -- Ignore all deps outside the telescope
+                  deps
+                (ti:telRev) ->
+                  loop (VarSet.insert ix deps) telRev ix (VarSet.union (allFreeVars ti) work)
 
-    directDependencies :: Int -> IntSet
-    directDependencies i = allFreeVars $ indexWithDefault __IMPOSSIBLE__ ts (n-1-i)
 
-    allDependencies :: IntSet -> IntSet -> IntSet
-    allDependencies =
-      IntSet.foldr $ \j soFar ->
-        if j >= n || j `IntSet.member` soFar
-        then soFar
-        else IntSet.insert j $ allDependencies soFar $ directDependencies j
 
 -- | Computes the set of variables in a telescope whose type depend on
 --   one of the variables in the given set (including recursive
 --   dependencies). Any dependencies outside of the telescope are
 --   ignored.
-varDependents :: Telescope -> IntSet -> IntSet
-varDependents tel = allDependents
+--
+--   Unlike 'varDependencies', a variable is *not* considered to depend on itself.
+varDependents :: Telescope -> VarSet -> VarSet
+varDependents tel vs =
+  loop empty (flattenTel tel) (size tel - 1) vs
   where
-    n  = size tel
-    ts = flattenTel tel
-
-    directDependents :: IntSet -> IntSet
-    directDependents is = IntSet.fromList
-      [ j | j <- downFrom n
-          , let tj = indexWithDefault __IMPOSSIBLE__ ts (n-1-j)
-          , getAny $ runFree (Any . (`IntSet.member` is)) IgnoreNot tj
-          ]
-
-    allDependents :: IntSet -> IntSet
-    allDependents is
-     | null new  = empty
-     | otherwise = new `IntSet.union` allDependents new
-      where new = directDependents is
+    -- Idea here is to keep a set @work@ of variables that we
+    -- want to find dependents of. At each iteration, we walk forwards through
+    -- the telescope and check if the each telescope contains any of the
+    -- variables in the work set. If it does, we add that variable to the work
+    -- and dependents set.
+    loop :: VarSet -> [Dom Type] -> Int -> VarSet -> VarSet
+    loop !deps tel ix work =
+      case tel of
+        [] -> deps
+        (ti:tel) ->
+          if getAny $ runFree (Any . (`VarSet.member` work)) IgnoreNot ti then
+            loop (VarSet.insert ix deps) tel (ix - 1) (VarSet.insert ix work)
+          else
+            loop deps tel (ix - 1) work
 
 -- | A telescope split in two.
 data SplitTel = SplitTel
@@ -233,7 +283,7 @@ splitTelescope fv tel = SplitTel tel1 tel2 perm
     n     = size tel
 
     is    = varDependencies tel fv
-    isC   = IntSet.fromList [0..(n-1)] `IntSet.difference` is
+    isC   = VarSet.complement n is
 
     perm  = Perm n $ map (n-1-) $ VarSet.toDescList is ++ VarSet.toDescList isC
 
@@ -241,7 +291,7 @@ splitTelescope fv tel = SplitTel tel1 tel2 perm
 
     tel'  = unflattenTel (permute perm names) ts1
 
-    m     = size is
+    m     = VarSet.size is
     (tel1, tel2) = telFromList -*- telFromList $ splitAt m $ telToList tel'
 
 -- | As splitTelescope, but fails if any additional variables or reordering
@@ -318,14 +368,14 @@ instantiateTelescope tel k p = guard ok $> (tel', sigma, rho)
     -- is1 is the part of Γ that depends on variable j
     is1   = varDependents tel $ singleton j
     -- lasti is the last (rightmost) variable of is0
-    lasti = if null is0 then n else IntSet.findMin is0
+    lasti = fromMaybe n $ VarSet.lookupMin is0
     -- we move each variable in is1 to the right until it comes after
     -- all variables in is0 (i.e. after lasti)
-    (as,bs) = List.partition (`IntSet.member` is1) [ n-1 , n-2 .. lasti ]
+    (as,bs) = List.partition (`VarSet.member` is1) [ n-1 , n-2 .. lasti ]
     is    = reverse $ List.delete j $ bs ++ as ++ downFrom lasti
 
     -- if u depends on var j, we cannot instantiate
-    ok    = not $ j `IntSet.member` is0
+    ok    = not $ j `VarSet.member` is0
 
     perm  = Perm n $ is    -- works on de Bruijn indices
     rho   = reverseP perm  -- works on de Bruijn levels
@@ -403,10 +453,10 @@ telViewPath :: PureTCM m => Type -> m TelView
 telViewPath = telViewUpToPath (-1)
 
 {-# SPECIALIZE telViewUpToPath :: Int -> Type -> TCM TelView #-}
--- | @telViewUpToPath n t@ takes off $t$
+-- | @telViewUpToPath n t@ takes off @t@
 --   the first @n@ (or arbitrary many if @n < 0@) function domains or Path types.
 --
--- @telViewUpToPath n t = fst <$> telViewUpToPathBoundary'n t@
+-- @telViewUpToPath n t = fst <$> telViewUpToPathBoundary' n t@
 telViewUpToPath :: PureTCM m => Int -> Type -> m TelView
 telViewUpToPath n t = if n == 0 then done t else do
   pathViewAsPi t >>= \case
@@ -417,16 +467,63 @@ telViewUpToPath n t = if n == 0 then done t else do
     done t      = return $ TelV EmptyTel t
     recurse a b = absV a (absName b) <$> telViewUpToPath (n - 1) (absBody b)
 
--- | [[ (i,(x,y)) ]] = [(i=0) -> x, (i=1) -> y]
-type Boundary = Boundary' (Term,Term)
-type Boundary' a = [(Term,a)]
+-- | Boundary conditions @[[ (i,(x,y)) ]] = [(i=0) -> x, (i=1) -> y]@.
+-- For instance, if @p : Path A a b@, then @p i@ has boundary condition @(i,(a,b))@.
+-- We call @i@ the /dimension/ and @(x,y)@ its /boundary/.
+newtype Boundary' x a = Boundary { theBoundary :: [(x,(a,a))] }
+  deriving (Show, Null)
 
+-- | Usually, the dimensions of a boundary condition are interval /variables/,
+-- represented by a de Bruijn index @Int@.
+type Boundary = Boundary' Int Term
+
+-- | Substitution formally creates dimensions that are interval /expressions/,
+-- represented by a @Term@.
+-- However, in practice these terms should be of the form @'var' i@.
+type TmBoundary = Boundary' Term Term
+
+-- | Turn dimension variables @i@ into dimension expressions @'var' i@.
+tmBoundary :: Boundary' Int a -> Boundary' Term a
+tmBoundary = Boundary . map (first var) . theBoundary
+
+-- | Turn dimension expressions into dimension variables.
+-- Formally this is a partial operation, but should only be called when the precondition is met.
+--
+-- Precondition: the dimension terms in the boundary are all of the form @'var' i@.
+varBoundary :: Boundary' Term a -> Boundary' Int a
+varBoundary = Boundary . map (first unVar) . theBoundary
+  where
+    unVar (Var i []) = i
+    unVar _ = __IMPOSSIBLE__
+
+-- | Substitution into a 'Boundary' a priori creates a 'TmBoundary' which we convert back via 'varBoundary'.
+-- A priori, this is a partial operation.
+instance Subst Boundary where
+  type SubstArg Boundary = Term
+  applySubst sub = varBoundary . applySubst sub . tmBoundary
+
+instance Subst TmBoundary where
+  type SubstArg TmBoundary = Term
+  applySubst sub = Boundary . applySubst sub . theBoundary
+
+deriving instance (Pretty x, Pretty a) => Pretty (Boundary' x a)
 
 {-# SPECIALIZE telViewUpToPathBoundary' :: Int -> Type -> TCM (TelView, Boundary) #-}
--- | Like @telViewUpToPath@ but also returns the @Boundary@ expected
--- by the Path types encountered. The boundary terms live in the
--- telescope given by the @TelView@.
--- Each point of the boundary has the type of the codomain of the Path type it got taken from, see @fullBoundary@.
+-- | Like 'telViewUpToPath' but also returns the 'Boundary' expected by the Path types encountered.
+-- The boundary terms live in the telescope given by the 'TelView'.
+-- Each point of the boundary has the type of the codomain of the Path type it got taken from, see 'fullBoundary'.
+--
+-- @
+--  (TelV Γ b, [(i,t_i,u_i)]) <- telViewUpToPathBoundary' n a
+--  Input:  Δ ⊢ a
+--  Output: Δ.Γ ⊢ b
+--          Δ.Γ ⊢ T is the codomain of the PathP at variable i
+--          Δ.Γ ⊢ i : I
+--          Δ.Γ ⊢ [ (i=0) -> t_i; (i=1) -> u_i ] : T
+-- @
+--
+-- Useful to reconstruct IApplyP patterns after teleNamedArgs Γ.
+--
 telViewUpToPathBoundary' :: PureTCM m => Int -> Type -> m (TelView, Boundary)
 telViewUpToPathBoundary' n t = if n == 0 then done t else do
   pathViewAsPi' t >>= \case
@@ -434,11 +531,11 @@ telViewUpToPathBoundary' n t = if n == 0 then done t else do
     Right (El _ (Pi a b)) -> recurse a b
     Right t               -> done t
   where
-    done t      = return (TelV EmptyTel t, [])
+    done t      = return (TelV EmptyTel t, empty)
     recurse a b = first (absV a (absName b)) <$> do
       underAbstractionAbs a b $ \b -> telViewUpToPathBoundary' (n - 1) b
-    addEndPoints xy (telv@(TelV tel _), cs) =
-      (telv, (var $ size tel - 1, raise (size tel) xy) : cs)
+    addEndPoints xy (telv@(TelV tel _), Boundary cs) =
+      (telv, Boundary $ (size tel - 1, raise (size tel) xy) : cs)
 
 
 fullBoundary :: Telescope -> Boundary -> Boundary
@@ -452,7 +549,7 @@ fullBoundary tel bs =
       -- Δ.Γ | PiPath Γ bs A ⊢ teleElims tel bs : b
    let es = teleElims tel bs
        l  = size tel
-   in map (\ (t@(Var i []), xy) -> (t, xy `applyE` (drop (l - i) es))) bs
+   in Boundary $ map (\ (i, xy) -> (i, xy `applyE` (drop (l - i) es))) $ theBoundary bs
 
 {-# SPECIALIZE telViewUpToPathBoundary :: Int -> Type -> TCM (TelView, Boundary) #-}
 -- | @(TelV Γ b, [(i,t_i,u_i)]) <- telViewUpToPathBoundary n a@
@@ -460,25 +557,14 @@ fullBoundary tel bs =
 --  Output: ΔΓ ⊢ b
 --          ΔΓ ⊢ i : I
 --          ΔΓ ⊢ [ (i=0) -> t_i; (i=1) -> u_i ] : b
-telViewUpToPathBoundary :: PureTCM m => Int -> Type -> m (TelView,Boundary)
+telViewUpToPathBoundary :: PureTCM m => Int -> Type -> m (TelView, Boundary)
 telViewUpToPathBoundary i a = do
    (telv@(TelV tel b), bs) <- telViewUpToPathBoundary' i a
-   return $ (telv, fullBoundary tel bs)
+   return (telv, fullBoundary tel bs)
 
-{-# INLINE telViewUpToPathBoundaryP #-}
--- | @(TelV Γ b, [(i,t_i,u_i)]) <- telViewUpToPathBoundaryP n a@
---  Input:  Δ ⊢ a
---  Output: Δ.Γ ⊢ b
---          Δ.Γ ⊢ T is the codomain of the PathP at variable i
---          Δ.Γ ⊢ i : I
---          Δ.Γ ⊢ [ (i=0) -> t_i; (i=1) -> u_i ] : T
--- Useful to reconstruct IApplyP patterns after teleNamedArgs Γ.
-telViewUpToPathBoundaryP :: PureTCM m => Int -> Type -> m (TelView,Boundary)
-telViewUpToPathBoundaryP = telViewUpToPathBoundary'
-
-{-# INLINE telViewPathBoundaryP #-}
-telViewPathBoundaryP :: PureTCM m => Type -> m (TelView,Boundary)
-telViewPathBoundaryP = telViewUpToPathBoundaryP (-1)
+{-# INLINE telViewPathBoundary #-}
+telViewPathBoundary :: PureTCM m => Type -> m (TelView, Boundary)
+telViewPathBoundary = telViewUpToPathBoundary' (-1)
 
 
 -- | @teleElimsB args bs = es@
@@ -487,15 +573,11 @@ telViewPathBoundaryP = telViewUpToPathBoundaryP (-1)
 --          Δ.Γ ⊢ i : I
 --          Δ.Γ ⊢ bs = [ (i=0) -> t_i; (i=1) -> u_i ] : T
 --  Output: Δ.Γ | PiPath Γ bs A ⊢ es : A
-teleElims :: DeBruijn a => Telescope -> Boundary' (a,a) -> [Elim' a]
-teleElims tel [] = map Apply $ teleArgs tel
-teleElims tel boundary = recurse (teleArgs tel)
+teleElims :: DeBruijn a => Telescope -> Boundary' Int a -> [Elim' a]
+teleElims tel (Boundary []) = map Apply $ teleArgs tel
+teleElims tel (Boundary boundary) = map updateArg $ teleArgs tel
   where
-    recurse = fmap updateArg
-    matchVar x =
-      snd <$> find (\case
-        (Var i [],_) -> i == x
-        _            -> __IMPOSSIBLE__) boundary
+    matchVar i = snd <$> find ((i ==) . fst) boundary
     updateArg a@(Arg info p) =
       case deBruijnView p of
         Just i | Just (t,u) <- matchVar i -> IApply t u p
@@ -587,14 +669,11 @@ telePatterns = telePatterns' teleNamedArgs
 
 telePatterns' :: DeBruijn a =>
                 (forall a. (DeBruijn a) => Telescope -> [NamedArg a]) -> Telescope -> Boundary -> [NamedArg (Pattern' a)]
-telePatterns' f tel [] = f tel
-telePatterns' f tel boundary = recurse $ f tel
+telePatterns' f tel (Boundary []) = f tel
+telePatterns' f tel (Boundary boundary) = recurse $ f tel
   where
     recurse = (fmap . fmap . fmap) updateVar
-    matchVar x =
-      snd <$> find (\case
-        (Var i [],_) -> i == x
-        _            -> __IMPOSSIBLE__) boundary
+    matchVar i = snd <$> find ((i ==) . fst) boundary
     updateVar x =
       case deBruijnView x of
         Just i | Just (t,u) <- matchVar i -> IApplyP defaultPatternInfo t u x
@@ -692,80 +771,17 @@ typeArity t = do
   TelV tel _ <- telView t
   return (size tel)
 
----------------------------------------------------------------------------
--- * Instance definitions
----------------------------------------------------------------------------
+-- | Fold a telescope into a monadic computation, adding variables to the
+-- context at each step.
 
-data OutputTypeName
-  = OutputTypeName QName
-  | OutputTypeVar
-  | OutputTypeVisiblePi
-  | OutputTypeNameNotYetKnown Blocker
-  | NoOutputTypeName
-
--- | Strips all hidden and instance Pi's and return the argument
---   telescope and head definition name, if possible.
-getOutputTypeName :: Type -> TCM (Telescope, OutputTypeName)
--- 2023-10-26, Jesper, issue #6941: To make instance search work correctly for
--- abstract or opaque instances, we need to ignore abstract mode when computing
--- the output type name.
-getOutputTypeName t = ignoreAbstractMode $ do
-  TelV tel t' <- telViewUpTo' (-1) notVisible t
-  ifBlocked (unEl t') (\ b _ -> return (tel , OutputTypeNameNotYetKnown b)) $ \ _ v ->
-    case v of
-      -- Possible base types:
-      Def n _  -> return (tel , OutputTypeName n)
-      Sort{}   -> return (tel , NoOutputTypeName)
-      Var n _  -> return (tel , OutputTypeVar)
-      Pi{}     -> return (tel , OutputTypeVisiblePi)
-      -- Not base types:
-      Con{}    -> __IMPOSSIBLE__
-      Lam{}    -> __IMPOSSIBLE__
-      Lit{}    -> __IMPOSSIBLE__
-      Level{}  -> __IMPOSSIBLE__
-      MetaV{}  -> __IMPOSSIBLE__
-      DontCare{} -> __IMPOSSIBLE__
-      Dummy s _ -> __IMPOSSIBLE_VERBOSE__ s
-
-
--- | Register the definition with the given type as an instance.
---   Issue warnings if instance is unusable.
-addTypedInstance ::
-     QName  -- ^ Name of instance.
-  -> Type   -- ^ Type of instance.
-  -> TCM ()
-addTypedInstance = addTypedInstance' True
-
--- | Register the definition with the given type as an instance.
-addTypedInstance' ::
-     Bool   -- ^ Should we print warnings for unusable instance declarations?
-  -> QName  -- ^ Name of instance.
-  -> Type   -- ^ Type of instance.
-  -> TCM ()
-addTypedInstance' w x t = do
-  (tel , n) <- getOutputTypeName t
-  case n of
-    OutputTypeName n            -> addNamedInstance x n
-    OutputTypeNameNotYetKnown{} -> addUnknownInstance x
-    NoOutputTypeName            -> when w $ warning $ WrongInstanceDeclaration
-    OutputTypeVar               -> when w $ warning $ WrongInstanceDeclaration
-    OutputTypeVisiblePi         -> when w $ warning $ InstanceWithExplicitArg x
-
-resolveUnknownInstanceDefs :: TCM ()
-resolveUnknownInstanceDefs = do
-  anonInstanceDefs <- getAnonInstanceDefs
-  clearAnonInstanceDefs
-  forM_ anonInstanceDefs $ \ n -> do
-    -- Andreas, 2022-12-04, issue #6380:
-    -- Do not warn about unusable instances here.
-    addTypedInstance' False n =<< typeOfConst n
-
--- | Try to solve the instance definitions whose type is not yet known, report
---   an error if it doesn't work and return the instance table otherwise.
-getInstanceDefs :: TCM InstanceTable
-getInstanceDefs = do
-  resolveUnknownInstanceDefs
-  insts <- getAllInstanceDefs
-  unless (null $ snd insts) $
-    typeError $ GenericError $ "There are instances whose type is still unsolved"
-  return $ fst insts
+foldrTelescopeM
+  :: MonadAddContext m
+  => (Dom (ArgName, Type) -> m b -> m b)
+  -> m b
+  -> Telescope
+  -> m b
+foldrTelescopeM f b = go
+  where
+    go EmptyTel = b
+    go (ExtendTel a tel) =
+      f ((absName tel,) <$> a) $ underAbstraction a tel go

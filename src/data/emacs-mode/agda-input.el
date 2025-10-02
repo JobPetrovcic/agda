@@ -213,9 +213,9 @@ order for the change to take effect."
 
   ;; Inequality and similar symbols.
 
-  ("leq"  . ,(agda-input-to-string-list "<≪⋘≤≦≲ ≶≺≼≾⊂⊆ ⋐⊏⊑ ⊰⊲⊴⋖⋚⋜⋞＜"))
+  ("leq"  . ,(agda-input-to-string-list "<≪⋘≤≦≲ ≶≺≼≾⊂⊆⫇⫉ ⋐⊏⊑ ⊰⊲⊴⋖⋚⋜⋞＜"))
   ("leqn" . ,(agda-input-to-string-list "≮  ≰≨≴⋦≸⊀ ⋨⊄⊈⊊  ⋢⋤ ⋪⋬   ⋠"))
-  ("geq"  . ,(agda-input-to-string-list ">≫⋙≥≧≳ ≷≻≽≿⊃⊇ ⋑⊐⊒ ⊱⊳⊵⋗⋛⋝⋟＞"))
+  ("geq"  . ,(agda-input-to-string-list ">≫⋙≥≧≳ ≷≻≽≿⊃⊇⫈⫊ ⋑⊐⊒ ⊱⊳⊵⋗⋛⋝⋟＞"))
   ("geqn" . ,(agda-input-to-string-list "≯  ≱≩≵⋧≹⊁ ⋩⊅⊉⊋  ⋣⋥ ⋫⋭   ⋡"))
 
   ("<="   . ("≤"))  (">="   . ("≥"))
@@ -230,6 +230,8 @@ order for the change to take effect."
   ("subn"  . ("⊄"))  ("supn"  . ("⊅"))
   ("sub="  . ("⊆"))  ("sup="  . ("⊇"))
   ("sub=n" . ("⊈"))  ("sup=n" . ("⊉"))
+  ("sub~"  . ("⫇"))  ("sup~"  . ("⫈"))
+  ("sub~~"  . ("⫉"))  ("sup~~"  . ("⫊"))
 
   ("squb"   . ("⊏"))  ("squp"   . ("⊐"))
   ("squb="  . ("⊑"))  ("squp="  . ("⊒"))
@@ -254,7 +256,7 @@ order for the change to take effect."
   ("glb" . ("⊓"))  ("lub" . ("⊔"))
   ("Glb" . ("⨅"))  ("Lub" . ("⨆"))
 
-  ;; Entailment etc.
+  ;; Entailment, tacks, etc.
 
   ("entails" . ,(agda-input-to-string-list "⊢⊣⊤⊥⊦⊧⊨⊩⊪⊫⊬⊭⊮⊯"))
 
@@ -264,6 +266,16 @@ order for the change to take effect."
   ("||-"  . ("⊩"))  ("||-n" . ("⊮"))
   ("||="  . ("⊫"))  ("||=n" . ("⊯"))
   ("|||-" . ("⊪"))
+
+
+  ("tack" . ,(agda-input-to-string-list "⟘⟙⟛⟝⟞⫫⫪"))
+  ("Bot"  . ("⟘")) ;; similar to Glb/Lub vs. glb/lub
+  ("Top"  . ("⟙"))
+  ("-||-" . ("⟛"))
+  ("|--"  . ("⟝"))
+  ("--|"  . ("⟞"))
+  ("bbot" . ("⫫")) ;; similar to bN for blackboard N
+  ("btop" . ("⫪"))
 
   ;; Divisibility, parallelity.
 
@@ -277,6 +289,8 @@ order for the change to take effect."
   ("exn" . ("∄"))
   ("0"   . ("∅"))
   ("C"   . ("∁"))
+  ("uin"    . ("⟒"))
+  ("din"    . ("⫙"))
 
   ;; Corners, ceilings and floors.
 
@@ -302,19 +316,22 @@ order for the change to take effect."
   (":"         . ,(agda-input-to-string-list "∶⦂ː꞉˸፥፦：﹕︓"))
   (","         . ,(agda-input-to-string-list "ʻ،⸲⸴⹁⹉、︐︑﹐﹑，､"))
   (";"         . ,(agda-input-to-string-list "⨾⨟⁏፤꛶；︔﹔⍮⸵;"))
+  ("++"        . ("⧺"))
   ("::"        . ("∷"))
   ("::-"       . ("∺"))
   ("-:"        . ("∹"))
   ("+ "        . ("⊹"))
   ("+"         . ("＋"))
   ("sqrt"      . ("√"))
+  ("surd"      . ("√"))
   ("surd3"     . ("∛"))
   ("surd4"     . ("∜"))
   ("increment" . ("∆"))
   ("inf"       . ("∞"))
-  ("&"         . ("⅋"))
+  ("&"         . ,(agda-input-to-string-list "⅋﹠＆"))
   ("z;"        . ,(agda-input-to-string-list "⨟⨾"))
   ("z:"        . ("⦂"))
+  ("at"        . ,(agda-input-to-string-list "@﹫＠"))
 
   ;; Circled operators.
 
@@ -326,7 +343,7 @@ order for the change to take effect."
   ("oo"  . ("⊚"))
   ("o*"  . ("⊛"))
   ("o="  . ("⊜"))
-  ("o-"  . ("⊝"))
+  ("o-"  . ,(agda-input-to-string-list "⊝⟜"))
 
   ("O+"  . ("⨁"))
   ("Ox"  . ("⨂"))
@@ -335,12 +352,18 @@ order for the change to take effect."
 
   ;; Boxed operators.
 
-  ("b+" . ("⊞"))
-  ("b-" . ("⊟"))
-  ("bx" . ("⊠"))
-  ("b." . ("⊡"))
+  ("b+"  . ("⊞"))
+  ("b-"  . ("⊟"))
+  ("bx"  . ("⊠"))
+  ("b."  . ("⊡"))
 
-  ;; APL boxed operators
+  ("b/"  . ("⧄"))
+  ("b\\" . ("⧅"))
+  ("b*"  . ("⧆"))
+  ("bo"  . ("⧇"))
+  ("bsq" . ("⧈"))
+
+  ;; APL boxed operators.
 
   ("box="       . ("⌸"))
   ("box?"       . ("⍰"))
@@ -376,6 +399,7 @@ order for the change to take effect."
   ("integral" . ,(agda-input-to-string-list "∫∬∭∮∯∰∱∲∳"))
   ("angle"    . ,(agda-input-to-string-list "∟∡∢⊾⊿"))
   ("join"     . ,(agda-input-to-string-list "⋈⋉⋊⋋⋌⨝⟕⟖⟗"))
+  ("esh"      . ("ʃ"))
 
   ;; Arrows.
 
@@ -424,6 +448,7 @@ order for the change to take effect."
   ("r->" . ("↣"))
 
   ("r-o" . ("⊸"))  ("-o"  . ("⊸"))
+  ("l-o" . ("⟜"))
 
   ("dz" . ("↯"))
 
@@ -690,7 +715,7 @@ order for the change to take effect."
   ("B8"   . ("𝟖"))
   ("B9"   . ("𝟗"))
 
-  ;; Fullwidth letters
+  ;; Fullwidth letters.
 
   ("FA"   . ("Ａ"))
   ("FB"   . ("Ｂ"))
@@ -745,7 +770,7 @@ order for the change to take effect."
   ("Fy"   . ("ｙ"))
   ("Fz"   . ("ｚ"))
 
-  ;; Fullwidth digits
+  ;; Fullwidth digits.
 
   ("F0"   . ("０"))
   ("F1"   . ("１"))
@@ -757,6 +782,42 @@ order for the change to take effect."
   ("F7"   . ("７"))
   ("F8"   . ("８"))
   ("F9"   . ("９"))
+
+  ;; Fullwidth symbols.
+
+  ("F!"   . ("！"))
+  ("F\""  . ("＂"))
+  ("F#"   . ("＃"))
+  ("F$"   . ("＄"))
+  ("F%"   . ("％"))
+  ("F&"   . ("＆"))
+  ("F'"   . ("＇"))
+  ("F("   . ("（"))
+  ("F)"   . ("）"))
+  ("F*"   . ("＊"))
+  ("F+"   . ("＋"))
+  ("F,"   . ("，"))
+  ("F-"   . ("－"))
+  ("F."   . ("．"))
+  ("F/"   . ("／"))
+  ("F:"   . ("："))
+  ("F;"   . ("；"))
+  ("F<"   . ("＜"))
+  ("F="   . ("＝"))
+  ("F>"   . ("＞"))
+  ("F?"   . ("？"))
+  ("F@"   . ("＠"))
+  ("F["   . ("［"))
+  ("F\\"  . ("＼"))
+  ("F]"   . ("］"))
+  ("F_"   . ("＿"))
+  ("F{"   . ("｛"))
+  ("F|"   . ("｜"))
+  ("F}"   . ("｝"))
+  ("F~"   . ("～"))
+  ("F(("  . ("｟"))
+  ("F))"  . ("｠"))
+  ("Fneg" . ("￢"))
 
   ;; Parentheses.
 
@@ -805,9 +866,11 @@ order for the change to take effect."
 
   ;; Musical symbols.
 
-  ("note" . ,(agda-input-to-string-list "♩♪♫♬"))
-  ("b"    . ("♭"))
-  ("#"    . ("♯"))
+  ("note"    . ,(agda-input-to-string-list "♩♪♫♬"))
+  ("b"       . ("♭"))
+  ("#"       . ("♯"))
+  ("bb"      . ("𝄫"))
+  ("##"      . ("𝄪"))
 
   ;; Other punctuation and symbols.
 
@@ -837,12 +900,13 @@ order for the change to take effect."
   ("@"          . ("＠"))
   ("__"         . ("＿"))
   ("\""         . ("＂"))
+  ("crossmark"  . ("✗"))
 
   ;; Some combining characters.
   ;;
   ;; The following combining characters also have (other)
   ;; translations:
-  ;; ̀ ́ ̂ ̃ ̄ ̆ ̇ ̈ ̋ ̌ ̣ ̧ ̱
+  ;;
 
   ("^--" . ,(agda-input-to-string-list"̅̿"))
   ("_--" . ,(agda-input-to-string-list"̲̳"))
@@ -888,7 +952,7 @@ order for the change to take effect."
   ("Gp"  . ("ψ"))  ("GP"  . ("Ψ"))
   ("Go"  . ("ω"))  ("GO"  . ("Ω"))
 
-  ;; Mathematical characters
+  ;; Mathematical characters.
 
   ("MiA" . ("𝐴"))
   ("MiB" . ("𝐵"))
@@ -942,6 +1006,7 @@ order for the change to take effect."
   ("Mix" . ("𝑥"))
   ("Miy" . ("𝑦"))
   ("Miz" . ("𝑧"))
+
   ("MIA" . ("𝑨"))
   ("MIB" . ("𝑩"))
   ("MIC" . ("𝑪"))
@@ -968,6 +1033,7 @@ order for the change to take effect."
   ("MIX" . ("𝑿"))
   ("MIY" . ("𝒀"))
   ("MIZ" . ("𝒁"))
+
   ("MIa" . ("𝒂"))
   ("MIb" . ("𝒃"))
   ("MIc" . ("𝒄"))
@@ -994,6 +1060,7 @@ order for the change to take effect."
   ("MIx" . ("𝒙"))
   ("MIy" . ("𝒚"))
   ("MIz" . ("𝒛"))
+
   ("McA" . ("𝒜"))
   ("McB" . ("ℬ"))
   ("McC" . ("𝒞"))
@@ -1046,6 +1113,7 @@ order for the change to take effect."
   ("Mcx" . ("𝓍"))
   ("Mcy" . ("𝓎"))
   ("Mcz" . ("𝓏"))
+
   ("MCA" . ("𝓐"))
   ("MCB" . ("𝓑"))
   ("MCC" . ("𝓒"))
@@ -1098,6 +1166,7 @@ order for the change to take effect."
   ("MCx" . ("𝔁"))
   ("MCy" . ("𝔂"))
   ("MCz" . ("𝔃"))
+
   ("MfA" . ("𝔄"))
   ("MfB" . ("𝔅"))
   ("MfC" . ("ℭ"))
@@ -1151,7 +1220,7 @@ order for the change to take effect."
   ("Mfy" . ("𝔶"))
   ("Mfz" . ("𝔷"))
 
-  ;; (Sub / Super) scripts
+  ;; (Sub / Super) scripts.
   ;;
   ;; Unicode 12.1 omits several latin characters from sub/superscript.
   ;; https://www.quora.com/Why-is-there-no-character-for-superscript-q-in-Unicode
@@ -1247,13 +1316,17 @@ order for the change to take effect."
   ;; ("^Y" . ("Y"))
   ;; ("^Z" . ("Z"))
 
+  ("^Ga" . ("ᵅ"))
   ("^Gb" . ("ᵝ"))
   ("^Gg" . ("ᵞ"))
   ("^Gd" . ("ᵟ"))
   ("^Ge" . ("ᵋ"))
   ("^Gth" . ("ᶿ"))
+  ("^Gi" . ("ᶥ"))
   ("^Gf" . ("ᵠ"))
   ("^Gc" . ("ᵡ"))
+
+  ("^GF" . ("ᶲ"))
 
   ;; Some ISO8859-1 characters.
 

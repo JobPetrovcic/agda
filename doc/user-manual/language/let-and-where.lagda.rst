@@ -23,10 +23,10 @@ There are two ways of declaring local definitions in Agda:
 let-expressions
 ===============
 
-A let-expression defines an abbreviation.
-In other words, the expression that we define in a let-expression can
-neither be recursive, nor can let bound functions be defined by
-pattern matching.
+A let-expression defines an abbreviation. This means that let-bound
+functions have to make sense as pure lambda expressions: they can not be
+recursive, and can not be defined by pattern matching on inductive
+types.
 
 Example::
 
@@ -35,7 +35,15 @@ Example::
           h m = suc (suc m)
       in  h zero + h (suc zero)
 
-let-expressions have the general form
+However, it is possible to match on *record* types in the left-hand side
+of a let-bound function, as described :ref:`below<let-record-pattern>`::
+
+  g : Nat
+  g = let h : Nat × Nat → Nat
+          h (x , y) = x + y
+       in h (1 , 2)
+
+A let-expression has the general form
 
 .. code-block:: agda
 
@@ -52,6 +60,13 @@ After type-checking, the meaning of this is simply the substitution
 ``e’[f₁ := λ x₁ … xₙ → e; …; fₘ := λ x₁ … xₖ → eₘ]``.  Since Agda
 substitutes away let-bindings, they do not show up in terms Agda
 prints, nor in the goal display in interactive mode.
+
+
+.. warning::
+  The :ref:`internal syntax used by Agda<core-language>` does not have let-expressions as a construct.
+  As a result, Agda inlines all let-bound variables during type checking.
+  In particular, let-binding cannot be used to introduce sharing.
+
 
 .. _let-record-pattern:
 
@@ -87,7 +102,24 @@ will be translated internally to as
 
 This is not allowed if ``R`` is declared ``coinductive``.
 
+
+.. _let-open:
+
+Let binding record patterns
+---------------------------
+
+Let-expressions can be used to locally open a :ref:`module<module-system>`.
+For example:
+
+.. code-block:: agda
+
+  let z = x + y
+      open M z
+  in  u          -- using definitions from M
+
+
 .. _where-blocks:
+
 
 where-blocks
 ============
@@ -262,22 +294,22 @@ Same definition but with a where-expression
 
 Even less type information using let::
 
-  g : Nat → List Nat
-  g zero    = [ zero ]
-  g (suc n) = let sing = [ suc n ]
-              in  sing ++ g n
+  h : Nat → List Nat
+  h zero    = [ zero ]
+  h (suc n) = let sing = [ suc n ]
+              in  sing ++ h n
 
 Same definition using where::
 
-  g' : Nat → List Nat
-  g' zero = [ zero ]
-  g' (suc n) = sing ++ g' n
+  h' : Nat → List Nat
+  h' zero = [ zero ]
+  h' (suc n) = sing ++ h' n
      where  sing = [ suc n ]
 
 More than one definition in a let::
 
-  h : Nat → Nat
-  h n = let add2 : Nat
+  i : Nat → Nat
+  i n = let add2 : Nat
             add2 = suc (suc n)
 
             twice : Nat → Nat
@@ -302,7 +334,7 @@ Combining let and where::
 
   k : Nat → Nat
   k n = let aux : Nat → Nat
-            aux m = pred (h m) + fibfact m
+            aux m = pred (i m) + fibfact m
         in aux (pred n)
     where pred : Nat → Nat
           pred zero = zero

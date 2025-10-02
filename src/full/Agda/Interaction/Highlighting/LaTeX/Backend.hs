@@ -2,12 +2,12 @@
 
 module Agda.Interaction.Highlighting.LaTeX.Backend
   ( latexBackend
+  , latexBackendName
   ) where
 
 import Agda.Interaction.Highlighting.LaTeX.Base
   ( LaTeXOptions(..)
-  , LogLaTeXT
-  , runLogLaTeXTWith
+  , MonadLogLaTeX(logLaTeX)
   , logMsgToText
   , generateLaTeXIO
   , prepareCommonAssets
@@ -16,16 +16,16 @@ import Agda.Interaction.Highlighting.LaTeX.Base
 import Control.DeepSeq
 import Control.Monad.Trans (MonadIO)
 
-import qualified Data.Map as Map
-import Data.Map (Map)
-
-import qualified Data.Text as T
+import           Data.Functor ( (<&>) )
+import qualified Data.Map     as Map
+import           Data.Map     ( Map )
+import qualified Data.Text    as T
 
 import GHC.Generics (Generic)
 
 import System.FilePath ( (</>) )
 
-import Agda.Compiler.Backend (Backend(..), Backend'(..), Definition, Recompile(..))
+import Agda.Compiler.Backend (Backend,Backend_boot(..), Backend',Backend'_boot(..), Definition, Recompile(..))
 import Agda.Compiler.Common (curIF, IsMain(IsMain, NotMain))
 
 import Agda.Interaction.Options
@@ -36,16 +36,19 @@ import Agda.Interaction.Options
   , OptDescr(..)
   )
 
+import Agda.Syntax.Common (BackendName)
 import Agda.Syntax.Position (mkRangeFile, rangeFilePath)
 import Agda.Syntax.TopLevelModuleName (TopLevelModuleName, projectRoot)
 
 import Agda.TypeChecking.Monad
   ( HasOptions(commandLineOptions)
   , MonadDebug
-  , stModuleToSource
+  , stModuleToSourceId
   , useTC
   , ReadTCState
   , reportS
+  , MonadFileId
+  , srcFilePath
   )
 
 import Agda.Utils.FileName (filePath, mkAbsolute)
@@ -75,6 +78,8 @@ defaultLaTeXFlags = LaTeXFlags
   , latexFlagGenerateLaTeX = False
   }
 
+-- | Command-line flag options for LaTeX.
+--   The 'latexPragmaOptions' are not included here since they have a different 'Flag' type.
 latexFlagsDescriptions :: [OptDescr (Flag LaTeXFlags)]
 latexFlagsDescriptions =
   [ Option []     ["latex"] (NoArg latexFlag)
@@ -95,12 +100,15 @@ data LaTeXModuleEnv  = LaTeXModuleEnv LaTeXOptions
 data LaTeXModule     = LaTeXModule
 data LaTeXDef        = LaTeXDef
 
+latexBackendName :: BackendName
+latexBackendName = "LaTeX"
+
 latexBackend :: Backend
 latexBackend = Backend latexBackend'
 
 latexBackend' :: Backend' LaTeXFlags LaTeXCompileEnv LaTeXModuleEnv LaTeXModule LaTeXDef
 latexBackend' = Backend'
-  { backendName           = "LaTeX"
+  { backendName           = latexBackendName
   , backendVersion        = Nothing
   , options               = defaultLaTeXFlags
   , commandLineFlags      = latexFlagsDescriptions
@@ -112,20 +120,31 @@ latexBackend' = Backend'
   , postCompile           = postCompileLaTeX
   , scopeCheckingSuffices = True
   , mayEraseType          = const $ return False
+  , backendInteractTop    = Nothing
+  , backendInteractHole   = Nothing
   }
 
-runLogLaTeXWithMonadDebug :: MonadDebug m => LogLaTeXT m a -> m a
-runLogLaTeXWithMonadDebug = runLogLaTeXTWith $ (reportS "compile.latex" 1) . T.unpack . logMsgToText
+-- | A wrapper to implement 'MonadLogLaTeX'.
+newtype LogLaTeXDebugT m a = LogLaTeXDebugT { runLogLaTeXDebugT :: m a }
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+instance MonadDebug m => MonadLogLaTeX (LogLaTeXDebugT m) where
+  logLaTeX = LogLaTeXDebugT . (reportS "compile.latex" 1) . T.unpack . logMsgToText
 
 -- Resolve the raw flags into usable LaTeX options.
-resolveLaTeXOptions :: (HasOptions m, ReadTCState m) => LaTeXFlags -> TopLevelModuleName -> m LaTeXOptions
+resolveLaTeXOptions :: (HasOptions m, ReadTCState m, MonadFileId m)
+  => LaTeXFlags
+  -> TopLevelModuleName
+  -> m LaTeXOptions
 resolveLaTeXOptions flags moduleName = do
   options <- commandLineOptions
-  modFiles <- useTC stModuleToSource
+  modFiles <- useTC stModuleToSourceId
+  let msrc = Map.lookup moduleName modFiles
+  mf <- traverse srcFilePath msrc
   let
-    mSrcFileName =
-      (\f -> mkRangeFile (mkAbsolute (filePath f)) (Just moduleName)) <$>
-      Map.lookup moduleName modFiles
+    mSrcFileName = mf <&> \ f ->
+      mkRangeFile (mkAbsolute (filePath f)) (Just moduleName)
+      -- TODO:    ^^^^^^^^^^^^^^^^^^^^^^^^^ can this just be `f`?
     countClusters = optCountClusters . optPragmaOptions $ options
     latexDir = latexFlagOutDir flags
     -- FIXME: This reliance on emacs-mode to decide whether to interpret the output location as project-relative or
@@ -149,7 +168,7 @@ preCompileLaTeX
 preCompileLaTeX flags = pure $ LaTeXCompileEnv flags
 
 preModuleLaTeX
-  :: (HasOptions m, ReadTCState m)
+  :: (HasOptions m, ReadTCState m, MonadFileId m)
   => LaTeXCompileEnv
   -> IsMain
   -> TopLevelModuleName
@@ -178,7 +197,7 @@ postModuleLaTeX
   -> m LaTeXModule
 postModuleLaTeX _cenv (LaTeXModuleEnv latexOpts) _main _moduleName _defs = do
   i <- curIF
-  runLogLaTeXWithMonadDebug $ do
+  runLogLaTeXDebugT do
     -- FIXME: It would be better to do "prepareCommonAssets" in @preCompileLaTeX@, but because
     -- the output directory depends on the module-relative project root (when in emacs-mode),
     -- we can't do that until we see the module.

@@ -13,10 +13,13 @@ module Agda.Utils.List2
   , module Reexport
   ) where
 
+import Prelude hiding ( zip, zipWith )
+
 import Control.DeepSeq
 import Control.Monad                   ( (<=<) )
 
 import qualified Data.List as List
+import Data.Semigroup (sconcat)
 
 import GHC.Exts                        ( IsList(..) )
 import qualified GHC.Exts  as Reexport ( toList )
@@ -81,6 +84,12 @@ toList1Either = \case
 cons :: a -> List1 a -> List2 a
 cons x (y :| ys) = List2 x y ys
 
+-- | O(n).
+snoc :: List1 a -> a -> List2 a
+snoc (x :| xs) z = List2 x y ys
+  where
+    y :| ys = List1.snoc xs z
+
 -- | O(length first list).
 append :: List1 a -> List1 a -> List2 a
 append (x :| xs) ys = cons x $ List1.prependList xs ys
@@ -88,6 +97,10 @@ append (x :| xs) ys = cons x $ List1.prependList xs ys
 -- | O(length first list).
 appendList :: List2 a -> [a] -> List2 a
 appendList (List2 x y ys) zs = List2 x y $ mappend ys zs
+
+-- | Concatenate at least 2 lists of length at least 1.
+concat21 :: List2 (List1 a) -> List2 a
+concat21 (List2 xs ys zss) = append xs $ sconcat $ ys :| zss
 
 -- * Destruction
 
@@ -110,3 +123,11 @@ break p = List.break p . toList
 
 instance NFData a => NFData (List2 a) where
   rnf (List2 a b cs) = rnf a `seq` rnf b `seq` rnf cs
+
+-- * Zip
+
+zipWith :: (a -> b -> c) -> List2 a -> List2 b -> List2 c
+zipWith f (List2 a1 a2 as) (List2 b1 b2 bs) = List2 (f a1 b1) (f a2 b2) (List.zipWith f as bs)
+
+zip :: List2 a -> List2 b -> List2 (a, b)
+zip = zipWith (,)

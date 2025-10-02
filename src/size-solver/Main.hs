@@ -24,11 +24,12 @@ import System.Exit
 import System.Environment (getArgs)
 
 import qualified Agda.TypeChecking.Monad as TCM
+import Agda.TypeChecking.Pretty           (PrettyTCM(..))
 import Agda.TypeChecking.SizedTypes.Utils (setDebugging, traceM)
 import Agda.TypeChecking.SizedTypes.Syntax
 import Agda.TypeChecking.SizedTypes.WarshallSolver
 
-import Agda.Syntax.Common.Pretty (Pretty, prettyShow, render, (<+>))
+import Agda.Syntax.Common.Pretty (Pretty(..), prettyShow, render, (<+>))
 
 import Parser
 
@@ -99,9 +100,9 @@ parseFile input = ( map parse hyps
                   )
   where
     (ls1, ls2)   = break isSeparator input
-    (hyps, rest) = if null ls2 then ([], ls1) else (ls1, tail ls2)
+    (hyps, rest) = case ls2 of {[] -> ([], ls1); (_ : tls2) -> (ls1, tls2)}
     (ls1', ls2') = break isSeparator rest
-    (pols, cons) = if null ls2' then ([], ls1') else (ls1', tail ls2')
+    (pols, cons) = case ls2' of {[] -> ([], ls1'); (_ : tls2') -> (ls1', tls2')}
 
 
 -- | A separator is a line consisting entirely of dashes,
@@ -110,3 +111,6 @@ isSeparator :: String -> Bool
 isSeparator s = length dashes >= 2 && all isSpace rest
   where (dashes, rest) = span (== '-') s
 -- -}
+
+instance PrettyTCM Flex where
+  prettyTCM = return . pretty

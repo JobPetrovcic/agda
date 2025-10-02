@@ -1,5 +1,4 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE ViewPatterns        #-}
 {-# LANGUAGE TypeApplications    #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -20,8 +19,9 @@ module Agda.TypeChecking.Substitute
   , Substitution'(..), Substitution
   ) where
 
+import Prelude hiding ( zip, zipWith )
+
 import Control.Arrow (first, second)
-import Control.Monad (guard)
 
 import Data.Coerce
 import Data.Function (on)
@@ -34,12 +34,14 @@ import Data.HashMap.Strict (HashMap)
 import Debug.Trace (trace)
 
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty
 import Agda.Syntax.Position
 import Agda.Syntax.Internal
 import Agda.Syntax.Internal.Pattern
 import qualified Agda.Syntax.Abstract as A
 
 import Agda.TypeChecking.Monad.Base
+import Agda.TypeChecking.Monad.Options
 import Agda.TypeChecking.Free as Free
 import Agda.TypeChecking.CompiledClause
 import Agda.TypeChecking.Positivity.Occurrence as Occ
@@ -49,16 +51,19 @@ import Agda.TypeChecking.Substitute.DeBruijn
 
 import Agda.Utils.Either
 import Agda.Utils.Empty
+import Agda.Utils.Function (applyWhen, applyUnless)
 import Agda.Utils.Functor
 import Agda.Utils.List
 import Agda.Utils.List1 (List1, pattern (:|))
 import qualified Agda.Utils.List1 as List1
+import qualified Agda.Utils.ListInf as ListInf
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.Monad
 import Agda.Utils.Permutation
-import Agda.Syntax.Common.Pretty
+import Agda.Utils.Singleton
 import Agda.Utils.Size
 import Agda.Utils.Tuple
+import Agda.Utils.Zip
 
 import Agda.Utils.Impossible
 
@@ -187,9 +192,7 @@ argToDontCare :: Arg Term -> Term
 argToDontCare (Arg ai v) = relToDontCare ai v
 
 relToDontCare :: LensRelevance a => a -> Term -> Term
-relToDontCare ai v
-  | Irrelevant <- getRelevance ai = dontCare v
-  | otherwise                     = v
+relToDontCare ai = applyWhen (isIrrelevant ai) dontCare
 
 -- Andreas, 2016-01-19: In connection with debugging issue #1783,
 -- I consider the Apply instance for Type harmful, as piApply is not
@@ -233,8 +236,8 @@ instance TermSubst a => Apply (Tele a) where
   applyE t es = apply t $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
 
 instance Apply Definition where
-  apply (Defn info x t pol occ gens gpars df m c inst copy ma nc inj copat blk lang d) args =
-    Defn info x (piApply t args) (apply pol args) (apply occ args) (apply gens args) (drop (length args) gpars) df m c inst copy ma nc inj copat blk lang (apply d args)
+  apply (Defn info x t pol occ gpars df m c inst copy ma nc inj copat blk lang d) args =
+    Defn info x (piApply t args) (apply pol args) (apply occ args) (drop (length args) gpars) df m c inst copy ma nc inj copat blk lang (apply d args)
 
   applyE t es = apply t $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
 
@@ -251,6 +254,7 @@ instance Apply RewriteRule where
        , rewRHS     = applyNLPatSubst sub (rewRHS r)
        , rewType    = applyNLPatSubst sub (rewType r)
        , rewFromClause = rewFromClause r
+       , rewTopModule  = rewTopModule r
        }
 
   applyE t es = apply t $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
@@ -303,7 +307,7 @@ instance Apply Defn where
   apply d args@(arg1:args1) = case d of
     Axiom{} -> d
     DataOrRecSig n -> DataOrRecSig (n - length args)
-    GeneralizableVar{} -> d
+    GeneralizableVar gv -> GeneralizableVar $ apply gv args
     AbstractDefn d -> AbstractDefn $ apply d args
     Function{ funClauses = cs, funCompiled = cc, funCovering = cov, funInv = inv
             , funExtLam = extLam
@@ -367,7 +371,7 @@ instance Apply Clause where
     -- It is assumed that we only apply a clause to "parameters", i.e.
     -- arguments introduced by lambda lifting. The problem is that these aren't
     -- necessarily the first elements of the clause telescope.
-    apply cls@(Clause rl rf tel ps b t catchall exact recursive unreachable ell wm) args
+    apply cls@(Clause rl rf tel ps b t catchall recursive unreachable ell wm) args
       | length args > length ps = __IMPOSSIBLE__
       | otherwise =
       Clause rl rf
@@ -376,7 +380,6 @@ instance Apply Clause where
              (applySubst rho b)
              (applySubst rho t)
              catchall
-             exact
              recursive
              unreachable
              ell
@@ -477,10 +480,10 @@ instance Apply Clause where
 instance Apply CompiledClauses where
   apply cc args = case cc of
     Fail hs -> Fail (drop len hs)
-    Done hs t
+    Done no mr hs t
       | length hs >= len ->
          let sub = parallelS $ map var [0..length hs - len - 1] ++ map unArg args
-         in  Done (List.drop len hs) $ applySubst sub t
+         in  Done no mr (List.drop len hs) $ applySubst sub t
       | otherwise -> __IMPOSSIBLE__
     Case n bs
       | unArg n >= len -> Case (n <&> \ m -> m - len) (apply bs args)
@@ -624,8 +627,8 @@ instance Abstract Telescope where
   ExtendTel arg xtel `abstract` tel = ExtendTel arg $ xtel <&> (`abstract` tel)
 
 instance Abstract Definition where
-  abstract tel (Defn info x t pol occ gens gpars df m c inst copy ma nc inj copat blk lang d) =
-    Defn info x (abstract tel t) (abstract tel pol) (abstract tel occ) (abstract tel gens)
+  abstract tel (Defn info x t pol occ gpars df m c inst copy ma nc inj copat blk lang d) =
+    Defn info x (abstract tel t) (abstract tel pol) (abstract tel occ)
       (replicate (size tel) Nothing ++ gpars)
       df m c inst copy ma nc inj copat blk lang (abstract tel d)
 
@@ -633,8 +636,8 @@ instance Abstract Definition where
 --   we do not need to change lhs, rhs, and t since they live in Γ.
 --   See 'Abstract Clause'.
 instance Abstract RewriteRule where
-  abstract tel (RewriteRule q gamma f ps rhs t c) =
-    RewriteRule q (abstract tel gamma) f ps rhs t c
+  abstract tel (RewriteRule q gamma f ps rhs t c top) =
+    RewriteRule q (abstract tel gamma) f ps rhs t c top
 
 instance {-# OVERLAPPING #-} Abstract [Occ.Occurrence] where
   abstract tel []  = []
@@ -665,7 +668,7 @@ instance Abstract Defn where
   abstract tel d = case d of
     Axiom{} -> d
     DataOrRecSig n -> DataOrRecSig (size tel + n)
-    GeneralizableVar{} -> d
+    GeneralizableVar gv -> GeneralizableVar $ abstract tel gv
     AbstractDefn d -> AbstractDefn $ abstract tel d
     Function{ funClauses = cs, funCompiled = cc, funCovering = cov, funInv = inv
             , funExtLam = extLam
@@ -721,13 +724,12 @@ instance Abstract PrimFun where
         where n = size tel
 
 instance Abstract Clause where
-  abstract tel (Clause rl rf tel' ps b t catchall exact recursive unreachable ell wm) =
+  abstract tel (Clause rl rf tel' ps b t catchall recursive unreachable ell wm) =
     Clause rl rf (abstract tel tel')
            (namedTelVars m tel ++ ps)
            b
            t -- nothing to do for t, since it lives under the telescope
            catchall
-           exact
            recursive
            unreachable
            ell
@@ -736,9 +738,9 @@ instance Abstract Clause where
 
 instance Abstract CompiledClauses where
   abstract tel cc = case cc of
-      Fail xs   -> Fail (hs ++ xs)
-      Done xs t -> Done (hs ++ xs) t
-      Case n bs -> Case (n <&> \ i -> i + size tel) (abstract tel bs)
+      Fail xs         -> Fail (hs ++ xs)
+      Done no mr xs t -> Done no mr (hs ++ xs) t
+      Case n bs       -> Case (n <&> \ i -> i + size tel) (abstract tel bs)
     where
       hs = map (argFromDom . fmap fst) $ telToList tel
 
@@ -781,7 +783,7 @@ abstractArgs args x = abstract tel x
         tel   = foldr (\arg@(Arg info x) -> ExtendTel (__DUMMY_TYPE__ <$ domFromArg arg) . Abs x)
                       EmptyTel
               $ zipWith (<$) names args
-        names = cycle $ map (stringToArgName . (:[])) ['a'..'z']
+        names = ListInf.cycle $ fmap (stringToArgName . singleton) ('a' :| ['b'..'z'])
 
 ---------------------------------------------------------------------------
 -- * Substitution and shifting\/weakening\/strengthening
@@ -857,6 +859,7 @@ instance Subst Term where
 
 -- András 2023-09-25: we can only put this here, because at the original definition site there's no Subst Term instance.
 {-# SPECIALIZE lookupS :: Substitution' Term -> Nat -> Term #-}
+{-# SPECIALIZE isNoAbs :: Abs Term -> Maybe Term #-}
 
 instance Subst BraveTerm where
   type SubstArg BraveTerm = BraveTerm
@@ -875,9 +878,9 @@ instance (Coercible a Term, Subst a) => Subst (Sort' a) where
     LockUniv   -> LockUniv
     LevelUniv  -> LevelUniv
     IntervalUniv -> IntervalUniv
-    PiSort a s1 s2 -> coerce $ piSort (coerce $ sub a) (coerce $ sub s1) (coerce $ sub s2)
-    FunSort s1 s2 -> coerce $ funSort (coerce $ sub s1) (coerce $ sub s2)
-    UnivSort s -> coerce $ univSort $ coerce $ sub s
+    PiSort a s1 s2 -> PiSort (coerce $ sub a) (coerce $ sub s1) (coerce $ sub s2)
+    FunSort s1 s2 -> FunSort (coerce $ sub s1) (coerce $ sub s2)
+    UnivSort s -> UnivSort $ coerce $ sub s
     MetaS x es -> MetaS x $ sub es
     DefS d es  -> DefS d $ sub es
     s@DummyS{} -> s
@@ -987,12 +990,12 @@ instance Subst NLPSort where
 
 instance Subst RewriteRule where
   type SubstArg RewriteRule = NLPat
-  applySubst rho (RewriteRule q gamma f ps rhs t c) =
+  applySubst rho (RewriteRule q gamma f ps rhs t c top) =
     RewriteRule q (applyNLPatSubst rho gamma)
                 f (applySubst (liftS n rho) ps)
                   (applyNLPatSubst (liftS n rho) rhs)
                   (applyNLPatSubst (liftS n rho) t)
-                  c
+                  c top
     where n = size gamma
 
 instance Subst a => Subst (Blocked a) where
@@ -1029,7 +1032,8 @@ instance Subst Constraint where
     LevelCmp cmp l1 l2       -> LevelCmp cmp (rf l1) (rf l2)
     IsEmpty r a              -> IsEmpty r (rf a)
     CheckSizeLtSat t         -> CheckSizeLtSat (rf t)
-    FindInstance m cands     -> FindInstance m (rf cands)
+    FindInstance r m cands   -> FindInstance r m (rf cands)
+    ResolveInstanceHead q    -> ResolveInstanceHead (rf q)
     c@UnBlock{}              -> c
     c@CheckFunDef{}          -> c
     HasBiggerSort s          -> HasBiggerSort (rf s)
@@ -1083,14 +1087,24 @@ instance Subst LetBinding where
   type SubstArg LetBinding = Term
   applySubst rho (LetBinding o v t) = LetBinding o (applySubst rho v) (applySubst rho t)
 
+instance Subst ContextEntry where
+  type SubstArg ContextEntry = Term
+  applySubst rho (CtxVar x a)   = CtxVar x $ applySubst rho a
+
 instance Subst a => Subst (Maybe a) where
   type SubstArg (Maybe a) = SubstArg a
 
 instance Subst a => Subst [a] where
   type SubstArg [a] = SubstArg a
 
+instance Subst a => Subst (List1 a) where
+  type SubstArg (List1 a) = SubstArg a
+
 instance (Ord k, Subst a) => Subst (Map k a) where
   type SubstArg (Map k a) = SubstArg a
+
+instance Subst a => Subst (Ranged a) where
+  type SubstArg (Ranged a) = SubstArg a
 
 instance Subst a => Subst (WithHiding a) where
   type SubstArg (WithHiding a) = SubstArg a
@@ -1129,7 +1143,7 @@ instance Subst EqualityView where
 
 instance Subst EqualityTypeData where
   type SubstArg EqualityTypeData = Term
-  applySubst rho (EqualityTypeData s eq l t a b) = EqualityTypeData
+  applySubst rho (EqualityTypeData r s eq l t a b) = EqualityTypeData r
     (applySubst rho s)
     eq
     (map (applySubst rho) l)
@@ -1138,7 +1152,7 @@ instance Subst EqualityTypeData where
     (applySubst rho b)
 
 instance DeBruijn a => DeBruijn (Pattern' a) where
-  debruijnNamedVar n i             = varP $ debruijnNamedVar n i
+  deBruijnNamedVar n i             = varP $ deBruijnNamedVar n i
   -- deBruijnView returns Nothing, to prevent consS and the like
   -- from dropping the names and origins when building a substitution.
   deBruijnView _                   = Nothing
@@ -1401,6 +1415,8 @@ deriving instance Eq NotBlocked
 deriving instance Eq t => Eq (Blocked t)
 deriving instance Eq CandidateKind
 deriving instance Eq Candidate
+deriving instance Ord CandidateKind
+deriving instance Ord Candidate
 
 deriving instance (Subst a, Eq a)  => Eq  (Tele a)
 deriving instance (Subst a, Ord a) => Ord (Tele a)
@@ -1620,14 +1636,13 @@ isSmallSort s = case sizeOfSort s of
 
 -- | Compute the sort of a function type from the sorts of its domain and codomain.
 --
---   This function should only be called on reduced sorts,
---   since the @LevelUniv@ rules should only apply when the sort does not reduce to @Set@.
-funSort' :: Sort -> Sort -> Either Blocker Sort
+--   The first argument is the value of `isLevelUniverseEnabled`
+funSort' :: Bool -> Sort -> Sort -> Either Blocker Sort
 -- Andreas, 2023-05-12, AIM XXXVI, pri #6623:
 -- On GHC 8.6 and 8.8 this pattern matching triggers warning
 -- "Pattern match checker exceeded (2000000) iterations in a case alternative."
 -- No clue how to turn off this warning, so we have to turn off -Werror for GHC < 8.10.
-funSort' = curry \case
+funSort' hasLevelUniv a b = case (normLU a, normLU b) of
   (Univ u a      , Univ u' b    ) -> Right $ Univ (funUniv u u') $ levelLub a b
   (Inf ua m      , b            ) -> sizeOfSort b <&> \ (SizeOfSort ub n) -> Inf (funUniv ua ub) (max m n)
   (a             , Inf ub n     ) -> sizeOfSort a <&> \ (SizeOfSort ua m) -> Inf (funUniv ua ub) (max m n)
@@ -1666,12 +1681,36 @@ funSort' = curry \case
   (DummyS{}      , _            ) -> Left neverUnblock
   (_             , DummyS{}     ) -> Left neverUnblock
 
-funSort :: Sort -> Sort -> Sort
-funSort a b = fromRight (const $ FunSort a b) $ funSort' a b
+  where
+  normLU = applyUnless hasLevelUniv \case
+             LevelUniv -> mkType 0
+             s         -> s
 
--- | Compute the sort of a pi type from the sorts of its domain
---   and codomain.
--- This function should only be called on reduced sorts, since the @LevelUniv@ rules should only apply when the sort doesn't reduce to @Set@
+funSort :: Bool -> Sort -> Sort -> Sort
+funSort hasLevelUniv a b = fromRight (const $ FunSort a b) $ funSort' hasLevelUniv a b
+
+{-# SPECIALISE funSortM' :: Sort -> Sort -> TCM (Either Blocker Sort) #-}
+funSortM' :: HasOptions m => Sort -> Sort -> m (Either Blocker Sort)
+funSortM' a b = do
+  hasLevelUniv <- isLevelUniverseEnabled
+  return $ funSort' hasLevelUniv a b
+
+{-# SPECIALISE funSortM :: Sort -> Sort -> TCM Sort #-}
+funSortM :: HasOptions m => Sort -> Sort -> m Sort
+funSortM a b = do
+  hasLevelUniv <- isLevelUniverseEnabled
+  return $ funSort hasLevelUniv a b
+
+-- | Compute the sort of a pi type from three inputs:
+--   1. The "raw" domain of the pi type (without the sort)
+--   2. The sort of the domain
+--   3. The sort of the codomain (which lives in an extended context)
+--
+-- Note that unlike funSort', we don't care whether --level-universe is
+-- enabled here. Instead, we just return a FunSort constructor and
+-- assume it will be simplified in the next step. See also:
+-- * `instance Reduce Sort` in Agda.TypeChecking.Substitute (this file)
+-- * `inferPiSort` in Agda.TypeChecking.Sort
 piSort' :: Dom Term -> Sort -> Abs Sort -> Either Blocker Sort
 piSort' a s1       (NoAbs _ s2) = Right $ FunSort s1 s2
 piSort' a s1 s2Abs@(Abs   _ s2) = case flexRigOccurrenceIn 0 s2 of
@@ -1728,6 +1767,20 @@ piSort' a s1 s2Abs@(Abs   _ s2) = case flexRigOccurrenceIn 0 s2 of
 
 piSort :: Dom Term -> Sort -> Abs Sort -> Sort
 piSort a s1 s2 = fromRight (const $ PiSort a s1 s2) $ piSort' a s1 s2
+
+{-# SPECIALISE piSortM :: Dom Term -> Sort -> Abs Sort -> TCM Sort #-}
+piSortM :: HasOptions m => Dom Term -> Sort -> Abs Sort -> m Sort
+piSortM va s1 s2 = case piSort' va s1 s2 of
+  Left _ -> return $ PiSort va s1 s2
+  -- Jesper, 2025-09-15: if a PiSort reduces to a FunSort, piSort'
+  -- just returns the FunSort without trying to simplify it further.
+  -- So if we get a FunSort here we call funSortM in the hopes
+  -- of getting a simpler result. But we DON'T call reduce as that
+  -- can lead to quadratic behavior, see #8096.
+  Right (FunSort s1' s2') -> funSortM s1' s2'
+  Right s' -> return s'
+
+
 
 ---------------------------------------------------------------------------
 -- * Level stuff

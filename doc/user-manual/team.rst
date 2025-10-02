@@ -11,14 +11,13 @@ Cubical Agda was originally contributed by Andrea Vezzosi.
 Agda 2 is currently actively developed mainly by (in alphabetical order):
 
 * Andreas Abel
-* Guillaume Allais
 * Liang-Ting Chen
+* Lawrence Chonavel
 * Jesper Cockx
-* Matthew Daggitt
 * Nils Anders Danielsson
 * Amélia Liao
 * Ulf Norell
-* Andrés Sicard-Ramírez
+* Szumi Xie
 
 Agda 2 has received major contributions by the following developers, amongst others.
 Some contributors have pioneered a feature which shall be mentioned here.
@@ -27,13 +26,17 @@ But many have worked on these features for improvements and maintenance.
 * Andreas Abel: *termination checker, sized types, irrelevance, copatterns, erasure, github workflows, stackage*
 * Arthur Adjedj: ``LevelUniv``
 * Guillaume Allais: *warnings, pattern guards, interleaved mutual blocks, standard library 1.0 and above*
+* Malin Altenmüller: ``--polarity``
 * Stevan Andjelkovic: *LaTeX backend*
 * Miëtek Bak: *Agda logo*
 * Marcin Benke: *original "Alonzo" compiler to Haskell*
 * Jean-Philippe Bernardy: ``syntax`` *declarations*
 * Guillaume Brunerie
+* Joris Ceulemans: ``--polarity``
 * James Chapman
 * Liang-Ting Chen: *github workflows*
+* Lawrence Chonavel
+* Jonathan Coates: *performance*
 * Jesper Cockx: *rewriting, unification* :option:`--without-K`, *recursive instance search*, *reflection*, ``Prop``, *cumulativity*
 * Catarina Coquand: *Agda 1*
 * Jonathan Coates: *performance*
@@ -41,36 +44,46 @@ But many have worked on these features for improvements and maintenance.
 * Nils Anders Danielsson: *efficient positivity checker, HTML backend, highlighting, standard library*, :option:`--erased-cubical`, *erasure*, *performance improvements*
 * Dominique Devriese: ``instance`` *arguments*
 * Péter Diviánszky: *web frontent,* ``variable`` *declarations*
+* Lucas Escot: ``--polarity``
 * Robert Estelle: *refactoring of backends, main driver*
+* Naïm Favier
 * Olle Fredriksson: *Epic compiler backend*
 * Paolo Giarrusso
 * Adam Gundry: *pattern synonyms*
 * Daniel Gustafsson: *Epic compiler backend*
+* Alex Haršáni: *GenericError refactorings*
 * Philipp Hausmann: *treeless compiler, UHC compiler backend, testsuite runner, Travis CI*
 * Kuen-Bang Hou "favonia"
 * Patrik Jansson
 * Alan Jeffrey: *JavaScript compiler backend*
 * Phil de Joux: some *hlinting*
 * Wolfram Kahl
+* Andre Knispel: *reflection, ``INJECTIVE_FOR_INFERENCE``*
 * Wen Kokke
+* András Kovács: *performance, serialization*
 * John Leo
 * Fredrik Lindblad: *Agsy proof search "Auto"*
 * Víctor López Juan: *"tog" prototype, markdown frontend, documentation*
 * Amélia Liao: *maintenance of Cubical Agda*
 * Ting-Gan Lua
 * Francesco Mazzoli: *"tog" prototype*
+* James McKinna: *standard library 1.7 and above*
 * Stefan Monnier
 * Guilhem Moulin: *highlighting*
 * Fredrik Nordvall Forsberg: *pattern lambdas, warnings*
 * Konstantin Nisht
 * Ulf Norell: *Agda 2*
-* Josselin Poiret: some refactoring of *modalities*
+* Andreas Nuyts: ``--polarity``
+* Josselin Poiret: ``--polarity``
 * Nicolas Pouillard: *module record expressions*
 * Jonathan Prieto: *Agda package manager*
 * Christian Sattler
+* Michael Shulman: *some Agda input key bindings*
 * Andrés Sicard-Ramírez: *Agda releases, stackage, Travis CI*
+* Lukas Skystedt: *Mimer proof search "Auto"*
 * Makoto Takeyama: *Agda 1, Emacs mode, "MAlonzo" compiler to Haskell, serialization*
 * Andrea Vezzosi: *Cubical Agda, Agda-flat, Agda-parametric, Guarded Cubical Agda*
+* Szumi Xie: *some bug fixes*
 * Noam Zeilberger: *pattern lambdas*
 * Tesla Ice Zhang
 

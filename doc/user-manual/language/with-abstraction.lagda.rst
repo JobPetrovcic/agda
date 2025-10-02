@@ -431,7 +431,7 @@ with-abstraction.
 Irrefutable With
 ~~~~~~~~~~~~~~~~
 
-When a pattern is irrefutable, we can use a pattern-matching ``with``
+When a pattern is irrefutable, we can use a pattern matching ``with``
 instead of a traditional ``with`` block. This gives us a lightweight
 syntax to make a lot of observations before using a "proper" ``with``
 block. For a basic example of such an irrefutable pattern, see this
@@ -468,7 +468,7 @@ of a vector whose length is neither 0 nor 1:
 
 Remember the example of :ref:`simultaneous
 abstraction <simultaneous-abstraction>` from above. A simultaneous
-rewrite / pattern-matching ``with`` is to be understood as being nested.
+rewrite / pattern matching ``with`` is to be understood as being nested.
 That is to say that the type refinements introduced by the first
 case analysis may be necessary to type the following ones.
 
@@ -483,7 +483,7 @@ of the vector argument using ``suc-+`` first.
     suc-+ (suc m) n rewrite suc-+ m n = refl
 
     infixr 1 _×_
-    _×_ : ∀ {a b} (A : Set a) (B : Set b) → Set ?
+    _×_ : ∀ {a b} (A : Set a) (B : Set b) → Set _
     A × B = Σ A (λ _ → B)
 
     splitAt : ∀ m {n} → Vec A (m + n) → Vec A m × Vec A n
@@ -497,9 +497,62 @@ of the vector argument using ``suc-+`` first.
                      with (before , focus ∷ after) ← splitAt m vs
                      = (before , focus , after)
 
-You can alternate arbitrarily many ``rewrite`` and pattern-matching
+You can alternate arbitrarily many ``rewrite`` and pattern matching
 ``with`` clauses and still perform a ``with`` abstraction afterwards
 if necessary.
+
+.. _with-using:
+
+..
+  ::
+  module with-using {a} {A : Set a} where
+    open import Agda.Builtin.Nat
+    open import Agda.Builtin.Sigma
+    open import Agda.Builtin.Equality
+    open import Agda.Builtin.Unit
+
+    open with-invert {A = A} hiding (splitAt)
+
+Left-hand side let-bindings
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An alternative to an irrefutable ``with``, when you just need to bind
+a variable or do simple unpacking of record values, is to use a
+``using``-binding. This is the left-hand side counterpart of a
+:ref:`let-binding <let-expressions>` and supports the same limited
+form of pattern matching.
+
+For instance, the irrefutable ``with`` used in ``splitAt`` in the
+section above can be changed to ``using``:
+
+::
+
+    splitAt : ∀ m {n} → Vec A (m + n) → Vec A m × Vec A n
+    splitAt zero    xs       = ([] , xs)
+    splitAt (suc m) (x ∷ xs) using (ys , zs) ← splitAt m xs = (x ∷ ys , zs)
+
+Variables bound with ``using`` are in scope in following ``with``
+clauses, allowing you to reuse bindings across multiple nested ``with`` s:
+
+::
+
+    contrived : ∀ m {n} → Vec A (m + n) → (Vec A m → Bool) → (Vec A n → Bool) → Bool
+    contrived m xs p q using (ys , zs) ← splitAt m xs
+                       with p ys
+    ... | true = true
+    ... | false with q zs
+    ...   | true  = false
+    ...   | false = true
+
+For convenience, multiple bindings can be separated by ``|``, and this
+has the same meaning as repeating the ``using`` keyword: bindings to
+the left are in scope to the right.
+
+Contrary to ``with`` and ``rewrite``, ``using`` does not perform any
+abstraction over the bound terms, but simply introduces a local
+binding. This can make it much cheaper to use than an irrefutable
+``with`` in situations where the goal type and context are big and
+expensive to normalise, and the abstraction isn't required.
 
 ..
   ::
@@ -655,13 +708,13 @@ Pattern lambdas
 +++++++++++++++
 
 Agda does not have a primitive ``case`` construct, but one can be emulated
-using :ref:`pattern matching lambdas <pattern-lambda>`. First you define a
+using :ref:`pattern lambdas <pattern-lambda>`. First you define a
 function ``case_of_`` as follows::
 
   case_of_ : ∀ {a b} {A : Set a} {B : Set b} → A → (A → B) → B
   case x of f = f x
 
-You can then use this function with a pattern matching lambda as the second
+You can then use this function with a pattern lambda as the second
 argument to get a Haskell-style case expression::
 
   filter : {A : Set} → (A → Bool) → List A → List A

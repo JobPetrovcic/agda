@@ -12,13 +12,124 @@ Where noted, these options can also serve as *pragma options*,
 i.e., be supplied in a file via the ``{-# OPTIONS ... #-}`` pragma
 or in the ``flags`` section of an ``.agda-lib`` file.
 
-General options
-~~~~~~~~~~~~~~~
+Setup and information
+~~~~~~~~~~~~~~~~~~~~~
+
+Some options cause Agda to perform tasks at startup like mandatory setup
+or printing some information.
+These options are not exclusive, they can be used with other options,
+albeit this seldom makes sense.
+They are not executed in the order given on the command line,
+but in the fixed order listed in the following:
+
+.. option:: --setup
+
+     .. versionadded:: 2.8.0
+
+     Extract Agda's data files (primitive library, emacs mode etc.)
+     to the data directory (see :option:`--print-agda-data-dir`).
+
+.. option:: --version, -V
+
+     Show version number and cabal flags used in this build of Agda.
+
+     Overwrites :option:`--numeric-version`.
+
+.. option:: --numeric-version
+
+     Show just the version number.
+
+     Overwrites :option:`--version`.
 
 .. option:: --help[={TOPIC}], -?[{TOPIC}]
 
-     Show basically this help, or more help about ``TOPIC``. Current
-     topics available: ``warning``.
+     Show basically this help, or more help about ``TOPIC``.
+     Available topics:
+
+     - ``emacs-mode``:
+       Explain the option :option:`--emacs-mode`.
+
+     - ``error``:
+       List the names of Agda's errors.
+
+     - ``warning``:
+       List warning groups and individual warnings and their default status.
+       Instruct how to toggle benign warnings.
+
+     Overwrites itself, i.e., only the last of several :option:`--help` options is effective.
+
+.. option:: --print-options
+
+     .. versionadded:: 2.9.0
+
+     Print a simple list of all options, suitable for implementing bash completion.
+
+.. option:: --build-library
+
+     .. versionadded:: 2.8.0
+
+     Expects an ``.agda-lib`` file in the current directory
+     (or in a parent directory) and type-checks all Agda files
+     found in the ``include`` directories of the library or
+     in subdirectories thereof.
+
+.. option:: --print-agda-app-dir
+
+     .. versionadded:: 2.6.4.1
+
+     Outputs the (:envvar:`AGDA_DIR`) directory containing Agda's
+     application configuration files, such as the ``defaults`` and
+     ``libraries`` files, as described in :ref:`package-system`.
+
+.. option:: --print-agda-dir
+
+     .. versionadded:: 2.6.2
+
+     Alias of :option:`--print-agda-data-dir`.
+
+.. option:: --print-agda-data-dir
+
+     .. versionadded:: 2.6.4.1
+
+     Outputs the root of the directory structure holding Agda's data
+     files such as core libraries, style files for the backends, etc.
+
+     Since 2.8.0, the data directory is determined as follows:
+
+     - The *default data directory* is defined at build time, either
+       as the standard data directory defined by Cabal, or, if the
+       :option:`use-xdg-data-home` build flag is enabled,
+       as ``$XDG_DATA_HOME/agda/$AGDA_VERSION``.
+
+     - The *data directory* can be set at runtime using the :envvar:`Agda_datadir`
+       environment variable and defaults to the default data directory.
+       It can be printed with this flag.
+
+.. option:: --emacs-mode={COMMAND}
+
+     .. versionadded:: 2.8.0
+
+     Administer the Agda Emacs mode,
+     a task previously managed by the ``agda-mode`` executable.
+
+     Available commands:
+
+     - ``setup``:
+       Install the Emacs mode into ``.emacs``.
+
+     - ``compile``:
+       Compile the Elisp files of the Emacs mode.
+
+     - ``locate``:
+       Print the path to the Emacs mode.
+
+     More information in :ref:`Section Emacs <install-agda-mode>`.
+
+     This option can be given several times to perform several commands.
+
+
+General options
+~~~~~~~~~~~~~~~
 
 .. option:: --interaction
 
@@ -103,39 +214,6 @@ General options
      Only scope-check the top-level module, do not type-check it (see
      :ref:`quickLaTeX`).
 
-.. option:: --version, -V
-
-     Show version number and cabal flags used in this build of Agda.
-
-.. option:: --numeric-version
-
-     Show just the version number.
-
-.. option:: --print-agda-app-dir
-
-     .. versionadded:: 2.6.4.1
-
-     Outputs the (:envvar:`AGDA_DIR`) directory containing Agda's
-     application configuration files, such as the ``defaults`` and
-     ``libraries`` files, as described in :ref:`package-system`.
-
-.. option:: --print-agda-dir
-
-     .. versionadded:: 2.6.2
-
-     Alias of :option:`--print-agda-data-dir`.
-
-.. option:: --print-agda-data-dir
-
-     .. versionadded:: 2.6.4.1
-
-     Outputs the root of the directory structure holding Agda's data
-     files such as core libraries, style files for the backends, etc.
-
-     While this location is usually determined at installation time, it
-     can be controlled at runtime using the environment variable
-     :envvar:`Agda_datadir`.
-
 .. option:: --transliterate
 
      .. versionadded:: 2.6.3
@@ -148,6 +226,8 @@ General options
      :option:`--interaction-json` are used, because when those options
      are used Agda uses UTF-8 when writing to stdout (and when reading
      from stdin).
+
+.. _compilation-options:
 
 Compilation
 ~~~~~~~~~~~
@@ -172,34 +252,8 @@ See :ref:`compilers` for backend-specific options.
 
      Default, opposite of :option:`--no-main`.
 
-.. option:: --with-compiler={PATH}
-
-     Set ``PATH`` as the executable to call to compile the backend's
-     output (default: ``ghc`` for the GHC backend).
-
 Generating highlighted source code
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. option:: --count-clusters
-
-     .. versionadded:: 2.5.3
-
-     Count extended grapheme clusters when generating LaTeX code (see
-     :ref:`grapheme-clusters`).
-     Available only when Agda was built with Cabal flag :option:`enable-cluster-counting`.
-
-     Pragma option since 2.5.4.
-
-.. option:: --no-count-clusters
-
-     .. versionadded:: 2.6.4
-
-     Opposite of :option:`--count-clusters`. Default.
-
-.. option:: --css={URL}
-
-     Set URL of the CSS file used by the HTML files to ``URL`` (can be
-     relative).
 
 .. option:: --dependency-graph={FILE}
 
@@ -223,49 +277,19 @@ Generating highlighted source code
      to ``M`` (even if ``M``'s file cannot be found via the
      ``include`` paths given in the ``.agda-lib`` file).
 
-.. option:: --highlight-occurrences
-
-     .. versionadded:: 2.6.2
-
-     When :ref:`generating HTML <generating-html>`,
-     place the :file:`highlight-hover.js` script
-     in the output directory (see :option:`--html-dir`).
-     In the presence of the script,
-     hovering over an identifier in the rendering of the HTML
-     will highlight all occurrences of the same identifier on the page.
-
 .. option:: --html
 
      .. versionadded:: 2.2.0
 
      Generate HTML files with highlighted source code (see
-     :ref:`generating-html`).
-
-.. option:: --html-dir={DIR}
-
-     Set directory in which HTML files are placed to ``DIR`` (default:
-     ``html``).
-
-.. option:: --html-highlight=[code,all,auto]
-
-     .. versionadded:: 2.6.0
-
-     Whether to highlight non-Agda code as comments in generated HTML
-     files (default: ``all``; see :ref:`generating-html`).
+     :ref:`generating-html` for description and further options).
 
 .. option:: --latex
 
      .. versionadded:: 2.3.2
 
      Generate LaTeX with highlighted source code (see
-     :ref:`generating-latex`).
-
-.. option:: --latex-dir={DIR}
-
-     .. versionadded:: 2.5.2
-
-     Set directory in which LaTeX files are placed to ``DIR``
-     (default: ``latex``).
+     :ref:`generating-latex` for description and further options).
 
 .. option:: --vim
 
@@ -280,20 +304,26 @@ Imports and libraries
 
      .. versionadded:: 2.6.0
 
-     Ignore *all* interface files, including builtin and primitive
+     Don't read *any* interface files, including builtin and primitive
      modules; only use this if you know what you are doing!
 
 .. option:: --ignore-interfaces
 
-     Ignore interface files (re-type check everything, except for
+     Don't read interface files (re-type check everything, except for
      builtin and primitive modules).
 
-.. option:: --include-path={DIR}, -i={DIR}
+.. option:: --no-write-interfaces
+
+     .. versionadded:: 2.9.0
+
+     Don't write out interface files after type-checking a module.
+
+.. option:: --include-path={DIR}, -i {DIR}
 
      Look for imports in ``DIR``.
      This option can be given multiple times.
 
-.. option:: --library={DIR}, -l={LIB}
+.. option:: --library={DIR}, -l {LIB}
 
      .. versionadded:: 2.5.1
 
@@ -304,14 +334,6 @@ Imports and libraries
      .. versionadded:: 2.5.1
 
      Use ``FILE`` instead of the standard ``libraries`` file.
-
-.. option:: --local-interfaces
-
-     .. versionadded:: 2.6.1
-
-     Prefer to read and write interface files next to the Agda files they
-     correspond to (i.e. do not attempt to regroup them in a ``_build/``
-     directory at the project's root, except if they already exist there).
 
 .. option:: --no-default-libraries
 
@@ -465,7 +487,7 @@ Printing and debugging
 
      Default, opposite of :option:`--show-irrelevant`.
 
-.. option:: --verbose={N}, -v={N}
+.. option:: --verbose={N}, -v {N}
 
      Set verbosity level to ``N``. This only has an effect if
      Agda was installed with the :option:`debug` flag.
@@ -521,12 +543,13 @@ Copatterns and projections
      .. versionadded:: 2.5.2
 
      Make postfix projection notation the default.
+     On by default since 2.7.0.
 
 .. option:: --no-postfix-projections
 
      .. versionadded:: 2.6.4
 
-     Default, opposite of :option:`--postfix-projections`.
+     Opposite of :option:`--postfix-projections`.
 
 Experimental features
 ~~~~~~~~~~~~~~~~~~~~~
@@ -620,12 +643,26 @@ Experimental features
      .. versionadded:: 2.6.2
 
      Enable a constraint-solving heuristic akin to first-order unification, see :ref:`lossy-unification`.
+     Implies :option:`--no-require-unique-meta-solutions`.
 
 .. option:: --no-lossy-unification
 
      .. versionadded:: 2.6.4
 
      Default, opposite of :option:`--lossy-unification`.
+
+.. option:: --require-unique-meta-solutions, --no-require-unique-meta-solutions
+
+      .. versionadded:: 2.7.0
+
+    When turned off, type checking is allowed to use heuristics to solve meta
+    variables that do not necessarily guarantee unique solutions. In
+    particular, it can make use of :ref:`INJECTIVE_FOR_INFERENCE <injective-for-inference-pragma>`
+    pragmas.
+
+    ``--no-require-unique-meta-solutions`` is implied by the :option:`--lossy-unification` flag.
+
+    Default: ``--require-unique-meta-solutions``
 
 .. option:: --prop, --no-prop
 
@@ -785,6 +822,15 @@ Pattern matching and equality
 
      Default, opposite of :option:`--flat-split`.
 
+.. option:: --polarity, --no-polarity
+
+     .. versionadded:: 2.6.5
+
+     Enables the use of modal polarity annotations, and their interaction with
+     the positivity checker. See :ref:`polarity`.
+
+     Default: :option:`--no-polarity`.
+
 .. option:: --no-pattern-matching
 
      .. versionadded:: 2.4.0
@@ -826,11 +872,13 @@ Pattern matching and equality
      Prevent interactive case splitting from replacing variables with
      dot patterns (see :ref:`dot-patterns`).
 
+     Default since 2.7.0.
+
 .. option:: --no-keep-pattern-variables
 
      .. versionadded:: 2.6.4
 
-     Default, opposite of :option:`--keep-pattern-variables`.
+     Opposite of :option:`--keep-pattern-variables`.
 
 .. option:: --infer-absurd-clauses, --no-infer-absurd-clauses
 
@@ -980,14 +1028,16 @@ Search depth and instances
      Set maximum depth for pattern match inversion to ``N`` (default:
      50). Should only be needed in pathological cases.
 
-.. option:: --overlapping-instances, --no-overlapping-instances
+.. option:: --backtracking-instance-search, --no-backtracking-instance-search
 
-     .. versionadded:: 2.6.0
+     .. versionadded:: 2.6.5
 
      Consider [do not consider] recursive instance arguments during
-     pruning of instance candidates.
+     pruning of instance candidates, see :ref:`backtracking-instances`
 
-     Default: ``--no-overlapping-instances``.
+     Default: ``--no-backtracking-instance-search``.
+
+     This option used to be called ``--overlapping-instances``.
 
 .. option:: --qualified-instances, --no-qualified-instances
 
@@ -997,6 +1047,20 @@ Search depth and instances
      under a qualified name.
 
      Default: ``--qualified-instances``.
+
+.. option:: --experimental-lazy-instances, --no-experimental-lazy-instances
+
+     .. versionadded:: 2.8.0
+
+     Opt into the experimental, faster implementation of instance
+     search. This is presently optional since it may potentially
+     introduce regressions in code which relies on the order of
+     constraint solving.
+
+     Default: ``--no-experimental-lazy-instances``.
+
+     The ``--experimental-lazy-instances`` behaviour will be made the
+     default and this flag will be removed in the future.
 
 
 Other features
@@ -1119,10 +1183,13 @@ Other features
 
      .. versionadded:: 2.6.3
 
-     Save [or do not save] meta-variables in ``.agdai`` files. The
-     alternative is to expand the meta-variables to their definitions.
-     This option can affect performance. The default is to not save
-     the meta-variables.
+     Save [or do not save] meta-variables in ``.agdai`` files. Not saving means
+     that all meta-variable solutions are inlined into the interface. Currently,
+     even if :option:`--save-metas` is used, very few meta-variables are
+     actually saved, and this option is more like an anticipation of possible
+     future optimizations.
+
+     Default: :option:`--no-save-metas`.
 
 Erasure
 ~~~~~~~
@@ -1167,6 +1234,12 @@ Erasure
 
      Default, opposite of :option:`--erase-record-parameters`.
 
+.. option:: --lossy-unification
+
+     .. versionadded:: 2.6.4
+
+     Enable lossy unification, see :ref:`lossy-unification`.
+
 .. _warnings:
 
 Warnings
@@ -1201,9 +1274,13 @@ Benign warnings
 Individual non-fatal warnings can be turned on and off by ``-W {NAME}`` and ``-W no{NAME}`` respectively.
 The list containing any warning ``NAME`` can be produced by ``agda --help=warning``:
 
-.. option:: AbsurdPatternRequiresNoRHS
+.. option:: AbsurdPatternRequiresAbsentRHS
 
      RHS given despite an absurd pattern in the LHS.
+
+.. option:: BuiltinDeclaresIdentifier
+
+     A ``BUILTIN`` pragma that declares an identifier, but has been given an existing one.
 
 .. option:: AsPatternShadowsConstructorOrPatternSynonym
 
@@ -1217,6 +1294,19 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      Clashes introduced by ``renaming``.
 
+.. option:: ConflictingPragmaOptions
+
+     Conflicting pragma options. For instance, both ``--this`` and ``--no-that`` when
+     ``--this`` implies ``--that``.
+
+.. option:: ConfluenceCheckingIncompleteBecauseOfMeta
+
+     Incomplete confluence checks because of unsolved metas.
+
+.. option:: ConfluenceForCubicalNotSupported
+
+     Attempts to check confluence with :option:`--cubical`.
+
 .. option:: CoverageNoExactSplit
 
      Failed exact split checks.
@@ -1225,13 +1315,21 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      Deprecated features.
 
+.. option:: DivergentModalityInClause
+
+     Modalities of clauses that diverge from the modality of the function.
+
 .. option:: DuplicateFields
 
      ``record`` expression with duplicate field names.
 
-.. option:: DuplicateInterfaceFiles
+.. option:: DuplicateRecordDirective
 
-     There exists both a local interface file and an interface file in ``_build``.
+     Conflicting directives in a record declaration.
+
+.. option:: DuplicateRewriteRule
+
+     Duplicate declaration of a name as :ref:`REWRITE<rewriting>` rule.
 
 .. option:: DuplicateUsing
 
@@ -1265,6 +1363,10 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      Empty ``mutual`` blocks.
 
+.. option:: EmptyPolarityPragma
+
+     :ref:`POLARITY pragmas <polarity-pragma>` not giving any polarities.
+
 .. option:: EmptyPostulate
 
      Empty ``postulate`` blocks.
@@ -1292,6 +1394,18 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 .. option:: FaceConstraintCannotBeNamed
 
      Face constraint patterns that are given as named arguments.
+
+.. option:: FixingCohesion
+
+     Invalid cohesion annotations, automatically corrected.
+
+.. option:: FixingPolarity
+
+     Invalid polarity annotations, automatically corrected.
+
+.. option:: FixingRelevance
+
+     Invalid relevance annotations, automatically corrected.
 
 .. option:: FixityInRenamingModule
 
@@ -1336,10 +1450,6 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      Illegal character literals such as surrogate code points.
 
-.. option:: InvalidConstructor
-
-     ``constructor`` blocks that contain declarations other type signatures for constructors.
-
 .. option:: InvalidConstructorBlock
 
      ``constructor`` blocks outside of ``interleaved mutual`` blocks.
@@ -1357,9 +1467,9 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      :ref:`NO_UNIVERSE_CHECK <no_universe_check-pragma>` pragmas before declarations other than ``data`` or ``record`` declarations.
 
-.. option:: InvalidRecordDirective
+.. option:: InvalidTacticAttribute
 
-     Record directives outside of record definition or below field declarations.
+     :ref:`@(tactic ...) <tactic_arguments>` attributes where they are not supported.
 
 .. option:: InvalidTerminationCheckPragma
 
@@ -1373,6 +1483,14 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      Unknown fields in library files.
 
+.. option:: MisplacedAttributes
+
+     Attributes where they cannot appear.
+
+.. option:: MissingTypeSignatureForOpaque
+
+     ``abstract`` or ``opaque`` definitions that lack a type signature.
+
 .. option:: ModuleDoesntExport
 
      Names mentioned in an import statement which are not exported by
@@ -1382,13 +1500,18 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      Multiple attributes given where only erasure is accepted.
 
-.. option:: NoGuardednessFlag
+.. option:: NoMain
 
-     Coinductive record but no :option:`--guardedness` flag.
+     Invoking the compiler on a module without a ``main`` function.
+     See also :option:`--no-main`.
 
 .. option:: NotAffectedByOpaque
 
      Declarations that should not be inside ``opaque`` blocks.
+
+.. option:: NotARewriteRule
+
+     ``REWRITE`` pragmas referring to identifiers that are neither definitions nor constructors.
 
 .. option:: NotInScope
 
@@ -1398,13 +1521,13 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      Deprecated :ref:`BUILTIN<built-ins>` pragmas.
 
-.. option:: OpenPublicAbstract
+.. option:: OpenImportAbstract
 
-     ``open public`` directives in ``abstract`` blocks.
+     ``open`` or ``import`` statements in ``abstract`` blocks.
 
-.. option:: OpenPublicPrivate
+.. option:: OpenImportPrivate
 
-     ``open public`` directives in ``private`` blocks.
+     ``open`` or ``import`` statements in ``private`` blocks.
 
 .. option:: OptionRenamed
 
@@ -1426,21 +1549,133 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      :ref:`COMPILE<foreign-function-interface>` pragma targeting an erased symbol.
 
+.. option:: PragmaCompileList
+
+     :ref:`COMPILE<foreign-function-interface>` pragma for GHC backend targeting lists.
+
+.. option:: PragmaCompileMaybe
+
+     :ref:`COMPILE<foreign-function-interface>` pragma for GHC backend targeting ``MAYBE``.
+
+.. option:: PragmaCompileUnparsable
+
+     Unparsable :ref:`COMPILE<foreign-function-interface>` GHC pragmas.
+
+.. option:: PragmaCompileWrong
+
+     Ill-formed :ref:`COMPILE<foreign-function-interface>` GHC pragmas.
+
+.. option:: PragmaCompileWrongName
+
+     :ref:`COMPILE<foreign-function-interface>` pragmas referring to identifiers that are neither definitions nor constructors.
+
+.. option:: PragmaExpectsDefinedSymbol
+
+     Pragmas referring to identifiers that are not defined symbols.
+
+.. option:: PragmaExpectsUnambiguousConstructorOrFunction
+
+     Pragmas referring to identifiers that are not unambiguous constructors or functions.
+
+.. option:: PragmaExpectsUnambiguousProjectionOrFunction
+
+     Pragmas referring to identifiers that are not unambiguous projections or functions.
+
 .. option:: PragmaNoTerminationCheck
 
      :ref:`NO_TERMINATION_CHECK<terminating-pragma>` pragmas; such are deprecated.
+
+.. option:: InvalidDisplayForm
+
+     An illegal :ref:`DISPLAY <display-pragma>` form; it will be ignored.
+
+.. option:: RewriteLHSNotDefinitionOrConstructor
+
+     Rewrite rule head symbol is not a defined symbol or constructor.
+
+.. option:: RewriteVariablesNotBoundByLHS
+
+     Rewrite rule does not bind all of its variables.
+
+.. option:: RewriteVariablesBoundMoreThanOnce
+
+     Constructor-headed rewrite rule has non-linear parameters.
+
+.. option:: RewriteLHSReduces
+
+     Rewrite rule LHS is not in weak-head normal form.
+
+.. option:: RewriteHeadSymbolIsProjectionLikeFunction
+
+     Rewrite rule head symbol is a projection-like function.
+
+.. option:: RewriteHeadSymbolIsTypeConstructor
+
+     Rewrite rule head symbol is a type constructor.
+
+.. option:: RewriteHeadSymbolContainsMetas
+
+     Definition of rewrite rule head symbol contains unsolved metas.
+
+.. option:: RewriteConstructorParametersNotGeneral
+
+     Constructor-headed rewrite rule parameters are not fully general.
+
+.. option:: RewriteContainsUnsolvedMetaVariables
+
+     Rewrite rule contains unsolved metas.
+
+.. option:: RewriteBlockedOnProblems
+
+     Checking rewrite rule blocked by unsolved constraint.
+
+.. option:: RewriteRequiresDefinitions
+
+     Checking rewrite rule blocked by missing definition.
+
+.. option:: RewriteDoesNotTargetRewriteRelation
+
+     Rewrite rule does not target the rewrite relation.
+
+.. option:: RewriteBeforeFunctionDefinition
+
+     Rewrite rule is not yet defined.
+
+.. option:: RewriteBeforeMutualFunctionDefinition
+
+     Mutually declaration with the rewrite rule is not yet defined.
+
+.. option:: RewritesNothing
+
+     ``rewrite`` clauses that do not fire.
 
 .. option:: ShadowingInTelescope
 
      Repeated variable name in telescope.
 
+.. option:: TooManyArgumentsToSort
+
+     E.g. ``Set`` used with more than one argument.
+
 .. option:: TooManyFields
 
      Record expression with invalid field names.
 
+.. option:: TooManyPolarities
+
+     :ref:`POLARITY pragma <polarity-pragma>` with too many polarities given.
+
+.. option:: UnfoldingWrongName
+
+     Names in an ``unfolding`` clause that are not unambiguous definitions.
+
 .. option:: UnfoldTransparentName
 
      Non-``opaque`` names mentioned in an ``unfolding`` clause.
+
+.. option:: UnknownAttribute
+
+     Unknown attributes.
 
 .. option:: UnknownFixityInMixfixDecl
 
@@ -1455,6 +1690,10 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      Names not declared in the same scope as their polarity pragmas.
 
+.. option:: UnknownPolarity
+
+     Unknown polarities.
+
 .. option:: UnreachableClauses
 
      Unreachable function clauses.
@@ -1466,6 +1705,10 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 .. option:: UnsupportedIndexedMatch
 
      Failures to compute full equivalence when splitting on indexed family.
+
+.. option:: UnusedVariablesInDisplayForm
+
+     :ref:`DISPLAY <display-pragma>` forms that bind variables they do not use.
 
 .. option:: UselessAbstract
 
@@ -1482,6 +1725,10 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 .. option:: UselessInstance
 
      ``instance`` blocks where they have no effect.
+
+.. option:: UselessMacro
+
+     ``macro`` blocks where they have no effect.
 
 .. option:: UselessOpaque
 
@@ -1501,11 +1748,24 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
 .. option:: UselessPublic
 
-     ``public`` blocks where they have no effect.
+     ``public`` directives where they have no effect.
+
+.. option:: UselessTactic
+
+     ``@tactic`` attributes in non-hidden and instance arguments.
 
 .. option:: UserWarning
 
      User-defined warnings added using one of the ``WARNING_ON_*`` pragmas.
+
+.. option:: WarningProblem
+
+     Problem encountered with option :option:`-W`,
+     like an unknown warning or the attempt to switch off a non-benign warning.
+
+.. option:: WithClauseProjectionFixityMismatch
+
+     Projection fixity different in with-clause compared to its parent clause.
 
 .. option:: WithoutKFlagPrimEraseEquality
 
@@ -1515,15 +1775,27 @@ The list containing any warning ``NAME`` can be produced by ``agda --help=warnin
 
      Terms marked as eligible for instance search whose type does not end with a name.
 
+.. option:: CustomBackendWarning
+
+     Warnings from custom backends.
+
 Error warnings
 ~~~~~~~~~~~~~~
 
 Some warnings are fatal; those are errors Agda first ignores but eventually raises.
 Such *error warnings* are always on, they cannot be toggled by :option:`-W`.
 
+.. option:: CoinductiveEtaRecord
+
+     Declaring a ``record`` type as both ``coinductive`` and having ``eta-equality``.
+
 .. option:: CoInfectiveImport
 
      Importing a file not using e.g. :option:`--safe` from one which does.
+
+.. option:: ConstructorDoesNotFitInData
+
+     Constructor with arguments in a universe higher than the one of its data type.
 
 .. option:: CoverageIssue
 
@@ -1533,9 +1805,9 @@ Such *error warnings* are always on, they cannot be toggled by :option:`-W`.
 
      Importing a file using e.g. :option:`--cubical` into one which does not.
 
-.. option:: MissingDeclarations
+.. option:: MissingDataDeclaration
 
-     Definitions not associated to a declaration.
+     Constructor definitions not associated to a data declaration.
 
 .. option:: MissingDefinitions
 
@@ -1621,6 +1893,10 @@ Such *error warnings* are always on, they cannot be toggled by :option:`-W`.
 
      Failed termination checks.
 
+.. option:: TopLevelPolarity
+
+     Declaring definitions with an explicit polarity annotation.
+
 .. option:: UnsolvedConstraints
 
      Unsolved constraints.
@@ -1632,6 +1908,24 @@ Such *error warnings* are always on, they cannot be toggled by :option:`-W`.
 .. option:: UnsolvedMetaVariables
 
      Unsolved meta variables.
+
+.. option:: HiddenNotInArgumentPosition
+
+     Hidden arguments ``{ x }`` can only appear as arguments to
+     functions, not as expressions by themselves.
+
+.. option:: InstanceNotInArgumentPosition
+
+     Instance arguments ``⦃ x ⦄`` can only appear as arguments to
+     functions, not as expressions by themselves.
+
+.. option:: MacroInLetBindings
+
+     Macros can not be let-bound.
+
+.. option:: AbstractInLetBindings
+
+     Let bindings can not be made abstract.
 
 
 Command-line examples
@@ -1666,15 +1960,15 @@ An *infective* option is an option that if used in one module, must be
 used in all modules that depend on this module. The following options
 are infective:
 
+* :option:`--cohesion`
+* :option:`--erased-matches`
+* :option:`--erasure`
+* :option:`--flat-split`
+* :option:`--guarded`
+* :option:`--polarity`
 * :option:`--prop`
 * :option:`--rewriting`
-* :option:`--guarded`
 * :option:`--two-level`
-* :option:`--cumulativity`
-* :option:`--cohesion`
-* :option:`--flat-split`
-* :option:`--erasure`
-* :option:`--erased-matches`
 
 Furthermore :option:`--cubical` and :option:`--erased-cubical` are
 *jointly infective*: if one of them is used in one module, then one or
@@ -1749,7 +2043,8 @@ again, the source file is re-typechecked instead:
 * :option:`--no-unicode`
 * :option:`--no-universe-polymorphism`
 * :option:`--omega-in-omega`
-* :option:`--overlapping-instances`
+* :option:`--backtracking-instance-search`
+* :option:`--polarity`
 * :option:`--prop`
 * :option:`--qualified-instances`
 * :option:`--rewriting`

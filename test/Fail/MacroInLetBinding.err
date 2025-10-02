@@ -1,0 +1,3 @@
+MacroInLetBinding.agda:4.15-22: error: [MacroInLetBindings]
+Macros can not be defined in let bindings.
+when scope checking let macro g = Set in Set

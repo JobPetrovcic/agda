@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 {-# OPTIONS_GHC -Wunused-imports #-}
 
 {-| This module contains the building blocks used to construct the lexer.
@@ -24,7 +26,9 @@ import Control.Monad.State (modify)
 
 import Data.Bifunctor
 import Data.Char
+#if !MIN_VERSION_base(4,20,0)
 import Data.Foldable (foldl')
+#endif
 import Data.Maybe
 
 import Agda.Syntax.Common (pattern Ranged)
@@ -273,13 +277,11 @@ qualified tok =
         mkName :: Interval -> [String1] -> [(Interval, String1)]
         mkName _ []     = []
         mkName i [x]    = [(i, x)]
-        mkName i (x:xs) = (i0, x) : mkName i1 xs
+        mkName (Interval f p0 p1) (x:xs) = (i0, x) : mkName i1 xs
             where
-                p0 = iStart i
-                p1 = iEnd i
                 p' = movePos (movePosByString p0 x) '.'
-                i0 = Interval p0 p'
-                i1 = Interval p' p1
+                i0 = Interval f p0 p'
+                i1 = Interval f p' p1
 
 
 {--------------------------------------------------------------------------

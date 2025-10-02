@@ -1,10 +1,9 @@
 {-# LANGUAGE ApplicativeDo #-}
+{-# OPTIONS_GHC -Wunused-imports #-}
 
 module Agda.TypeChecking.Primitive.Base where
 
 import Control.Monad             ( mzero )
-import Control.Monad.Fail        ( MonadFail )
-  -- Control.Monad.Fail import is redundant since GHC 8.8.1
 import Control.Monad.Trans.Maybe ( MaybeT(..), runMaybeT )
 
 import qualified Data.Map as Map
@@ -23,7 +22,6 @@ import Agda.TypeChecking.Reduce ( reduce )
 import Agda.TypeChecking.Monad.Signature
 import Agda.TypeChecking.Substitute
 
-import Agda.Utils.Functor
 import Agda.Utils.Impossible
 import Agda.Utils.Maybe
 import Agda.Syntax.Common.Pretty ( prettyShow )
@@ -34,16 +32,17 @@ infixr 4 -->
 infixr 4 .-->
 infixr 4 ..-->
 
-(-->), (.-->), (..-->) :: Applicative m => m Type -> m Type -> m Type
+(-->), (.-->), (..-->) :: HasOptions m => m Type -> m Type -> m Type
 a --> b = garr id a b
-a .--> b = garr (const $ Irrelevant) a b
-a ..--> b = garr (const $ NonStrict) a b
+a .--> b = garr (const irrelevant) a b
+a ..--> b = garr (const shapeIrrelevant) a b
 
-garr :: Applicative m => (Relevance -> Relevance) -> m Type -> m Type -> m Type
+garr :: HasOptions m => (Relevance -> Relevance) -> m Type -> m Type -> m Type
 garr f a b = do
   a' <- a
   b' <- b
-  pure $ El (funSort (getSort a') (getSort b')) $
+  s <- funSortM (getSort a') (getSort b')
+  pure $ El s $
     Pi (mapRelevance f $ defaultDom a') (NoAbs "_" b')
 
 gpi :: (MonadAddContext m, MonadDebug m)
@@ -62,7 +61,7 @@ hPi, nPi :: (MonadAddContext m, MonadDebug m)
 hPi = gpi $ setHiding Hidden defaultArgInfo
 nPi = gpi defaultArgInfo
 
-hPi', nPi' :: (MonadFail m, MonadAddContext m, MonadDebug m)
+hPi', nPi' :: (MonadAddContext m, MonadDebug m)
            => String -> NamesT m Type -> (NamesT m Term -> NamesT m Type) -> NamesT m Type
 hPi' s a b = hPi s a (bind' s (\ x -> b x))
 nPi' s a b = nPi s a (bind' s (\ x -> b x))
@@ -79,7 +78,7 @@ pPi' n phi b = toFinitePi <$> nPi' n (elSSet $ cl isOne <@> phi) b
 -- function.
 toFinitePi :: Type -> Type
 toFinitePi (El s (Pi d b)) = El s $ Pi
-  (setRelevance Irrelevant $ d { domIsFinite = True })
+  (setRelevance irrelevant d{ domIsFinite = True })
   b
 toFinitePi _ = __IMPOSSIBLE__
 
@@ -118,7 +117,7 @@ gApply' info a b = do
 (<@>),(<#>),(<..>) :: Applicative m => m Term -> m Term -> m Term
 (<@>) = gApply NotHidden
 (<#>) = gApply Hidden
-(<..>) = gApply' (setRelevance Irrelevant defaultArgInfo)
+(<..>) = gApply' defaultIrrelevantArgInfo
 
 (<@@>) :: Applicative m => m Term -> (m Term,m Term,m Term) -> m Term
 t <@@> (x,y,r) = do
@@ -182,6 +181,7 @@ lookupPrimitiveFunction x =
                 reportSDoc "tc.prim" 20 $ "Lookup of primitive function" <+> pretty x <+> "failed"
                 typeError $ NoSuchPrimitiveFunction (getBuiltinId x))
             (Map.lookup x primitiveFunctions)
+
 
 lookupPrimitiveFunctionQ :: QName -> TCM (PrimitiveId, PrimitiveImpl)
 lookupPrimitiveFunctionQ q = do

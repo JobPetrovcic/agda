@@ -4,9 +4,7 @@ module Agda.TypeChecking.Coverage.Cubical where
 
 import Prelude hiding (null, (!!))  -- do not use partial functions like !!
 
-import Control.Monad
-import Control.Monad.Except
-import Control.Monad.Trans ( lift )
+import Control.Monad.Except ( runExceptT )
 
 import qualified Data.Set as Set
 import Data.IntSet (IntSet)
@@ -33,6 +31,7 @@ import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope
 import Agda.TypeChecking.Telescope.Path
 
+import Agda.Utils.Either ( fromRight )
 import Agda.Utils.Functor
 import Agda.Utils.List
 import Agda.Utils.List1 ( pattern (:|) )
@@ -55,14 +54,8 @@ createMissingIndexedClauses :: QName
                             -> [Clause]
                             -> TCM ([(SplitTag,CoverResult)],[Clause])
 createMissingIndexedClauses f n x old_sc scs cs = do
-  reflId <- getName' builtinReflId
   let infos = [(c,i) | (SplitCon c, (_,TheInfo i)) <- scs ]
   case scs of
-    [(SplitCon c,(_newSc,i@TheInfo{}))] | Just c == reflId -> do
-      mc <- createMissingConIdClause f n x old_sc i
-      caseMaybe mc (return ([],cs)) $ \ ((sp,tree),cl) -> do
-      let res = CoverResult tree (IntSet.singleton (length cs)) [] [cl] IntSet.empty
-      return ([(sp,res)],snoc cs cl)
     xs | info:_ <- infos -> do
          reportSDoc "tc.cover.indexed" 20 $ text "size (xs,infos):" <+> pretty (size xs,size infos)
          reportSDoc "tc.cover.indexed" 20 $ text "xs :" <+> pretty (map fst xs)
@@ -107,12 +100,7 @@ covFillTele func tel face d j = do
   ed_f <- liftTCM $ runExceptT $ trFillTel tel face d j
   case ed_f of
     Right d_f -> pure $ map unArg d_f
-    Left failed_t -> enterClosure failed_t $ \failed_t -> addContext ("i" :: String, __DUMMY_DOM__) $ do
-      typeError . GenericDocError =<< vcat
-        [ "Could not generate a transport clause for" <+> prettyTCM func
-        , "because a term of type" <+> prettyTCM (unAbs failed_t)
-        , "lives in the sort" <+> prettyTCM (getSort (unAbs failed_t)) <+> "and thus can not be transported"
-        ]
+    Left failed_t -> typeError $ CannotGenerateTransportClause func failed_t
 
 createMissingTrXTrXClause :: QName -- ^ trX
                             -> QName -- ^ f defined
@@ -203,7 +191,7 @@ createMissingTrXTrXClause q_trX f n x old_sc = do
           bindNArg (teleArgNames $ unAbsN xTel) $ \ x -> do
           params <- pure params `applyN` (fmap unArg <$> g1)
           x      <- sequence x
-          s <- s `applyN` (map (pure . unArg) $ params ++ x)
+          s <- s `applyN` map (pure . unArg) (params ++ x)
           pure $ El s $ Def d [] `apply` (params ++ x)
     return $ (params, xTel,dT)
 
@@ -217,7 +205,7 @@ createMissingTrXTrXClause q_trX f n x old_sc = do
              bindNArg [defaultArg "x0"] $ \ x0 -> do
              param_args <- fmap (map (setHiding Hidden . fmap (unnamed . dotP))) $
                pure params `applyN` (fmap unArg <$> g1)
-             (phi:p) <- sequence phi_p
+             (phi, p) <- fromMaybe __IMPOSSIBLE__ . uncons <$> sequence phi_p
              x0 <- sequence x0
              pure $ DefP defaultPatternInfo q_trX $ param_args ++ p ++ [phi] ++ x0
       trX = (fmap . fmap . fmap) patternToTerm <$> trX'
@@ -242,7 +230,7 @@ createMissingTrXTrXClause q_trX f n x old_sc = do
     abstractN (xTelI `applyN` g1) $ \ p -> do
     abstractT "ψ" (pure interval) $ \ psi -> do
     abstractN (xTelI `applyN` g1) $ \ q -> do
-    abstractT "x0" (pure dT `applyN` g1 `applyN` (for q $ \ f -> f <@> pure iz)) $ \ x0 -> do
+    abstractT "x0" (pure dT `applyN` g1 `applyN` for q (\ f -> f <@> pure iz)) $ \ x0 -> do
     deltaPat g1 phi p psi q x0
 
   ps_ty_rhs <- runNamesT [] $ do
@@ -270,7 +258,7 @@ createMissingTrXTrXClause q_trX f n x old_sc = do
       base <- map defaultArg <$> appTel (sequence q) j
       u  <- liftM2 (,) (max j psi) $ bind "h" $ \ h -> do
               appTel (sequence p) (min j (min h i))
-      Right xs <- lift $ runExceptT $ transpSysTel' False ty [u] face base
+      xs <- fromRight __IMPOSSIBLE__ <$> do lift $ runExceptT $ transpSysTel' False ty [u] face base
       pure $ map unArg xs
     -- Ξ ⊢ pat_rec[0] = pat : D η v
     -- Ξ ⊢ pat_rec[1] = trX q4 (φ ∧ ψ) x0 : D η v
@@ -317,25 +305,29 @@ createMissingTrXTrXClause q_trX f n x old_sc = do
     -- Ξ ⊢ rhs := tr (i. old_t[γ1,x = pat_rec[~i], δ_f[~i]]) (φ ∧ ψ) w0 -- TODO plus sides.
     syspsi <- (open =<<) $ lam "i" $ \ i -> ilam "o" $ \ _ -> do
       c <- mkComp $ bindN ["i","j"] $ \ [i,j] -> do
-        Abs n (data_ty,lines) <- bind "k" $ \ k -> do
+        res <- bind "k" $ \ k -> do
           let phi_k = max phi (neg k)
           let p_k = for p $ \ p -> lam "h" $ \ h -> p <@> (min k h)
-          data_ty <- pure dT `applyN` g1 `applyN` (for p $ \ p -> p <@> k)
+          data_ty <- pure dT `applyN` g1 `applyN` for p (\ p -> p <@> k)
           line1 <- trX `applyN` g1 `applyN` (phi_k:p_k) `applyN` [x0]
 
           line2 <- trX `applyN` g1
-                       `applyN` (max phi_k j      : (for p_k $ \ p -> lam "h" $ \ h -> p <@> (max h j)))
+                       `applyN` (max phi_k j      : for p_k (\ p -> lam "h" $ \ h -> p <@> (max h j)))
                        `applyN`
                   [trX `applyN` g1
-                       `applyN` (max phi_k (neg j): (for p_k $ \ p -> lam "h" $ \ h -> p <@> (min h j)))
+                       `applyN` (max phi_k (neg j): for p_k (\ p -> lam "h" $ \ h -> p <@> (min h j)))
                        `applyN` [x0]]
-          pure (data_ty,[line1,line2])
-        data_ty <- open $ Abs n data_ty
-        [line1,line2] <- mapM (open . Abs n) lines
-        let sys = [(neg i, lam "k" $ \ k -> ilam "o" $ \ _ -> absApp <$> line2 <*> k)
-                  ,(neg j `max` j `max` i `max` phi, lam "k" $ \ k -> ilam "o" $ \ _ -> absApp <$> line1 <*> k)
-                  ]
-        transpSys data_ty sys (pure iz) x0
+          pure (data_ty, [line1, line2])
+        case res of
+          Abs n (data_ty, [line1, line2]) -> do
+            data_ty <- open $ Abs n data_ty
+            line1   <- open $ Abs n line1
+            line2   <- open $ Abs n line2
+            let sys = [(neg i, lam "k" $ \ k -> ilam "o" $ \ _ -> absApp <$> line2 <*> k)
+                      ,(neg j `max` j `max` i `max` phi, lam "k" $ \ k -> ilam "o" $ \ _ -> absApp <$> line1 <*> k)
+                      ]
+            transpSys data_ty sys (pure iz) x0
+          _ -> __IMPOSSIBLE__
       absApp <$> pure c <*> i
     sysphi <- (open =<<) $ lam "i" $ \ i -> ilam "o" $ \ o -> do
       c <- mkComp $ bindN ["i","j"] $ \ _ij -> do
@@ -356,9 +348,8 @@ createMissingTrXTrXClause q_trX f n x old_sc = do
                  , namedClausePats = ps
                  , clauseBody      = Just rhs
                  , clauseType      = Just $ Arg (getArgInfo ty) (unDom ty)
-                 , clauseCatchall    = False
-                 , clauseExact       = Nothing
-                 , clauseRecursive   = Just True
+                 , clauseCatchall    = empty
+                 , clauseRecursive   = YesRecursive
                  , clauseUnreachable = Just False
                  , clauseEllipsis    = NoEllipsis
                  , clauseWhereModule = Nothing
@@ -492,7 +483,7 @@ createMissingTrXHCompClause q_trX f n x old_sc = do
           bindNArg (teleArgNames $ unAbsN xTel) $ \ x -> do
           params <- pure params `applyN` (fmap unArg <$> g1)
           x      <- sequence x
-          s <- s `applyN` (map (pure . unArg) $ params ++ x)
+          s <- s `applyN` map (pure . unArg) (params ++ x)
           pure $ El s $ Def d [] `apply` (params ++ x)
     return $ (params, xTel,dT)
 
@@ -506,7 +497,7 @@ createMissingTrXHCompClause q_trX f n x old_sc = do
              bindNArg [defaultArg "x0"] $ \ x0 -> do
              param_args <- fmap (map (setHiding Hidden . fmap (unnamed . dotP))) $
                pure params `applyN` (fmap unArg <$> g1)
-             (phi:p) <- sequence phi_p
+             (phi, p) <- fromMaybe __IMPOSSIBLE__ . uncons <$> sequence phi_p
              x0 <- sequence x0
              pure $ DefP defaultPatternInfo q_trX $ param_args ++ p ++ [phi] ++ x0
       trX = (fmap . fmap . fmap) patternToTerm <$> trX'
@@ -514,7 +505,7 @@ createMissingTrXHCompClause q_trX f n x old_sc = do
     hcompD' g1 v =
         bindNArg [argH "psi",argN "u", argN "u0"] $ \ x0 -> do
         x0 <- sequence x0
-        Just (LEl l t) <- (toLType =<<) $ pure dT `applyN` g1 `applyN` v
+        LEl l t <- fromMaybe __IMPOSSIBLE__ <.> toLType =<< do pure dT `applyN` g1 `applyN` v
         let ty = map (fmap (unnamed . dotP) . argH) [Level l,t]
         pure $ DefP defaultPatternInfo q_hcomp $ ty ++ x0
   hcompD <- runNamesT [] $
@@ -624,9 +615,8 @@ createMissingTrXHCompClause q_trX f n x old_sc = do
                  , namedClausePats = ps
                  , clauseBody      = Just rhs
                  , clauseType      = Just $ Arg (getArgInfo ty) (unDom ty)
-                 , clauseCatchall    = False
-                 , clauseExact       = Nothing
-                 , clauseRecursive   = Just True
+                 , clauseCatchall    = empty
+                 , clauseRecursive   = YesRecursive
                  , clauseUnreachable = Just False
                  , clauseEllipsis    = NoEllipsis
                  , clauseWhereModule = Nothing
@@ -750,7 +740,7 @@ createMissingTrXConClause q_trX f n x old_sc c (UE gamma gamma' xTel u v rho tau
             bindNArg gammaArgNames $ \ g1_args -> do
             bindNArg ([defaultArg "phi"] ++ teleArgNames xTel) $ \ phi_p -> do
             let (g1,args) = splitAt gamma1_size g1_args
-            (phi:p) <- sequence phi_p
+            (phi, p) <- fromMaybe __IMPOSSIBLE__ . uncons <$> sequence phi_p
             args <- sequence args
             let cargs = defaultArg $ unnamed $ ConP chead noConPatternInfo args
             -- Amy (2022-11-06): Set the parameters to quantity-0.
@@ -859,9 +849,8 @@ createMissingTrXConClause q_trX f n x old_sc c (UE gamma gamma' xTel u v rho tau
                   , namedClausePats = ps
                   , clauseBody      = Just rhs
                   , clauseType      = Just $ Arg (getArgInfo ty) (unDom ty)
-                  , clauseCatchall    = False
-                  , clauseExact       = Nothing
-                  , clauseRecursive   = Just True
+                  , clauseCatchall    = empty
+                  , clauseRecursive   = YesRecursive
                   , clauseUnreachable = Just False
                   , clauseEllipsis    = NoEllipsis
                   , clauseWhereModule = Nothing
@@ -876,7 +865,7 @@ createMissingTrXConClause q_trX f n x old_sc c (UE gamma gamma' xTel u v rho tau
     ]
 
   let mod =
-        setRelevance Irrelevant $  -- See #5611.
+        setRelevance irrelevant $  -- See #5611.
         getModality $ fromMaybe __IMPOSSIBLE__ $ scTarget old_sc
   -- we follow what `cover` does when updating the modality from the target.
   applyModalityToContext mod $ do
@@ -885,237 +874,6 @@ createMissingTrXConClause q_trX f n x old_sc c (UE gamma gamma' xTel u v rho tau
     addContext cTel $ usableAtModality IndexedClause mod rhs
 
   return cl
-
--- | If given @TheInfo{}@ then assumes "x : Id u v" and
---   returns both a @SplittingDone@ for conId, and the @Clause@ that covers it.
-createMissingConIdClause :: QName         -- ^ function being defined
-                         -> Arg Nat       -- ^ @covSplitArg@ index
-                         -> BlockingVar   -- ^ @x@ variable being split on.
-                         -> SplitClause   -- ^ clause before split
-                         -> IInfo         -- ^ info from unification
-                         -> TCM (Maybe ((SplitTag,SplitTree),Clause))
-createMissingConIdClause f _n x old_sc (TheInfo info) = setCurrentRange f $ do
-  let
-    -- iΓ'
-    itel = infoTel
-    -- with 3 params, reflId : Id A u u -- no arguments.
-    -- iΓ' ⊢ iρ : Γ
-    --
-    -- Δ = Γ,φ,(p : u ≡ v) ⊢ iτ : iΓ'
-    -- ρ = iρ
-    -- τ = iτ
-    irho = infoRho info
-    itau = infoTau info
-    ileftInv = infoLeftInv info
-  interval <- elInf primInterval
-  tTrans  <- primTrans
-  tComp  <- fromMaybe __IMPOSSIBLE__ <$> getTerm' builtinComp
-  conId <- fromMaybe __IMPOSSIBLE__ <$> getName' builtinConId
-  let bindSplit (tel1,tel2) = (tel1,AbsN (teleNames tel1) tel2)
-  let
-      old_tel = scTel old_sc
-
-  -- old_tel = Γ(x: Id A u v)Δ
-  -- Γ(x: Id A u v)Δ ⊢ old_t
-  -- Γ ⊢ hdelta = (x : Id A u v)(δ : Δ)
-      pair@(_gamma,_hdelta@(ExtendTel hdom delta)) = splitTelescopeAt (size old_tel - (blockingVarNo x + 1)) old_tel
-      (gamma,hdelta) = bindSplit pair
-      old_t  = AbsN (teleNames old_tel) $ fromJust $ scTarget old_sc
-      old_ps = AbsN (teleNames old_tel) $ patternsToElims $ fromSplitPatterns $ scPats old_sc
-      old_ps' = AbsN (teleNames old_tel) $ fromSplitPatterns $ scPats old_sc
-
-  params <- runNamesT [] $ do
-    hdelta <- open hdelta
-    bindN (teleNames gamma) $ \ args -> do
-       hdelta@(ExtendTel hdom _) <- applyN hdelta args
-       Def _Id es@[_,_,_,_] <- reduce $ unEl $ unDom hdom
-       return $ map unArg $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
-
-  working_tel <- runNamesT [] $ do
-    hdelta <- open hdelta
-    params <- open params
-    abstractN (pure gamma) $ \ args -> do
-      pTel <- open =<< (lift $ pathTelescope (infoEqTel info) (map defaultArg $ infoEqLHS info) (map defaultArg $ infoEqRHS info))
-      abstractN (pure (telFromList [defaultDom ("phi",interval)] :: Telescope)) $ \ [phi] ->
-        abstractN pTel $ \ [p] -> do
-          [l,bA,x,y] <- mapM open =<< applyN params args
-          apply1 <$> applyN hdelta args <*> (cl primConId <#> l <#> bA <#> x <#> y <@> phi <@> p)
-  -- working_tel ⊢ i. γ[leftInv i]
-  (gamma_args_left :: Abs [Term], con_phi_p_left :: Abs Term) <- fmap (raise (size delta) . unAbsN) . runNamesT [] $ do
-    params <- open params
-    bindN (teleNames gamma ++ ["phi","p"]) $ \ args' -> do
-      let (args,[phi,p]) = splitAt (size gamma) args'
-      [l,bA,x,y] <- mapM open =<< applyN params args
-      gargs <- Abs "i" . applySubst ileftInv <$> sequence args
-      con_phi_p <- Abs "i" . applySubst ileftInv <$> do
-        (cl primConId <#> l <#> bA <#> x <#> y <@> phi <@> p)
-      return (gargs,con_phi_p)
-  ps <- fmap unAbsN . runNamesT [] $ do
-    old_ps' <- open $ old_ps'
-    params <- open params
-    bindN (teleNames working_tel) $ \ (wargs :: [NamesT TCM Term]) -> do
-      let (g,phi:p:d) = splitAt (size gamma) $ telePatterns working_tel []
-      params <- map (argH . unnamed . dotP) <$> applyN params (take (size gamma) wargs)
-      let x = DefP defaultPatternInfo conId $ params ++ [phi,p]
-      args <- open $ map namedArg g ++ [x] ++ map namedArg d
-      applyN' old_ps' args
-  -- tel = Γ',Δ[ρ,x = refl]
-  -- Γ' ⊢ ρ : Γ
-  -- Γ' ⊢ u[ρ] = v[ρ] : A[ρ]
-
-  -- Γ' ⊢ ρ,x=refl : Γ,(x : Id A u v)
-
-  -- Γ',Δ[ρ,x = refl] ⊢ old_t[ρ,x=refl] = Δ₂ -> t
-  -- Γ',Δ[ρ,x = refl] ⊢ f old_ps[ρ,x = refl] : old_t[ρ,x = refl]
-  -- Γ,(φ : I),(p : Path A u v) ⊢ τ : Γ'
-
-  -- Γ' ⊢ [ρ,x = refl u[ρ]] : Γ,(x : Id A u v)
-
-  -- Γ,(φ : I),(p : Path A u v) ⊢ [ρ,x = refl u[ρ]][τ] = [ρ[τ], x = refl u[ρ[τ]]] : Γ,(x : Id A u v)
-
-  -- Γ,(φ : I),(p : Path A u v) ⊢ leftInv : ρ[τ],i1,refl ≡ idS : Γ,(φ : I),(p : Path A u v)
-
-  -- Γ,(φ : I),(p : Path A u v)| (i : I) ⊢ leftInv i : Γ,(φ : I),(p : Path A u v)
-
-  -- Γ,(φ : I),(p : Path A u v) ⊢ leftInv i0 = ρ[τ],i1,refl : Γ,(φ : I),(p : Path A u v)
-  -- Γ,(φ : I),(p : Path A u v) ⊢ leftInv i1 = γ   ,φ ,p : Γ,(φ : I),(p : Path A u v)
-  --                      leftInv[φ = i1][i] = idS
-
-  -- Γ,(φ : I),(p : Path A u v),Δ[ρ,x = refl][τ] ⊢ τ' = liftS |Δ[ρ,x = refl]| τ : Γ',Δ[ρ,x = refl]
-
-  -- Γ,(φ : I),(p : Path A u v),Δ[ρ,x = refl][τ] ⊢
-  --            w = f old_ps[ρ[τ],x = refl u[ρ[τ]],δ] : old_t[ρ,x = refl][τ'] = old_t[ρ[τ],x = refl u[ρ[τ]],δ]
-
-  -- Γ,(φ : I),(p : Path A u v) | (i : I) ⊢ μ = ⟨φ,p⟩[leftInv (~i)] : (Id A u v)[γ[leftInv (~ i)]]
-  --                                     μ[0] = ⟨ φ             , p    ⟩
-  --                                     μ[1] = ⟨ 1             , refl ⟩
-
-  -- Γ,(φ : I),(p : Path A u v),(δ : Δ[x = ⟨ φ , p ⟩]) ⊢
-  --         δ_f[1] = vecTransp (i. Δ[γ[leftInv (~ i)], ⟨φ,p⟩[leftInv (~i)]]) φ δ : Δ[ρ[τ], x = refl u[ρ[τ]]]
-
-  -- Γ,(φ : I),(p : Path A u v),(δ : Δ[x = ⟨ φ , p ⟩]) ⊢ w[δ_f[1]] : old_t[ρ[τ],x = refl u[ρ[τ]],δ_f[1]]
-  -- Γ,(φ : I),(p : Path A u v),Δ[x = ⟨ φ , p ⟩] ⊢ rhs = transp (i. old_t[γ[leftInv i],x = ⟨φ,p⟩[leftInv i], δ_f[~i]]) φ (w[δ_f[1]]) : old_t[γ,x = ⟨ φ , p ⟩,δ]
-  let
-      getLevel t = do
-        s <- reduce $ getSort t
-        case s of
-          Type l -> pure (Level l)
-          s      -> do
-            reportSDoc "tc.cover.hcomp" 20 $ text "getLevel, s = " <+> prettyTCM s
-            typeError . GenericDocError =<<
-                    (text "The sort of" <+> prettyTCM t <+> text "should be of the form \"Set l\"")
-  (ty,rhs) <- addContext working_tel $ runNamesT [] $ do
-    let
-        raiseFrom :: Subst a => Telescope -> a -> a
-        raiseFrom tel x = raise (size working_tel - size tel) x
-        all_args = teleArgs working_tel :: Args
-        (gamma_args,phi:p:delta_args) = splitAt (size gamma) all_args
-    old_t <- open $ raiseFrom EmptyTel old_t
-    old_ps <- open $ raiseFrom EmptyTel old_ps
-    delta_args <- open delta_args
-    gamma_args_left <- open gamma_args_left
-    con_phi_p_left <- open con_phi_p_left
-    hdelta <- open $ raiseFrom gamma hdelta
-    delta_f <- bind "i" $ \ i -> do
-      apply1 <$> applyN' hdelta (lazyAbsApp <$> gamma_args_left <*> (cl primINeg <@> i)) <*> (lazyAbsApp <$> con_phi_p_left <*> (cl primINeg <@> i))
-    delta_f <- open delta_f
-    [phi,p] <- mapM (open . unArg) [phi,p]
-    delta_args_f <- bind "i" $ \ i -> do
-
-      m <- trFillTel' True <$> delta_f <*> phi <*> delta_args <*> i
-      either __IMPOSSIBLE__ id <$> (lift $ runExceptT m)
-    delta_args_f <- open delta_args_f
-    old_t_f <- (open =<<) $ bind "i" $ \ i -> do
-      g <- lazyAbsApp <$> gamma_args_left <*> i
-      x <- lazyAbsApp <$> con_phi_p_left <*> i
-      d <- lazyAbsApp <$> delta_args_f <*> (cl primINeg <@> i)
-      args <- open $ g ++ [x] ++ map unArg d
-      applyN' old_t args
-    w <- (open =<<) $ bind "i" $ \ i -> do
-      g <- lazyAbsApp <$> gamma_args_left <*> i
-      x <- lazyAbsApp <$> con_phi_p_left <*> i
-      d <- lazyAbsApp <$> delta_args_f <*> (cl primINeg <@> i)
-      args <- open $ g ++ [x] ++ map unArg d
-      Def f <$> applyN' old_ps args
-
-    ps <- open ps
-    max <- primIMax
-    iz <- primIZero
-    alphas <- (open =<<) $ do
-      vs <- iApplyVars <$> ps
-      neg <- primINeg
-      zero <- primIZero
-      return $ foldr (\ x r -> max `apply` [argN $ max `apply` [argN x, argN (neg `apply` [argN x])], argN r]) zero $ map var vs
-    sides <- (open =<<) $ do
-      neg <- primINeg
-      io <- primIOne
-      bind "i" $ \ i -> do
-        vs <- iApplyVars <$> ps
-        tm <- lazyAbsApp <$> w <*> i
-        xs <- forM vs $ \ v ->
-          -- have to reduce these under the appropriate substitutions, otherwise non-normalizing
-          fmap (var v,) . reduce $ (inplaceS v iz `applySubst` tm, inplaceS v io `applySubst` tm)
-        phiv <- fromMaybe __IMPOSSIBLE__ . deBruijnView <$> phi
-        -- extra assumption: phi |- w i = w 0, otherwise we need [ phi -> w 0 ] specifically
-        tm_phi <- reduce $ inplaceS phiv io `applySubst` tm
-        phi <- phi
-        return $ (phi,tm_phi) : concatMap (\(v,(l,r)) -> [(neg `apply` [argN v],l),(v,r)]) xs
-
-    let imax i j = apply max $ map argN [i,j]
-    tPOr <- fromMaybe __IMPOSSIBLE__ <$> getTerm' builtinPOr
-    let
-      pOr l ty phi psi u0 u1 = do
-          [phi,psi] <- mapM open [phi,psi]
-          pure tPOr <#> l
-                    <@> phi <@> psi
-                    <#> (ilam "o" $ \ _ -> ty) <@> noilam u0 <@> u1
-
-      noilam u = do
-         u <- open u
-         ilam "o" $ \ _ -> u
-
-      combine l ty [] = __IMPOSSIBLE__
-      combine l ty [(psi,u)] = noilam u
-      combine l ty ((psi,u):xs) = pOr l ty psi (foldr imax iz (map fst xs)) u (combine l ty xs)
-
-    let ty i = lazyAbsApp <$> old_t_f <*> i
-    l <- (open =<<) $ lam "i" $ \ i -> do
-           t <- unDom <$> ty i
-           lift $ getLevel t
-    ((,) <$> ty (cl primIOne) <*>) $ do
-         n <- length . unAbs <$> sides
-         -- TODO don't comp if the family and the sides "j. [ α ↦ u ]" are constant?
-         if n > 1 then
-           pure tComp <#> l <@> (lam "i" $ \ i -> unEl . unDom <$> ty i)
-                <@> (cl primIMax <@> phi <@> alphas)
-                <@> (lam "i" $ \ i -> combine (l <@> i) (unEl . unDom <$> ty i) =<< (lazyAbsApp <$> sides <*> i))
-                <@> (lazyAbsApp <$> w <*> primIZero)
-         else
-           pure tTrans <#> l <@> (lam "i" $ \ i -> unEl . unDom <$> ty i)
-                <@> phi
-                <@> (lazyAbsApp <$> w <*> primIZero)
-
-  reportSDoc "tc.cover.conid" 20 $ text "conid case for" <+> text (show f)
-  reportSDoc "tc.cover.conid" 20 $ text "tel =" <+> prettyTCM working_tel
-  reportSDoc "tc.cover.conid" 25 $ addContext working_tel $ prettyTCM rhs
-
-  let cl =   Clause { clauseLHSRange  = noRange
-                    , clauseFullRange = noRange
-                    , clauseTel       = working_tel
-                    , namedClausePats = ps
-                    , clauseBody      = Just $ rhs
-                    , clauseType      = Just $ Arg (domInfo ty) (unDom ty)
-                    , clauseCatchall    = False
-                    , clauseUnreachable = Just False  -- missing, thus, not unreachable
-                    , clauseRecursive   = Just False
-                    , clauseEllipsis    = NoEllipsis
-                    , clauseExact       = Nothing
-                    , clauseWhereModule = Nothing
-                    }
-  addClauses f [cl]
-  return $ Just ((SplitCon conId,SplittingDone (size working_tel)),cl)
-createMissingConIdClause f n x old_sc NoInfo = return Nothing
-
 
 {-
   OLD leftInv case
@@ -1175,14 +933,23 @@ createMissingHCompClause f n x old_sc (SClause tel ps _sigma' _cps (Just t)) cs 
       -- with Δ' and ps' introduced by fixTarget.
       -- So final clause will be:
       -- tel ⊢ ps ↦ rhs_we_define{wkS ..} ps'
+
       getLevel t = do
         s <- reduce $ getSort t
         case s of
           Type l -> pure (Level l)
-          s      -> do
-            reportSDoc "tc.cover.hcomp" 20 $ text "getLevel, s = " <+> prettyTCM s
-            typeError . GenericDocError =<<
-                    (text "The sort of" <+> prettyTCM t <+> text "should be of the form \"Set l\"")
+
+          -- Impossible since we only have HITs in Type:
+          s -> do
+            reportSDoc "tc.cover.hcomp" 20 $ vcat
+              [ "sort of blocking variable when creating hcomp clause is not Type"
+              , nest 2 ("t =" <+> prettyTCM t)
+              , nest 2 ("s =" <+> prettyTCM s)
+              , ""
+              , "clause:"
+              , nest 2 $ prettyTCM (QNamed f empty{ clauseTel = tel, namedClausePats = fromSplitPatterns ps })
+              ]
+            __IMPOSSIBLE__
 
       -- Γ ⊢ hdelta = (x : H)(δ : Δ)
       (gamma,hdelta@(ExtendTel hdom delta)) = splitTelescopeAt (size old_tel - (blockingVarNo x + 1)) old_tel
@@ -1267,7 +1034,10 @@ createMissingHCompClause f n x old_sc (SClause tel ps _sigma' _cps (Just t)) cs 
           lvl <- open =<< (lift . getLevel $ unDom hdom)
 
           -- Γ,φ,u,u0,Δ(x = hcomp phi u u0) ⊢
-          [phi,u,u0] <- mapM (open . raise (size delta) . var) [2,1,0]
+          let vr = open . raise (size delta) . var
+          phi <- vr 2
+          u   <- vr 1
+          u0  <- vr 0
           -- Γ,x,Δ ⊢ f old_ps
           -- Γ ⊢ abstract hdelta (f old_ps)
           g <- open $ raise (3 + size delta) $ abstract hdelta (Def f old_ps)
@@ -1314,8 +1084,9 @@ createMissingHCompClause f n x old_sc (SClause tel ps _sigma' _cps (Just t)) cs 
           b <- do
              sides <- forM alphab $ \ (psi,(side0,side1)) -> do
                 psi <- open $ hcompS `applySubst` psi
-
-                [side0, side1] <- mapM (open . raise (3 + size delta) . abstract hdelta) [side0, side1]
+                let f = open . raise (3 + size delta) . abstract hdelta
+                side0 <- f side0
+                side1 <- f side1
                 return $ (ineg psi `imax` psi, \ i -> pOr_ty i (ineg psi) psi (ilam "o" $ \ _ -> apply_delta_fill i $ side0 <@> hfill lvl htype phi u u0 i)
                                                             (ilam "o" $ \ _ -> apply_delta_fill i $ side1 <@> hfill lvl htype phi u u0 i))
              let recurse []           i = __IMPOSSIBLE__
@@ -1351,9 +1122,8 @@ createMissingHCompClause f n x old_sc (SClause tel ps _sigma' _cps (Just t)) cs 
                     , namedClausePats = fromSplitPatterns ps
                     , clauseBody      = Just $ rhs
                     , clauseType      = Just $ defaultArg t
-                    , clauseCatchall    = False
-                    , clauseExact       = Just True
-                    , clauseRecursive   = Nothing     -- TODO: can it be recursive?
+                    , clauseCatchall    = empty
+                    , clauseRecursive   = MaybeRecursive     -- TODO: can it be recursive?
                     , clauseUnreachable = Just False  -- missing, thus, not unreachable
                     , clauseEllipsis    = NoEllipsis
                     , clauseWhereModule = Nothing

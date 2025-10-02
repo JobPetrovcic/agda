@@ -14,19 +14,16 @@ import qualified Data.HashMap.Strict as HashMap
 ------------------------------------------------------------------------------
 -- Agda library imports
 
-import Agda.Interaction.FindFile ( SourceFile(..) )
 import Agda.Interaction.Imports ( typeCheckMain, Mode(TypeCheck), parseSource, CheckResult(CheckResult), crInterface )
 import Agda.Interaction.Options ( defaultOptions )
 
--- import Agda.Syntax.Translation.InternalToAbstract ( reify )
--- import Agda.Syntax.Translation.AbstractToConcrete ()
+import Agda.TypeChecking.Monad   (  TCM, Definition(..), Interface(..), Signature(..), runTCMTop
+                                  , setCommandLineOptions, srcFromPath, recomputeInverseScope, evalWithScope )
+import Agda.TypeChecking.Pretty  ( prettyTCM, (<+>), text )
 
-import Agda.TypeChecking.Monad
-import Agda.TypeChecking.Pretty
+import Agda.Utils.FileName       ( absolute )
 
-import Agda.Utils.FileName
-
-import Agda.Syntax.Common.Pretty (render)
+import Agda.Syntax.Common.Pretty (render )
 
 ------------------------------------------------------------------------------
 
@@ -38,13 +35,15 @@ main = do
 mainTCM :: TCM ()
 mainTCM = do
   setCommandLineOptions defaultOptions
-  f <- liftIO $ SourceFile <$> absolute "PrettyInterface.agda"
-  CheckResult { crInterface = i } <- typeCheckMain TypeCheck =<< parseSource f
+  f   <- liftIO $ absolute "PrettyInterface.agda"
+  src <- srcFromPath f
+  CheckResult { crInterface = i } <- typeCheckMain TypeCheck =<< parseSource src
   compilerMain i
 
 compilerMain :: Interface -> TCM ()
-compilerMain i = withScope_ (iInsideScope i) $ do -- withShowAllArguments $ disableDisplayForms $ do
-  let (Sig _secs defs _rews) = iSignature i
+compilerMain i = evalWithScope (iInsideScope i) $ do -- withShowAllArguments $ disableDisplayForms $ do
+  recomputeInverseScope
+  let Sig{_sigDefinitions = defs} = iSignature i
   forM_ (HashMap.toList defs) $ \ (q, def) -> do
     let t = defType def
     doc <- prettyTCM q <+> text ":" <+> prettyTCM t

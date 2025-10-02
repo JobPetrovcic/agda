@@ -4,22 +4,16 @@
 Emacs Mode
 **********
 
-Agda programs are commonly edited using `Emacs
-<http://www.gnu.org/software/emacs/>`_ which is explained in this
-section.  Other editors with interactive support for Agda include Atom
-(`agda-mode on Atom <https://atom.io/packages/agda-mode>`_), Visual
-Studio Code (`agda-mode on VS Code
-<https://github.com/banacorn/agda-mode-vscode>`_), and Vim (`agda-vim
-<https://github.com/derekelkins/agda-vim>`_).
+Agda programs can be edited in
+`Emacs <http://www.gnu.org/software/emacs/>`_ with support by the ``agda-mode``.
+To use it, first ensure
+you have :ref:`installed Agda <installation>` and the :ref:`Emacs agda-mode <install-agda-mode>`.
 
-To edit a module in Emacs (assuming you have :ref:`installed
-<installation>` Agda and the Emacs mode properly), open a file ending
-in ``.agda`` and load it by pressing ``C-c C-l`` (other commands are
-listed under :ref:`notation-for-key-combinations` below). This will
-apply syntax highlighting to the code and display any errors in a
-separate buffer. Agda uses certain background colors to indicate
-specific issues with the code, see :ref:`highlight` below.
-
+To edit a module in Emacs, open a file ending in ``.agda`` and load it by pressing
+``C-c C-l`` (other commands are listed under :ref:`notation-for-key-combinations`
+below). This will apply syntax highlighting to the code and display any errors in
+a separate buffer. Agda uses certain background colors to indicate specific issues
+with the code, see :ref:`highlight` below.
 
 Menus
 =====
@@ -105,6 +99,10 @@ weak-head normal forms.
 Global commands
 ~~~~~~~~~~~~~~~
 
+These commands can be invoked both from within or outside of a hole.
+When invoked from within a hole and whenever it makes sense,
+they limit their action to the hole and take context and content of the hole into account.
+
 :kbd:`C-c C-l`
      **L**\ oad file. This type-checks the contents of the file, and
      replaces each occurrence of a question mark ``?`` or a hole
@@ -115,49 +113,55 @@ Global commands
      ``main`` function using a given backend (the ``GHC`` backend is
      used by default).
 
+:kbd:`C-c C-i`
+     Call a given backend's top-level (or hole) **i**\ nteraction command (if any).
+
 :kbd:`C-c C-x C-q`
-     **Q**\ uit, kill the Agda process
+     **Q**\ uit, kill the Agda process.
 
 :kbd:`C-c C-x C-r`
-     Kill and **r**\ estart the Agda process
+     Kill and **r**\ estart the Agda process.
+
+:kbd:`C-c C-x C-s`
+     **S**\ witch to a different Agda version.
 
 :kbd:`C-c C-x C-a`
-     **A**\ bort a command
+     **A**\ bort a command.
 
 :kbd:`C-c C-x C-d`
-     Remove goals and highlighting (**d**\ eactivate)
+     Remove goals and highlighting (**d**\ eactivate).
 
 :kbd:`C-c C-x C-h`
-     Toggle display of **h**\ idden arguments
+     Toggle display of **h**\ idden arguments.
 
 :kbd:`C-c C-x C-i`
-     Toggle display of **i**\ rrelevant arguments
-
-:kbd:`C-c C-=`
-     Show constraints
-
-:kbd:`C-c C-s`
-     **S**\ olve constraints
-
-:kbd:`C-c C-?`
-     Show all goals
+     Toggle display of **i**\ rrelevant arguments.
 
 :kbd:`C-c C-f`
-     Move to next goal (**f**\ orward)
+     Move to next goal (**f**\ orward).
 
 :kbd:`C-c C-b`
-     Move to previous goal (**b**\ ackwards)
+     Move to previous goal (**b**\ ackwards).
+
+:kbd:`C-c C-?`
+     Show all goals.
+
+:kbd:`C-c C-=`
+     Show constraints.
+
+:kbd:`C-c C-s`
+     **S**\ olve constraints.
+     Tries to fill holes with existing meta variable solutions
+     (as displayed by :kbd:`C-c C-=`).
+
+:kbd:`C-c C-a`
+     :ref:`auto`
+     Tries to fill holes by **a**\ utomatic type-directed term synthesis.
 
 :kbd:`C-c C-d`
      Infer (**d**\ educe) type. The system asks for a term and infers
      its type.  When executed inside a hole, it will instead take the
      contents of the hole as input (if any).
-
-:kbd:`C-c C-o`
-     M\ **o**\ dule c\ **o**\ ntents
-
-:kbd:`C-c C-z`
-     :ref:`search-about`
 
 :kbd:`C-c C-n`
      Compute **n**\ ormal form. The system asks for a term which is
@@ -165,21 +169,33 @@ Global commands
      the contents of the hole as input (if any).
 
 :kbd:`C-u C-c C-n`
-     Compute normal form, ignoring ``abstract``
+     Compute normal form,
+     ignoring :ref:`abstract <abstract-definitions>` and :ref:`NON_TERMINATING <non_terminating-pragma>`.
 
 :kbd:`C-u C-u C-c C-n`
-     Compute and print normal form of ``show <expression>``
+     Compute and print normal form of ``show <expression>``.
+
+:kbd:`C-u C-u C-u C-c C-n`
+     Compute weak head normal form.
+
+:kbd:`C-c C-o`
+     Display c\ **o**\ ntents of the given m\ **o**\ dule.
+
+:kbd:`C-c C-w`
+     **W**\ hy in scope, given a defined name returns how it was brought into scope and its definition.
+
+:kbd:`C-c C-z`
+     :ref:`search-about`
 
 :kbd:`C-c C-x M-;`
-     Comment/uncomment rest of buffer
-
-:kbd:`C-c C-x C-s`
-     Switch to a different Agda version
+     Comment/uncomment rest of buffer.
 
 .. _emacs-context-sensitive-commands:
 
 Commands in context of a goal
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following commands only work (and make sense) inside of a hole.
 
 Commands expecting input (for example which variable to case split)
 will either use the text inside the goal or ask the user for input.
@@ -199,9 +215,6 @@ will either use the text inside the goal or ask the user for input.
      Elaborate and Give (fill goal with normalized expression).
      Takes the same ``C-u`` prefixes as ``C-c C-n``.
 
-:kbd:`C-c C-a`
-     :ref:`auto`
-
 :kbd:`C-c C-c`
      **C**\ ase split. If the cursor is positioned in a hole which
      denotes the right hand side of a definition, then this command
@@ -218,16 +231,13 @@ will either use the text inside the goal or ask the user for input.
 
 :kbd:`C-c C-h`
      Compute type of **h**\ elper function and add type
-     signature to kill ring (clipboard)
+     signature to kill ring (clipboard).
 
 :kbd:`C-c C-t`
-     Goal **t**\ ype
+     Goal **t**\ ype.
 
 :kbd:`C-c C-e`
-     Context (**e**\ nvironment)
-
-:kbd:`C-c C-d`
-     Infer (**d**\ educe) type
+     Context (**e**\ nvironment).
 
 :kbd:`C-c C-,`
      Goal type and context. Shows the goal type, i.e. the type
@@ -235,46 +245,31 @@ will either use the text inside the goal or ask the user for input.
      defined identifiers.
 
 :kbd:`C-c C-.`
-     Goal type, context and inferred type
+     Goal type, context and inferred type.
 
 :kbd:`C-c C-;`
-     Goal type, context and checked term
-
-:kbd:`C-c C-o`
-     M\ **o**\ dule c\ **o**\ ntents
-
-:kbd:`C-c C-n`
-     Compute **n**\ ormal form
-
-:kbd:`C-u C-c C-n`
-     Compute normal form, ignoring ``abstract``
-
-:kbd:`C-u C-u C-c C-n`
-     Compute and print normal form of ``show <expression>``
-
-:kbd:`C-c C-w`
-     Why in scope, given a defined name returns how it was brought into scope and its definition
+     Goal type, context and checked term.
 
 Other commands
 ~~~~~~~~~~~~~~
 
 :kbd:`TAB`
-     Indent current line, cycles between points
+     Indent current line, cycles between points.
 
 :kbd:`S-TAB`
-     Indent current line, cycles in opposite direction
+     Indent current line, cycles in opposite direction.
 
 :kbd:`M-.`
-     Go to definition of identifier under point
+     Go to definition of identifier under point.
 
 :guilabel:`Middle mouse button`
-     Go to definition of identifier clicked on
+     Go to definition of identifier clicked on.
 
 :kbd:`M-*`
-     Go back (Emacs < 25.1)
+     Go back (Emacs < 25.1).
 
 :kbd:`M-,`
-     Go back (Emacs ≥ 25.1)
+     Go back (Emacs ≥ 25.1).
 
 .. _unicode-input:
 

@@ -1,9 +1,7 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE GADTs                #-}
 {-# LANGUAGE DataKinds            #-}
 {-# LANGUAGE PolyKinds            #-}
-{-# LANGUAGE TypeOperators        #-}
 
 -- We need undecidable instances for the definition of @Foldr@,
 -- and @Domains@ and @CoDomain@ using @If@ for instance.
@@ -59,12 +57,24 @@ data ConsMap1 :: (Function k l -> Type) -> k -> Function [l] [l] -> Type
 type instance Apply (ConsMap0 f)    a = ConsMap1 f a
 type instance Apply (ConsMap1 f a) tl = Apply f a ': tl
 
-type family Constant (b :: l) (as :: [k]) :: [l] where
+type family Constant (b :: Type) (as :: [k]) :: [Type] where
   Constant b as = Map (Constant1 b) as
 
 ------------------------------------------------------------------
 -- TYPE FORMERS
 ------------------------------------------------------------------
+
+data Nat = Zero | Suc Nat
+
+type family Arity t :: Nat where
+  Arity (a -> b) = 'Suc (Arity b)
+  Arity a        = 'Zero
+
+type family IsZero (n :: Nat) :: Bool where
+  IsZero 'Zero = 'True
+  IsZero _     = 'False
+
+type IsBase t = IsZero (Arity t)
 
 -- | @Arrows [a1,..,an] r@ corresponds to @a1 -> .. -> an -> r@
 -- | @Products [a1,..,an]@ corresponds to @(a1, (..,( an, ())..))@
@@ -83,11 +93,6 @@ strictUncurry :: (a -> b -> c) -> (StrictPair a b -> c)
 strictUncurry f = \ !(Pair a b) -> f a b
 {-# INLINE strictUncurry #-}
 
--- | @IsBase t@ is @'True@ whenever @t@ is *not* a function space.
-
-type family IsBase (t :: Type) :: Bool where
-  IsBase (a -> t) = 'False
-  IsBase a        = 'True
 
 -- | Using @IsBase@ we can define notions of @Domains@ and @CoDomains@
 --   which *reduce* under positive information @IsBase t ~ 'True@ even

@@ -39,15 +39,14 @@ import Agda.Utils.Lens
 -- saturated unfolding sets.
 saturateOpaqueBlocks
   :: forall m. (MonadTCState m, ReadTCState m, MonadFresh OpaqueId m, MonadDebug m, MonadTrace m, MonadWarning m, MonadIO m)
-  => [A.Declaration]
-  -> m ()
-saturateOpaqueBlocks moddecs = entry where
+  => m ()
+saturateOpaqueBlocks = entry where
   entry = do
     known   <- useTC stOpaqueBlocks
     inverse <- useTC stOpaqueIds
     OpaqueId _ ourmod <- fresh
 
-    canonical <- useTC stCopiedNames
+    canonical  <- fmap snd <$> useTC stCopiedNames
     backcopies <- useTC stNameCopies
 
     reportSDoc "tc.opaque.copy" 45 $ "Canonical names of copied definitions:" $+$ pretty (HashMap.toList canonical)

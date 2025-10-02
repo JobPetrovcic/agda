@@ -1,16 +1,25 @@
+{-# LANGUAGE BlockArguments            #-}
 {-# LANGUAGE FlexibleContexts          #-}
 {-# LANGUAGE LambdaCase                #-}
 {-# LANGUAGE NamedFieldPuns            #-}
 {-# LANGUAGE OverloadedStrings         #-}
+{-# LANGUAGE RecordWildCards           #-}
 
 module Main ( main ) where
 
+import Control.Monad
+import Data.Bifunctor  ( bimap )
+import Data.Char       ( isSpace )
 import Data.Foldable
--- import Data.List ( intercalate )
+import Data.Functor
+import Data.List       ( partition )
 import Data.Maybe
-import Data.Text (Text)
+import Data.Text ( Text )
 import qualified Data.Text as Text
 import qualified Data.ByteString.Char8 as BS
+
+import Data.Set (Set)
+import qualified Data.Set as Set
 
 import qualified Data.Vector as V
 
@@ -35,6 +44,9 @@ import GitHub.Data.Issues
          , issueTitle
          )
   )
+import GitHub.Data.Id
+  ( Id
+  )
 import GitHub.Data.Name
   ( Name( N )
   , untagName
@@ -55,6 +67,9 @@ import GitHub.Endpoints.Issues.Milestones
   )
 import GitHub.Endpoints.Issues
   ( issuesForRepoR
+  )
+import GitHub.Endpoints.PullRequests
+  ( isPullRequestMergedR
   )
 import GitHub.Request
   ( github
@@ -92,18 +107,21 @@ usage = do
 debugPrint :: String -> IO ()
 debugPrint = hPutStrLn stderr
 
-issueLabelsNames :: Issue -> [Text]
+type Label = Text
+
+issueLabelsNames :: Issue -> [Label]
 issueLabelsNames i = map (untagName . labelName) $ V.toList $ issueLabels i
 
 -- Please keep the labels in the list in alphabetic order!
-labelsNotInChangelog :: [Text]
-labelsNotInChangelog =
+labelsNotInChangelog :: Set Label
+labelsNotInChangelog = Set.fromList
   [ "Makefile"
   , "agda-bisect"
   , "bug-tracker"
   , "closed-issues-for-milestone"
-  , "devx"
   , "debug"
+  , "dev: hlint"
+  , "devx"
   , "documented-in-changelog"
   , "faq"
   , "fix-agda-whitespace"
@@ -128,6 +146,67 @@ labelsNotInChangelog =
   , "type: task"
   , "typo"
   ]
+
+-- | Classification of issues.
+--
+-- We filter issues by the following criteria:
+-- 1. Correct milestone or wrong milestone (the latter should be impossible).
+-- 2. Issue or PR.
+-- 3. Happened (regular close or merge) or didn't happen (close as not planned or closed without merge).
+-- 4. Should be listed or not (in the latter case, give the labels that indicate it should not be listed).
+
+data Class = Class
+  { correctMilestone :: Bool       -- ^ False if milestone is not the one we requested.
+  , isIssue          :: Bool       -- ^ False if PR.
+  , happened         :: Bool       -- ^ False if closed as not planned or closed without merge.
+  , goodLabels       :: Set Label  -- ^ Labels that do not affect inclusion in changelog.
+  , badLabels        :: Set Label  -- ^ Labels that prevent inclusion in changelog
+  }
+
+-- | Issue enriched with its classification.
+--
+data ClassifiedIssue = ClassifiedIssue
+  { theIssue   :: Issue
+  , issueClass :: Class
+  }
+
+-- | This classifies issue numbers,
+--   but the field 'happened' is only set correctly for issues, not for milestones.
+--
+classifyIssue :: Id Milestone -> Issue -> Class
+classifyIssue mileStoneId i = Class{..}
+  where
+  correctMilestone        = maybe False ((mileStoneId ==) . milestoneNumber) $ issueMilestone i
+  isIssue                 = isNothing $ issuePullRequest i
+  happened                = maybe True (StateReasonNotPlanned /=) $ issueStateReason i
+  (badLabels, goodLabels) = bimap Set.fromList Set.fromList $
+     partition (`Set.member` labelsNotInChangelog) $ issueLabelsNames i
+
+-- | Delete trailing whitespace from issue
+sanitizeIssue :: Issue -> Issue
+sanitizeIssue i = i{ issueTitle = trim $ issueTitle i }
+  where
+    trim = Text.dropWhileEnd isSpace
+
+-- | Format issue in markdown for printing.
+--
+printIssue :: Issue -> String
+printIssue Issue{ issueNumber, issueTitle, issuePullRequest } = do
+  let n = show $ unIssueNumber issueNumber
+  let issuePR = if isNothing issuePullRequest then "Issue" else "PR"
+  concat
+    [ "[", issuePR, " #", n, "]"
+    , "(https://github.com/", theRepo, "/issues/", n, ")"
+    , ": ", Text.unpack issueTitle
+    ]
+
+debugPrintIssues :: [ClassifiedIssue] -> String -> IO ()
+debugPrintIssues is title =
+  unless (null is) do
+    debugPrint title
+    forM_ is $ \ (ClassifiedIssue i _c) -> debugPrint $ "- " ++ printIssue i
+    debugPrint ""
+
 
 -- | Retrieve closed issues for the given milestone and print as csv to stdout.
 run :: Text -> IO ()
@@ -156,45 +235,47 @@ run mileStoneTitle = do
   -- and pull requests when using the function 'issuesForRepo''.
   issueVector <- crashOr $ github auth $ issuesForRepoR (N owner) (N repo) issueFilter FetchAll
 
-  -- Filter by issues, milestone, reason for closure, and labels.
-  let issues :: [Issue]
-      issues = reverse
-        [ i
-        | i <- toList issueVector
+  -- Classify issues and remove trailing whitespace from the issue title.
+  let issues0 :: [ClassifiedIssue]
+      issues0 = reverse (toList issueVector) <&> \ i ->
+        ClassifiedIssue (sanitizeIssue i) (classifyIssue mileStoneId i)
 
-        -- Filter out PRs
-        , isNothing $ issuePullRequest i
+  -- We progressively filter out issue numbers not included in changelog.
 
-        -- Filter out "Closed as not planned"
-        , maybe True (StateReasonNotPlanned /=) $ issueStateReason i
+  -- Filter out issues/PRs with wrong milestone:
+  let (issues1, wrongMilestone) = partition (correctMilestone . issueClass) issues0
+  debugPrintIssues wrongMilestone "Issues/PR with wrong milestone:"
 
-        -- Filter out wrong milestones
-        , m <- maybeToList $ issueMilestone i
-        , milestoneNumber m == mileStoneId
+  -- Filter out issues that were "Closed as not planned"
+  let (issues2, didNotHappen) = partition (happened . issueClass) issues1
+  debugPrintIssues didNotHappen "Issues closed as not planned"
 
-        -- Filter out "not in changelog" issues
-        , not $ any (`elem` issueLabelsNames i) labelsNotInChangelog
-        ]
+  -- Find out which PRs were closed without merging
+  issues3 <- forM issues2 $ \ ic@(ClassifiedIssue i c) -> do
+    if isIssue c then pure ic else do
+      merged <- crashOr $ github auth $ isPullRequestMergedR (N owner) (N repo) (issueNumber i)
+      pure (ClassifiedIssue i c{ happened = merged })
 
-  debugPrint $ unwords
-    [ "Found", show (length issues), "closed issues tagged with milestone", Text.unpack mileStoneTitle ]
+  -- Filter out PRs that were closed without merging
+  let (issues4, notMerged) = partition (happened . issueClass) issues3
+  debugPrintIssues notMerged "PRs closed without merging"
 
-  -- Print issues.
+  -- Filter out issues/PRs that have a bad label
+  let (issues5, badLabel)  = partition (Set.null . badLabels . issueClass) issues4
+  debugPrintIssues badLabel "Issues/PRs that have a label excluding them from the changelog"
 
-  forM_ issues $ \ Issue{ issueNumber, issueTitle } -> do
-    let n = unIssueNumber issueNumber
-    putStrLn $
-      "- [#" ++ show n
-     ++ "](https://github.com/" ++ theRepo ++ "/issues/" ++ show n
-     ++ "): " ++ Text.unpack issueTitle
+  -- Print issues and PRs.
 
-  -- TODO: output tsv
-  --
-  -- forM_ issues $ \ Issue{ issueNumber, issueTitle } -> do
-  --   putStrLn $ intercalate "\t" $
-  --     [ show issueNumber
-  --     , Text.unpack issueTitle
-  --     ]
+  let ms = Text.unpack mileStoneTitle
+  if null issues5 then debugPrint $
+    "No matching closed issues or PRs in milestone " ++ ms
+  else do
+    let (issues, prs) = partition (isIssue . issueClass) issues5
+    debugPrintIssues issues $ "Issues for closed for milestone " ++ ms
+    debugPrintIssues prs $ "PRs for closed for milestone " ++ ms
+    forM_ issues $ \ ic -> putStrLn $ "- " ++ printIssue (theIssue ic)
+    forM_ prs    $ \ ic -> putStrLn $ "- " ++ printIssue (theIssue ic)
+
 
 -- | Crash on exception.
 crashOr :: Show e => IO (Either e a) -> IO a

@@ -9,14 +9,18 @@ import qualified Control.Exception as E
 
 import Control.Monad.Except
 import Control.Monad.State
-import Control.Monad.Writer        ( WriterT, MonadWriter, tell )
+import Control.Monad.Writer        ( WriterT, runWriterT, MonadWriter, tell )
 import Control.Monad.IO.Class      ( MonadIO(..) )
 
 import Data.Bifunctor              ( first , second )
+import Data.Char                   ( isDigit )
+import Data.Function               ( (&), on )
+import Data.Hashable               ( Hashable )
+import qualified Data.List         as List
 import Data.Map                    ( Map )
 import qualified Data.Map          as Map
-import Data.Semigroup              ( Semigroup(..) )
 import Data.Text                   ( Text, unpack )
+import qualified Data.Text         as T
 
 import GHC.Generics                ( Generic )
 
@@ -24,17 +28,58 @@ import System.Directory
 
 import Agda.Interaction.Options.Warnings
 
+import Agda.Syntax.Common.Pretty
 import Agda.Syntax.Position
 
+import Agda.Utils.IO               ( showIOException )
 import Agda.Utils.Lens
+import Agda.Utils.List             ( chopWhen )
 import Agda.Utils.List1            ( List1, toList )
 import Agda.Utils.List2            ( List2, toList )
+import qualified Agda.Utils.List1  as List1
 import Agda.Utils.Null
-import Agda.Syntax.Common.Pretty
 
 -- | A symbolic library name.
 --
-type LibName = String
+--   Library names are structured into the base name and a suffix of version
+--   numbers, e.g. @mylib-1.2.3@.  The version suffix is optional.
+data LibName = LibName
+  { libNameBase    :: Text
+      -- ^ Actual library name.
+  , libNameVersion :: [Integer]
+      -- ^ Major version, minor version, subminor version, etc., all non-negative.
+  } deriving (Eq, Show, Generic)
+
+-- | In comparisons, a missing version number is assumed to be infinity.
+--   E.g. @foo > foo-2.2 > foo-2.0.1 > foo-2 > foo-1.0@.
+instance Ord LibName where
+  compare = compare `on` versionMeasure
+    where
+      versionMeasure :: LibName -> (Text, Bool, [Integer])
+      versionMeasure (LibName rx vs) = (rx, null vs, vs)
+
+instance Pretty LibName where
+  pretty = \case
+    LibName base [] -> pretty base
+    LibName base vs -> hcat [ pretty base, "-", text $ List.intercalate "." $ map show vs ]
+
+-- | Split a library name into basename and a list of version numbers.
+--
+--   > parseLibName "foo-1.2.3"    == LibName "foo" [1, 2, 3]
+--   > parseLibName "foo-01.002.3" == LibName "foo" [1, 2, 3]
+--
+--   Note that because of leading zeros, @parseLibName@ is not injective.
+--   (@prettyShow . parseLibName@ would produce a normal form.)
+parseLibName :: String -> LibName
+parseLibName s =
+  case span (\ c -> isDigit c || c == '.') (reverse s) of
+    (v, '-' : x) | valid vs ->
+      LibName (T.pack $ reverse x) $ reverse $ map (read . reverse) vs
+      where
+        vs = chopWhen (== '.') v
+        valid [] = False
+        valid vs = not $ any null vs
+    _ -> LibName (T.pack s) []
 
 data LibrariesFile = LibrariesFile
   { lfPath   :: FilePath
@@ -42,11 +87,12 @@ data LibrariesFile = LibrariesFile
   , lfExists :: Bool
        -- ^ The libraries file might not exist,
        --   but we may print its assumed location in error messages.
-  } deriving (Show)
+  } deriving (Show, Generic)
 
 -- | A symbolic executable name.
 --
 type ExeName = Text
+type ExeMap  = Map ExeName FilePath
 
 data ExecutablesFile = ExecutablesFile
   { efPath   :: FilePath
@@ -60,18 +106,18 @@ data ExecutablesFile = ExecutablesFile
 --   should count as a project root.
 --
 libNameForCurrentDir :: LibName
-libNameForCurrentDir = "."
+libNameForCurrentDir = LibName "." []
 
 -- | A file can either belong to a project located at a given root
---   containing one or more .agda-lib files, or be part of the default
---   project.
+--   containing an .agda-lib file, or be part of the default project.
 data ProjectConfig
   = ProjectConfig
     { configRoot         :: FilePath
-    , configAgdaLibFiles :: [FilePath]
+        -- ^ Directory which contains the @.agda-lib@ file for the current project.
+    , configAgdaLibFile  :: FilePath
+        -- ^ @.agda-lib@ file relative to 'configRoot' (filename only, no directory).
     , configAbove        :: !Int
-      -- ^ How many directories above the Agda file is the @.agda-lib@
-      -- file located?
+        -- ^ How many directories above the Agda file is the @.agda-lib@ file located?
     }
   | DefaultProjectConfig
   deriving Generic
@@ -124,7 +170,7 @@ data AgdaLibFile = AgdaLibFile
 
 emptyLibFile :: AgdaLibFile
 emptyLibFile = AgdaLibFile
-  { _libName     = ""
+  { _libName     = empty
   , _libFile     = ""
   , _libAbove    = 0
   , _libIncludes = []
@@ -132,7 +178,18 @@ emptyLibFile = AgdaLibFile
   , _libPragmas  = mempty
   }
 
--- | Lenses for AgdaLibFile
+---------------------------------------------------------------------------
+-- * Lenses
+---------------------------------------------------------------------------
+
+-- ** Lenses for 'ProjectConfig'
+
+lensConfigAbove :: Lens' ProjectConfig Int
+lensConfigAbove f = \case
+  DefaultProjectConfig -> DefaultProjectConfig <$ f 0
+  c@ProjectConfig{} -> f (configAbove c) <&> \ !i -> c{ configAbove = i }
+
+-- ** Lenses for 'AgdaLibFile'
 
 libName :: Lens' AgdaLibFile LibName
 libName f a = f (_libName a) <&> \ x -> a { _libName = x }
@@ -187,6 +244,7 @@ libraryWarningName (LibWarning c (UnknownField{})) = LibUnknownField_
 -- * Errors
 
 data LibError = LibError (Maybe LibPositionInfo) LibError'
+  deriving (Show, Generic)
 
 -- | Collected errors while processing library files.
 --
@@ -197,8 +255,10 @@ data LibError'
       -- ^ Raised when a library name could not successfully be resolved
       --   to an @.agda-lib@ file.
       --
-  | AmbiguousLib LibName [AgdaLibFile]
+  | AmbiguousLib LibName (List2 AgdaLibFile)
       -- ^ Raised when a library name is defined in several @.agda-lib files@.
+  | SeveralAgdaLibFiles FilePath (List2 FilePath)
+      -- ^ The given project root contains more than one @.agda-lib@ file.
   | LibParseError LibParseError
       -- ^ The @.agda-lib@ file could not be parsed.
   | ReadError
@@ -215,7 +275,7 @@ data LibError'
         -- ^ Name of the executable that is defined twice.
       (List2 (LineNumber, FilePath))
         -- ^ The resolutions of the executable.
-  -- deriving (Show)
+  deriving (Show, Generic)
 
 -- | Exceptions thrown by the @.agda-lib@ parser.
 --
@@ -237,6 +297,7 @@ data LibParseError
       -- ^ At the given line number, the given field is not followed by @:@.
   | ContentWithoutField LineNumber
       -- ^ At the given line number, indented text (content) is not preceded by a field.
+  deriving (Show, Generic)
 
 -- ** Raising warnings and errors
 
@@ -265,43 +326,58 @@ raiseErrors = tell . map Left . toList
 --
 type LibErrorIO = WriterT LibErrWarns (StateT LibState IO)
 
--- | Throws 'Doc' exceptions, still collects 'LibWarning's.
-type LibM = ExceptT Doc (WriterT [LibWarning] (StateT LibState IO))
+-- | Throws 'LibErrors' exceptions, still collects 'LibWarning's.
+type LibM = ExceptT LibErrors (WriterT [LibWarning] (StateT LibState IO))
+
+type LibState = LibCache
 
 -- | Cache locations of project configurations and parsed @.agda-lib@ files.
-type LibState =
-  ( Map FilePath ProjectConfig
-  , Map FilePath AgdaLibFile
-  )
+data LibCache = LibCache
+  { projectConfigs :: !(Map FilePath ProjectConfig)
+      -- ^ Map from directories to paths of closest enclosing @.agda-lib@
+      --   files (or 'DefaultProjectConfig' if there are none).
+  , agdaLibFiles   :: !(Map FilePath AgdaLibFile)
+      -- ^ Contents of @.agda-lib@ files that have already been parsed.
+  }
+  deriving (Generic)
+
+-- | Collected errors when processing an @.agda-lib@ file.
+--
+data LibErrors = LibErrors
+  { libErrorsInstalledLibraries :: [AgdaLibFile]
+  , libErrors                   :: List1 LibError
+  } deriving (Show, Generic)
+
+runLibM :: LibM a -> LibState -> IO ((Either LibErrors a, [LibWarning]), LibState)
+runLibM m s = m & runExceptT & runWriterT & (`runStateT` s)
 
 getCachedProjectConfig
   :: (MonadState LibState m, MonadIO m)
   => FilePath -> m (Maybe ProjectConfig)
 getCachedProjectConfig path = do
   path <- liftIO $ canonicalizePath path
-  cache <- gets fst
-  return $ Map.lookup path cache
+  Map.lookup path <$> gets projectConfigs
 
 storeCachedProjectConfig
   :: (MonadState LibState m, MonadIO m)
   => FilePath -> ProjectConfig -> m ()
 storeCachedProjectConfig path conf = do
   path <- liftIO $ canonicalizePath path
-  modify $ first $ Map.insert path conf
+  modify \ s -> s { projectConfigs = Map.insert path conf $ projectConfigs s }
 
 getCachedAgdaLibFile
   :: (MonadState LibState m, MonadIO m)
   => FilePath -> m (Maybe AgdaLibFile)
 getCachedAgdaLibFile path = do
   path <- liftIO $ canonicalizePath path
-  gets $ Map.lookup path . snd
+  Map.lookup path <$> gets agdaLibFiles
 
 storeCachedAgdaLibFile
   :: (MonadState LibState m, MonadIO m)
   => FilePath -> AgdaLibFile -> m ()
 storeCachedAgdaLibFile path lib = do
   path <- liftIO $ canonicalizePath path
-  modify $ second $ Map.insert path lib
+  modify \ s -> s { agdaLibFiles = Map.insert path lib $ agdaLibFiles s }
 
 ------------------------------------------------------------------------
 -- * Prettyprinting errors and warnings
@@ -314,6 +390,12 @@ formatLibError installed (LibError mc e) =
     (Just c, LibParseError err) -> sep  [ formatLibPositionInfo c err, pretty e ]
     (_     , LibNotFound{}    ) -> vcat [ pretty e, prettyInstalledLibraries installed ]
     _ -> pretty e
+
+
+-- | Pretty-print 'LibErrors'.
+formatLibErrors :: LibErrors -> Doc
+formatLibErrors (LibErrors libs errs) =
+  vcat $  map (formatLibError libs) $ List1.toList errs
 
 -- | Does a parse error contain a line number?
 hasLineNumber :: LibParseError -> Maybe LineNumber
@@ -369,7 +451,7 @@ prettyInstalledLibraries installed =
   vcat $ ("Installed libraries:" :) $
     map (nest 2) $
     if null installed then ["(none)"]
-    else [ sep [ text $ _libName l, nest 2 $ parens $ text $ _libFile l ]
+    else [ sep [ pretty $ _libName l, nest 2 $ parens $ text $ _libFile l ]
          | l <- installed
          ]
 
@@ -384,7 +466,7 @@ instance Pretty LibError' where
       ]
 
     LibNotFound file lib -> vcat $
-      [ text $ "Library '" ++ lib ++ "' not found."
+      [ hcat [ "Library '", pretty lib, "' not found." ]
       , sep [ "Add the path to its .agda-lib file to"
             , nest 2 $ text $ "'" ++ lfPath file ++ "'"
             , "to install."
@@ -392,16 +474,21 @@ instance Pretty LibError' where
       ]
 
     AmbiguousLib lib tgts -> vcat $
-      sep [ text $ "Ambiguous library '" ++ lib ++ "'."
+      sep [ hcat [ "Ambiguous library '", pretty lib, "'." ]
             , "Could refer to any one of"
           ]
-        : [ nest 2 $ text (_libName l) <+> parens (text $ _libFile l) | l <- tgts ]
+        : [ nest 2 $ pretty (_libName l) <+> parens (text $ _libFile l) | l <- toList tgts ]
+
+    SeveralAgdaLibFiles root files -> vcat $
+      sep [ "The project root", pretty root ]
+        : "may contain only one .agda-lib file, but I found several:"
+        : map (("-" <+>) . pretty) (List.sort $ toList files)
 
     LibParseError err -> pretty err
 
     ReadError e msg -> vcat
       [ text $ msg
-      , text $ E.displayException e
+      , text $ showIOException e
       ]
 
     DuplicateExecutable exeFile exe paths -> vcat $
@@ -417,7 +504,7 @@ instance Pretty LibParseError where
       [ "Bad library name:", quotes (text s) ]
     ReadFailure file e -> vcat
       [ hsep [ "Failed to read library file", text file <> "." ]
-      , "Reason:" <+> text (E.displayException e)
+      , "Reason:" <+> text (showIOException e)
       ]
 
     MissingFields   xs -> "Missing"   <+> listFields xs
@@ -447,12 +534,38 @@ instance Pretty LibWarning' where
   pretty (UnknownField s) = text $ "Unknown field '" ++ s ++ "'"
 
 ------------------------------------------------------------------------
+-- Hashable instances
+------------------------------------------------------------------------
+
+instance Hashable LibName
+
+------------------------------------------------------------------------
+-- Null instances
+------------------------------------------------------------------------
+
+instance Null LibName where
+  empty = LibName empty empty
+  null (LibName a b) = null a && null b
+
+instance Null LibCache where
+  empty = LibCache empty empty
+  null (LibCache a b) = null a && null b
+
+------------------------------------------------------------------------
 -- NFData instances
 ------------------------------------------------------------------------
 
 instance NFData ExecutablesFile
+instance NFData LibrariesFile
 instance NFData ProjectConfig
 instance NFData AgdaLibFile
+instance NFData LibName
+instance NFData LibCache
 instance NFData LibPositionInfo
 instance NFData LibWarning
 instance NFData LibWarning'
+instance NFData LibError
+instance NFData LibError'
+instance NFData LibErrors
+instance NFData LibParseError
+instance NFData E.IOException where rnf _ = ()

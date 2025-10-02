@@ -1,4 +1,4 @@
-{-# OPTIONS --safe --no-guardedness #-}
+{-# OPTIONS --safe #-}
 
 record Stream (A : Set) : Set where
   coinductive
@@ -11,3 +11,10 @@ open Stream
 repeat : ∀ {A} → A → Stream A
 repeat x .head = x
 repeat x .tail = repeat x
+
+-- Expected error: [TerminationIssue]
+-- Termination checking failed for the following functions:
+-- (Option --guardedness might fix this problem.)
+--   repeat
+-- Problematic calls:
+--   repeat x

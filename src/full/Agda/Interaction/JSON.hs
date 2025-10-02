@@ -16,12 +16,10 @@ import Data.Aeson    as Export hiding (Result(..), (.=))
 
 import qualified Data.Aeson
 import Data.Aeson.Types ( Pair )
-#if MIN_VERSION_aeson(2,0,0)
 import qualified Data.Aeson.Key as Key
-#endif
 
 import Data.Text (Text)
-import GHC.Int (Int32)
+import Data.Word (Word32)
 
 -- import qualified Agda.Syntax.Translation.InternalToAbstract as I2A
 -- import qualified Agda.Syntax.Translation.AbstractToConcrete as A2C
@@ -30,18 +28,15 @@ import GHC.Int (Int32)
 -- import qualified Agda.Syntax.Internal as I
 import Agda.TypeChecking.Monad
 import Agda.Syntax.Common.Pretty
+
+import Agda.Utils.DocTree qualified as DocTree
 import qualified Agda.Utils.FileName as File
 import qualified Agda.Utils.Maybe.Strict as Strict
+import Agda.Interaction.Highlighting.Common (toAtoms)
+import qualified Data.Aeson.KeyMap as KeyMap
 
-#if MIN_VERSION_aeson(2,0,0)
 toKey :: Text -> Key
 toKey = Key.fromText
-#else
-type Key = Text
-
-toKey :: Text -> Key
-toKey = id
-#endif
 
 ---------------------------------------------------------------------------
 -- * The EncodeTCM class
@@ -124,11 +119,26 @@ instance EncodeTCM a => EncodeTCM [a] where
 -- overlaps with the instance declared above
 instance {-# OVERLAPPING #-} EncodeTCM String
 
-instance EncodeTCM Bool where
-instance EncodeTCM Int where
-instance EncodeTCM Int32 where
-instance EncodeTCM Value where
-instance EncodeTCM Doc where
+instance EncodeTCM Bool
+instance EncodeTCM Int
+instance EncodeTCM Word32
+instance EncodeTCM Value
+instance EncodeTCM Doc
+instance EncodeTCM DocTree
+
+instance ToJSON DocTree where
+  toJSON = toJSON . DocTree.treeToTextNoAnn
+  -- toJSON = toJsonDocTree  -- TODO: communicate annotations to JSON client
+
+-- UNUSED code taken from
+-- https://github.com/plt-amy/agda/blob/9fd50b883f14a05792ed79a0b693fbecb2165bf5/src/full/Agda/LSP/Output.hs#L29-L35
+toJsonDocTree :: DocTree -> Value
+toJsonDocTree = \case
+    DocTree.Node tt ds -> Object $ KeyMap.fromList
+      [ ("style", toJSON (toAtoms tt))
+      , ("children", toJSONList ds)
+      ]
+    DocTree.Text t -> toJSON t
 
 instance ToJSON Doc where
   toJSON = toJSON . render
@@ -139,9 +149,3 @@ instance EncodeTCM a => EncodeTCM (Maybe a) where
 
 instance ToJSON File.AbsolutePath where
   toJSON (File.AbsolutePath path) = toJSON path
-
-#if !(MIN_VERSION_aeson(1,5,3))
-instance ToJSON a => ToJSON (Strict.Maybe a) where
-  toJSON (Strict.Just a) = toJSON a
-  toJSON Strict.Nothing  = Null
-#endif

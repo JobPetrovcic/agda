@@ -1,4 +1,5 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
 
 {-|
     Desugaring for do-notation. Uses whatever `_>>=_` and `_>>_` happen to be
@@ -27,6 +28,8 @@
  -}
 module Agda.Syntax.DoNotation (desugarDoNotation) where
 
+import Prelude hiding (null)
+
 import Agda.Syntax.Common
 import Agda.Syntax.Position
 import Agda.Syntax.Concrete
@@ -38,12 +41,14 @@ import Agda.TypeChecking.Monad
 import Agda.Utils.List1  ( List1, pattern (:|) )
 import qualified Agda.Utils.List1 as List1
 import Agda.Syntax.Common.Pretty ( prettyShow )
+
+import Agda.Utils.Null
 import Agda.Utils.Singleton
 
 import Agda.Utils.Impossible
 
-desugarDoNotation :: Range -> List1 DoStmt -> ScopeM Expr
-desugarDoNotation r ss = do
+desugarDoNotation :: List1 DoStmt -> ScopeM Expr
+desugarDoNotation ss = do
   let qBind = QName $ simpleBinaryOperator ">>="
       qThen = QName $ simpleBinaryOperator ">>"
       isBind DoBind{} = True
@@ -99,7 +104,7 @@ desugarDo qBind qThen = \case
   desugarDo0 :: [DoStmt] -> ScopeM Expr
   desugarDo0 ss = List1.ifNull ss failure $ desugarDo qBind qThen
 
-  failure = genericError
+  failure = doNotationError
     "The last statement in a 'do' block must be an expression or an absurd match."
 
 singleName :: Pattern -> Maybe Name
@@ -116,7 +121,7 @@ matchingBind qBind r p e body cs =
   where
     mainClause = LamClause { lamLHS      = [p]
                            , lamRHS      = RHS body
-                           , lamCatchAll = False }
+                           , lamCatchall = empty }
 
     -- Add parens to left-hand sides.
     addParens c = c { lamLHS = addP (lamLHS c) }
@@ -139,6 +144,9 @@ ensureInScope :: QName -> ScopeM ()
 ensureInScope q = do
   r <- resolveName q
   case r of
-    UnknownName -> genericError $
+    UnknownName -> doNotationError $
       prettyShow q ++ " needs to be in scope to desugar 'do' block"
     _ -> return ()
+
+doNotationError :: String -> ScopeM a
+doNotationError = typeError . DoNotationError

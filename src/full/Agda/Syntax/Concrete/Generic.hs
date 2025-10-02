@@ -1,4 +1,6 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
+{-# OPTIONS_GHC -Wunused-binds #-}
 
 -- | Generic traversal and reduce for concrete syntax,
 --   in the style of "Agda.Syntax.Internal.Generic".
@@ -87,6 +89,7 @@ instance ExprLike a => ExprLike (WithHiding a)
 
 instance ExprLike a => ExprLike (MaybePlaceholder a)
 instance ExprLike a => ExprLike (RHS' a)
+instance ExprLike a => ExprLike (TacticAttribute' a)
 instance ExprLike a => ExprLike (TypedBinding' a)
 instance ExprLike a => ExprLike (WhereClause' a)
 
@@ -127,15 +130,17 @@ instance ExprLike Expr where
      InstanceArg r e         -> f $ InstanceArg r          $ mapE e
      Lam r bs e              -> f $ Lam r       (mapE bs)  $ mapE e
      AbsurdLam{}             -> f $ e0
-     ExtendedLam r e cs      -> f $ ExtendedLam r e        $ mapE cs
-     Fun r a b               -> f $ Fun r     (mapE <$> a) $ mapE b
-     Pi tel e                -> f $ Pi          (mapE tel) $ mapE e
-     Rec r es                -> f $ Rec r                  $ mapE es
-     RecUpdate r e es        -> f $ RecUpdate r (mapE e)   $ mapE es
-     Let r ds e              -> f $ Let r       (mapE ds)  $ mapE e
-     Paren r e               -> f $ Paren r                $ mapE e
-     IdiomBrackets r es      -> f $ IdiomBrackets r        $ mapE es
-     DoBlock r ss            -> f $ DoBlock r              $ mapE ss
+     ExtendedLam r e cs      -> f $ ExtendedLam r e             $ mapE cs
+     Fun r a b               -> f $ Fun r     (mapE <$> a)      $ mapE b
+     Pi tel e                -> f $ Pi          (mapE tel)      $ mapE e
+     Rec kwr r es            -> f $ Rec kwr r                   $ mapE es
+     RecUpdate k r e es      -> f $ RecUpdate k r (mapE e)      $ mapE es
+     RecWhere kwr r es       -> f $ RecWhere kwr r              $ mapE es
+     RecUpdateWhere k r e es -> f $ RecUpdateWhere k r (mapE e) $ mapE es
+     Let r ds e              -> f $ Let r       (mapE ds)       $ mapE e
+     Paren r e               -> f $ Paren r                     $ mapE e
+     IdiomBrackets r es      -> f $ IdiomBrackets r             $ mapE es
+     DoBlock r ss            -> f $ DoBlock r                   $ mapE ss
      Absurd{}                -> f $ e0
      As r x e                -> f $ As r x                 $ mapE e
      Dot r e                 -> f $ Dot r                  $ mapE e
@@ -165,7 +170,7 @@ instance ExprLike FieldAssignment where
 instance ExprLike ModuleAssignment where
   mapExpr      f (ModuleAssignment m es i) = ModuleAssignment m (mapExpr f es) i
   traverseExpr f (ModuleAssignment m es i) = (\es' -> ModuleAssignment m es' i) <$> traverseExpr f es
-  foldExpr     f (ModuleAssignment m es i) = foldExpr f es
+  foldExpr     f (ModuleAssignment _ es _) = foldExpr f es
 
 instance ExprLike a => ExprLike (OpApp a) where
   mapExpr f = \case
@@ -197,7 +202,8 @@ instance ExprLike LHS where
 instance (ExprLike qn, ExprLike e) => ExprLike (RewriteEqn' qn nm p e) where
   mapExpr f = \case
     Rewrite es    -> Rewrite (mapExpr f es)
-    Invert qn pes -> Invert qn (fmap (fmap $ fmap $ mapExpr f) pes)
+    Invert qn pes -> Invert qn $ (fmap . fmap . fmap . mapExpr) f pes
+    LeftLet pes   -> LeftLet $ (fmap . fmap . mapExpr) f pes
   foldExpr     = __IMPOSSIBLE__
   traverseExpr = __IMPOSSIBLE__
 
@@ -216,7 +222,7 @@ instance ExprLike DoStmt where
 
 instance ExprLike ModuleApplication where
   mapExpr f = \case
-     SectionApp r bs e -> SectionApp r (mapE bs) $ mapE e
+     SectionApp r bs x es -> SectionApp r (mapE bs) x $ mapE es
      e@RecordModuleInstance{} -> e
    where
      mapE :: ExprLike e => e -> e
@@ -229,7 +235,7 @@ instance ExprLike Declaration where
      TypeSig ai t x e          -> TypeSig ai (mapE t) x (mapE e)
      FieldSig i t n e          -> FieldSig i (mapE t) n (mapE e)
      Field r fs                -> Field r                              $ map (mapExpr f) fs
-     FunClause lhs rhs wh ca   -> FunClause (mapE lhs) (mapE rhs) (mapE wh) (mapE ca)
+     FunClause ai lhs rhs wh ca-> FunClause ai (mapE lhs) (mapE rhs) (mapE wh) ca
      DataSig r er x bs e       -> DataSig r er x (mapE bs)             $ mapE e
      DataDef r n bs cs         -> DataDef r n (mapE bs)                $ mapE cs
      Data r er n bs e cs       -> Data r er n (mapE bs) (mapE e)       $ mapE cs
@@ -238,7 +244,6 @@ instance ExprLike Declaration where
      Record r er n dir tel e ds
                                -> Record r er n dir (mapE tel) (mapE e)
                                                                        $ mapE ds
-     e@RecordDirective{}       -> e
      e@Infix{}                 -> e
      e@Syntax{}                -> e
      e@PatternSyn{}            -> e
@@ -315,12 +320,11 @@ instance FoldDecl Declaration where
     FieldSig _ _ _ _        -> mempty
     Generalize _ _          -> mempty
     Field _ _               -> mempty
-    FunClause _ _ wh _      -> foldDecl f wh
+    FunClause _ _ _ wh _    -> foldDecl f wh
     DataSig _ _ _ _ _       -> mempty
     Data _ _ _ _ _ _        -> mempty
     DataDef _ _ _ _         -> mempty
     RecordSig _ _ _ _ _     -> mempty
-    RecordDirective _       -> mempty
     Infix _ _               -> mempty
     Syntax _ _              -> mempty
     PatternSyn _ _ _ _      -> mempty
@@ -371,12 +375,11 @@ instance TraverseDecl Declaration where
       FieldSig _ _ _ _           -> return d
       Generalize _ _             -> return d
       Field _ _                  -> return d
-      FunClause lhs rhs wh ca    -> preTraverseDecl f wh <&> \ wh' -> FunClause lhs rhs wh' ca
+      FunClause ai lhs rhs wh ca -> preTraverseDecl f wh <&> \ wh' -> FunClause ai lhs rhs wh' ca
       DataSig _ _ _ _ _          -> return d
       Data _ _ _ _ _ _           -> return d
       DataDef _ _ _ _            -> return d
       RecordSig _ _ _ _ _        -> return d
-      RecordDirective _          -> return d
       Infix _ _                  -> return d
       Syntax _ _                 -> return d
       PatternSyn _ _ _ _         -> return d

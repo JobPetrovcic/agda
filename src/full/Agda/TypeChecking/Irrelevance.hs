@@ -75,22 +75,22 @@ variable rule:
 
 module Agda.TypeChecking.Irrelevance where
 
-import Control.Monad.Except
-
-import Agda.Interaction.Options
+import Control.Monad.Except ( MonadError(..), runExceptT )
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
-import Agda.Syntax.Concrete.Pretty
 
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Substitute.Class
+import Agda.TypeChecking.Telescope
 
-import Agda.Utils.Lens
+import Agda.Utils.Either (fromRightM)
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
+
+import Agda.Utils.Impossible
 
 -- | Check whether something can be used in a position of the given relevance.
 --
@@ -220,7 +220,7 @@ instance UsableModality Term where
       fmod <- modalityOfConst f
       -- Pure modalities don't matter here, only positional ones, hence remove
       -- them from the equation.
-      let ok = setCohesion Flat fmod `moreUsableModality` mod
+      let ok = setModalPolarity (withStandardLock MixedPolarity) (setCohesion Flat fmod) `moreUsableModality` mod
       reportSDoc "tc.irr" 50 $
         "Definition" <+> prettyTCM (Def f []) <+>
         text ("has modality " ++ show fmod ++ ", which is a " ++
@@ -241,7 +241,8 @@ instance UsableModality Term where
     Pi a b   -> usableMod domMod (unEl $ unDom a) `and2M` usableModAbs (getArgInfo a) mod (unEl <$> b)
       where
         domMod = mapQuantity (composeQuantity $ getQuantity a) $
-                 mapCohesion (composeCohesion $ getCohesion a) mod
+                 mapCohesion (composeCohesion $ getCohesion a) $
+                 mapModalPolarity (composePolarity $ getModalPolarity a) mod
     -- Andrea 15/10/2020 not updating these cases yet, but they are quite suspicious,
     -- do we have special typing rules for Sort and Level?
     Sort s   -> usableMod mod s
@@ -298,8 +299,7 @@ instance UsableModality a => UsableModality (Arg a) where
 instance UsableModality a => UsableModality (Dom a) where
   usableMod mod Dom{unDom = u} = usableMod mod u
 
-usableAtModality'
-  :: MonadConstraint TCM
+usableAtModality' :: MonadConstraint TCM
   -- Note: This weird-looking constraint is to trick GHC into accepting
   -- that an instance of MonadConstraint TCM will exist, even if we
   -- can't import the module in which it is defined.
@@ -309,60 +309,8 @@ usableAtModality' ms why mod t =
     whenM (maybe (pure True) isFibrant ms) $ do
       res <- runExceptT $ usableMod mod t
       case res of
-        Right b -> unless b $
-          typeError . GenericDocError =<< formatWhy
+        Right b -> unless b $ typeError $ UnusableAtModality why mod t
         Left blocker -> patternViolation blocker
-  where
-    formatWhy = do
-      compatible <- optCubicalCompatible <$> pragmaOptions
-      cubical <- isJust . optCubical <$> pragmaOptions
-      let
-        context
-          | cubical    = "in Cubical Agda,"
-          | compatible = "to maintain compatibility with Cubical Agda,"
-          | otherwise  = "when --without-K is enabled,"
-
-        explanation what
-          | cubical || compatible =
-            [ ""
-            , fsep ( "Note:":pwords context
-                  ++ pwords what ++ pwords "must be usable at the modality"
-                  ++ pwords "in which the function was defined, since it will be"
-                  ++ pwords "used for computing transports"
-                  )
-            , ""
-            ]
-          | otherwise = []
-
-      case why of
-        IndexedClause ->
-          vcat $
-            ( fsep ( pwords "This clause has target type"
-                  ++ [prettyTCM t]
-                  ++ pwords "which is not usable at the required modality"
-                  ++ [pure (attributesForModality mod) <> "."]
-                   )
-            : explanation "the target type")
-
-        -- Arguments sometimes need to be transported too:
-        IndexedClauseArg forced the_arg ->
-          vcat $
-            ( fsep (pwords "The argument" ++ [prettyTCM the_arg] ++ pwords "has type")
-            : nest 2 (prettyTCM t)
-            : fsep ( pwords "which is not usable at the required modality"
-                  ++ [pure (attributesForModality mod) <> "."] )
-            : explanation "this argument's type")
-
-        -- Note: if a generated clause is modality-incorrect, that's a
-        -- bug in the LHS modality check
-        GeneratedClause ->
-          __IMPOSSIBLE_VERBOSE__ . show =<<
-                   prettyTCM t
-              <+> "is not usable at the required modality"
-              <+> pure (attributesForModality mod)
-        _ -> prettyTCM t <+> "is not usable at the required modality"
-         <+> pure (attributesForModality mod)
-
 
 usableAtModality :: MonadConstraint TCM => WhyCheckModality -> Modality -> Term -> TCM ()
 usableAtModality = usableAtModality' Nothing
@@ -372,14 +320,12 @@ usableAtModality = usableAtModality' Nothing
 
 -- | Is a type a proposition?  (Needs reduction.)
 
-isPropM
-  :: (LensSort a, PrettyTCM a, PureTCM m, MonadBlock m)
-  => a -> m Bool
+{-# SPECIALIZE isPropM :: Dom Type -> TCM Bool #-}
+isPropM :: (LensSort a, PrettyTCM a, PureTCM m, MonadBlock m) => a -> m Bool
 isPropM a = do
-  traceSDoc "tc.prop" 80 ("Is " <+> prettyTCM a <+> "of sort" <+> prettyTCM (getSort a) <+> "in Prop?") $ do
-  abortIfBlocked (getSort a) <&> \case
-    Prop{} -> True
-    _      -> False
+  let s = getSort a
+  traceSDoc "tc.prop" 80 ("Is " <+> prettyTCM a <+> "of sort" <+> prettyTCM s <+> "in Prop?") do
+  isProp <$> abortIfBlocked s
 
 {-# SPECIALIZE isIrrelevantOrPropM :: Dom Type -> TCM Bool #-}
 isIrrelevantOrPropM
@@ -387,41 +333,52 @@ isIrrelevantOrPropM
   => a -> m Bool
 isIrrelevantOrPropM x = return (isIrrelevant x) `or2M` isPropM x
 
+allIrrelevantOrPropTel
+  :: (PureTCM m, MonadBlock m)
+  => Telescope -> m Bool
+allIrrelevantOrPropTel =
+  foldrTelescopeM (and2M . isIrrelevantOrPropM . fmap snd) (return True)
+
 -- * Fibrant types
 
 -- | Is a type fibrant (i.e. Type, Prop)?
 
-isFibrant
-  :: (LensSort a, PureTCM m, MonadBlock m)
-  => a -> m Bool
-isFibrant a = abortIfBlocked (getSort a) <&> \case
-  Univ u _   -> univFibrancy u == IsFibrant
-  Inf u _    -> univFibrancy u == IsFibrant
-  SizeUniv{} -> False
-  LockUniv{} -> False
-  LevelUniv{}  -> False
-  IntervalUniv{} -> False
-  PiSort{}   -> False
-  FunSort{}  -> False
-  UnivSort{} -> False
-  MetaS{}    -> False
-  DefS{}     -> False
-  DummyS{}   -> False
+isFibrant :: (LensSort a, PureTCM m, MonadBlock m) => a -> m Bool
+isFibrant = fromRightM patternViolation . isFibrant'
+
+isFibrant' :: (LensSort a, PureTCM m) => a -> m (Either Blocker Bool)
+isFibrant' s =
+  ifBlocked (getSort s) (\ blocker _ -> return $ Left blocker) \ _ ->
+    return . Right . \case
+      Univ u _       -> univFibrancy u == IsFibrant
+      Inf u _        -> univFibrancy u == IsFibrant
+      SizeUniv{}     -> False
+      LockUniv{}     -> False
+      LevelUniv{}    -> False
+      IntervalUniv{} -> False
+      PiSort{}       -> __IMPOSSIBLE__
+      FunSort{}      -> __IMPOSSIBLE__
+      UnivSort{}     -> __IMPOSSIBLE__
+      MetaS{}        -> __IMPOSSIBLE__
+      DefS{}         -> False
+      DummyS{}       -> False
 
 
 -- | Cofibrant types are those that could be the domain of a fibrant
 --   pi type. (Notion by C. Sattler).
-isCoFibrantSort :: (LensSort a, PureTCM m, MonadBlock m) => a -> m Bool
-isCoFibrantSort a = abortIfBlocked (getSort a) <&> \case
-  Univ u _   -> univFibrancy u == IsFibrant
-  Inf u _    -> univFibrancy u == IsFibrant
-  SizeUniv{} -> False
-  LockUniv{} -> True
-  LevelUniv{}  -> False
-  IntervalUniv{} -> True
-  PiSort{}   -> False
-  FunSort{}  -> False
-  UnivSort{} -> False
-  MetaS{}    -> False
-  DefS{}     -> False
-  DummyS{}   -> False
+isCoFibrantSort :: (LensSort a, PureTCM m) => a -> m (Either Blocker Bool)
+isCoFibrantSort s =
+  ifBlocked (getSort s) (\ blocker _ -> return $ Left blocker) \ _ ->
+    return . Right . \case
+      Univ u _       -> univFibrancy u == IsFibrant
+      Inf u _        -> univFibrancy u == IsFibrant
+      SizeUniv{}     -> False
+      LockUniv{}     -> True
+      LevelUniv{}    -> False
+      IntervalUniv{} -> True
+      PiSort{}       -> __IMPOSSIBLE__
+      FunSort{}      -> __IMPOSSIBLE__
+      UnivSort{}     -> __IMPOSSIBLE__
+      MetaS{}        -> __IMPOSSIBLE__
+      DefS{}         -> False
+      DummyS{}       -> False

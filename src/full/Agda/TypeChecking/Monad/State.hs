@@ -4,19 +4,23 @@ module Agda.TypeChecking.Monad.State where
 
 import qualified Control.Exception as E
 
-import Control.Monad       (void, when)
-import Control.Monad.Trans (MonadIO, liftIO)
+import Control.DeepSeq           (rnf)
+import Control.Exception         (evaluate)
+import Control.Monad.Trans       (MonadIO, liftIO)
+import Control.Monad.Trans.Maybe (MaybeT(MaybeT), runMaybeT)
 
 import Data.Maybe
-
+import qualified Data.EnumMap.Strict as EnumMap
+import qualified Data.HashMap.Strict as HMap
 import qualified Data.Map as Map
-
 import Data.Set (Set)
 import qualified Data.Set as Set
-import qualified Data.HashMap.Strict as HMap
 
 import Agda.Benchmarking
 
+import Agda.Compiler.Backend.Base (pattern Backend, backendName, mayEraseType)
+
+import Agda.Interaction.Library ( classifyBuiltinModule_ )
 import Agda.Interaction.Response
   (InteractionOutputCallback, Response)
 
@@ -33,14 +37,16 @@ import Agda.Syntax.TopLevelModuleName
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Warnings
 
-import Agda.TypeChecking.Monad.Debug (reportSDoc, reportSLn, verboseS)
+import Agda.TypeChecking.Monad.Debug (reportS, reportSDoc, reportSLn, verboseS)
 import Agda.TypeChecking.Positivity.Occurrence
 import Agda.TypeChecking.CompiledClause
 
 import qualified Agda.Utils.BiMap as BiMap
+import Agda.Utils.FileId ( File, getIdFile, registerFileId' )
 import Agda.Utils.Lens
 import qualified Agda.Utils.List1 as List1
-import Agda.Utils.Monad (bracket_)
+import Agda.Utils.Maybe
+import Agda.Utils.Monad
 import Agda.Syntax.Common.Pretty
 import Agda.Utils.Tuple
 
@@ -49,44 +55,35 @@ import Agda.Utils.Impossible
 -- | Resets the non-persistent part of the type checking state.
 
 resetState :: TCM ()
-resetState = do
-    pers <- getsTC stPersistentState
-    putTC $ initState { stPersistentState = pers }
+resetState = modifyTC \ s -> initStateFromPersistentState (s ^. lensPersistentState)
 
 -- | Resets all of the type checking state.
 --
---   Keep only 'Benchmark' and backend information.
+--   Keep only the session state (backend information, 'Benchmark', file ids).
 
 resetAllState :: TCM ()
-resetAllState = do
-    b <- getBenchmark
-    backends <- useTC stBackends
-    putTC $ updatePersistentState (\ s -> s { stBenchmark = b }) initState
-    stBackends `setTCLens` backends
--- resetAllState = putTC initState
+resetAllState = modifyTC \ s -> initStateFromSessionState (s ^. lensSessionState)
+
+-- | Overwrite the 'TCState', but not the 'SessionTCState' part.
+putTCPreservingSession :: TCState -> TCM ()
+putTCPreservingSession = bracket_ get put . putTC where
+  get = (,) <$> useTC lensSessionState <*> useTC stStatistics
+
+  put (sess, stat) = do
+    setTCLens lensSessionState sess
+    setTCLens stStatistics stat
 
 -- | Restore 'TCState' after performing subcomputation.
 --
---   In contrast to 'Agda.Utils.Monad.localState', the 'Benchmark'
---   info from the subcomputation is saved.
+--   In contrast to 'Agda.Utils.Monad.localState', the
+--   'SessionTCState' from the subcomputation is saved.
 localTCState :: TCM a -> TCM a
-localTCState = bracket_ getTC (\ s -> do
-   b <- getBenchmark
-   putTC s
-   modifyBenchmark $ const b)
+localTCState = bracket_ getTC putTCPreservingSession
 
 -- | Same as 'localTCState' but also returns the state in which we were just
 --   before reverting it.
 localTCStateSaving :: TCM a -> TCM (a, TCState)
-localTCStateSaving compute = do
-  oldState <- getTC
-  result <- compute
-  newState <- getTC
-  do
-    b <- getBenchmark
-    putTC oldState
-    modifyBenchmark $ const b
-  return (result, newState)
+localTCStateSaving compute = localTCState $ liftA2 (,) compute getTC
 
 -- | Same as 'localTCState' but keep all warnings.
 localTCStateSavingWarnings :: TCM a -> TCM a
@@ -94,19 +91,6 @@ localTCStateSavingWarnings compute = do
   (result, newState) <- localTCStateSaving compute
   modifyTC $ over stTCWarnings $ const $ newState ^. stTCWarnings
   return result
-
-data SpeculateResult = SpeculateAbort | SpeculateCommit
-
--- | Allow rolling back the state changes of a TCM computation.
-speculateTCState :: TCM (a, SpeculateResult) -> TCM a
-speculateTCState m = do
-  ((x, res), newState) <- localTCStateSaving m
-  case res of
-    SpeculateAbort  -> return x
-    SpeculateCommit -> x <$ putTC newState
-
-speculateTCState_ :: TCM SpeculateResult -> TCM ()
-speculateTCState_ m = void $ speculateTCState $ ((),) <$> m
 
 -- | A fresh TCM instance.
 --
@@ -118,29 +102,28 @@ speculateTCState_ m = void $ speculateTCState $ ((),) <$> m
 
 freshTCM :: TCM a -> TCM (Either TCErr a)
 freshTCM m = do
+
+  -- Run m in fresh TCM that only kept the current persistent state.
   ps <- useTC lensPersistentState
-  let s = set lensPersistentState ps initState
-  r <- liftIO $ (Right <$> runTCM initEnv s m) `E.catch` (return . Left)
+  let s0 = initStateFromPersistentState ps
+  r <- liftIO $ (Right <$> runTCM initEnv s0 m) `E.catch` (return . Left)
+
+  -- Keep m's changes to the persistent state, if possible.
+  let keepPersistent s = setTCLens lensPersistentState $ s ^. lensPersistentState
   case r of
-    Right (a, s) -> do
-      setTCLens lensPersistentState $ s ^. lensPersistentState
-      return $ Right a
-    Left err -> do
+    Right (a, s) -> Right a <$ keepPersistent s
+    Left err -> Left err <$
       case err of
-        TypeError { tcErrState = s } ->
-          setTCLens lensPersistentState $ s ^. lensPersistentState
-        IOException s _ _ ->
-          setTCLens lensPersistentState $ s ^. lensPersistentState
-        _ -> return ()
-      return $ Left err
+        TypeError { tcErrState = s } -> keepPersistent s
+        IOException (Just s) _ _     -> keepPersistent s
+        IOException Nothing  _ _     -> return ()
+        GenericException _           -> return ()
+        ParserError _                -> return ()
+        PatternErr _                 -> return ()
 
 ---------------------------------------------------------------------------
 -- * Lens for persistent states and its fields
 ---------------------------------------------------------------------------
-
-lensPersistentState :: Lens' TCState PersistentTCState
-lensPersistentState f s =
-  f (stPersistentState s) <&> \ p -> s { stPersistentState = p }
 
 updatePersistentState
   :: (PersistentTCState -> PersistentTCState) -> (TCState -> TCState)
@@ -172,15 +155,15 @@ getScope = useR stScope
 setScope :: ScopeInfo -> TCM ()
 setScope scope = modifyScope (const scope)
 
-{-# INLINE modifyScope_ #-}
--- | Modify the current scope without updating the inverse maps.
-modifyScope_ :: MonadTCState m => (ScopeInfo -> ScopeInfo) -> m ()
-modifyScope_ f = stScope `modifyTCLens` f
-
 {-# INLINE modifyScope #-}
--- | Modify the current scope.
+-- | Modify the current scope without updating the inverse maps.
 modifyScope :: MonadTCState m => (ScopeInfo -> ScopeInfo) -> m ()
-modifyScope f = modifyScope_ (recomputeInverseScopeMaps . f)
+modifyScope f = stScope `modifyTCLens` f
+
+{-# INLINE recomputeInverseScope #-}
+-- | Recompute inverse names, inverse modules and InScopeSet-s.
+recomputeInverseScope :: MonadTCState m => m ()
+recomputeInverseScope = modifyScope recomputeInverseScope'
 
 {-# INLINE useScope #-}
 -- | Get a part of the current scope.
@@ -195,12 +178,12 @@ locallyScope l = locallyTCState $ stScope . l
 {-# INLINE withScope #-}
 -- | Run a computation in a local scope.
 withScope :: ReadTCState m => ScopeInfo -> m a -> m (a, ScopeInfo)
-withScope s m = locallyTCState stScope (recomputeInverseScopeMaps . const s) $ (,) <$> m <*> getScope
+withScope s m = locallyTCState stScope (const s) $ (,) <$> m <*> getScope
 
-{-# INLINE withScope_ #-}
+{-# INLINE evalWithScope #-}
 -- | Same as 'withScope', but discard the scope from the computation.
-withScope_ :: ReadTCState m => ScopeInfo -> m a -> m a
-withScope_ s m = fst <$> withScope s m
+evalWithScope :: ReadTCState m => ScopeInfo -> m a -> m a
+evalWithScope s m = fst <$> withScope s m
 
 -- | Discard any changes to the scope by a computation.
 localScope :: TCM a -> TCM a
@@ -213,19 +196,19 @@ localScope m = do
 -- | Scope error.
 notInScopeError :: C.QName -> TCM a
 notInScopeError x = do
-  printScope "unbound" 5 ""
-  typeError $ NotInScope [x]
+  printScope "unbound" 25 ""
+  typeError $ NotInScope x
 
 notInScopeWarning :: C.QName -> TCM ()
 notInScopeWarning x = do
-  printScope "unbound" 5 ""
-  warning $ NotInScopeW [x]
+  printScope "unbound" 25 ""
+  warning $ NotInScopeW x
 
 -- | Debug print the scope.
 printScope :: String -> Int -> String -> TCM ()
 printScope tag v s = verboseS ("scope." ++ tag) v $ do
   scope <- getScope
-  reportSDoc ("scope." ++ tag) v $ return $ vcat [ text s, pretty scope ]
+  reportS ("scope." ++ tag) v $ vcat [ text s, pretty scope ]
 
 ---------------------------------------------------------------------------
 -- * Signature
@@ -290,6 +273,12 @@ setMatchableSymbols f matchables =
     where
       setMatchable def = def { defMatchable = Set.insert f $ defMatchable def }
 
+-- ** 'modify' methods for the signature
+
+modifyRecEta :: MonadTCState m => QName -> (EtaEquality -> EtaEquality) -> m ()
+modifyRecEta q f =
+  modifySignature $ updateDefinition q $ over (lensTheDef . lensRecord . lensRecEta) f
+
 -- ** Modifiers for parts of the signature
 
 lookupDefinition :: QName -> Signature -> Maybe Definition
@@ -338,6 +327,56 @@ updateDefBlocked :: (Blocked_ -> Blocked_) -> Definition -> Definition
 updateDefBlocked f def@Defn{ defBlocked = b } = def { defBlocked = f b }
 
 ---------------------------------------------------------------------------
+-- * File identification
+---------------------------------------------------------------------------
+
+-- | Translate an absolute path to a file id, and register a new file id
+--   if the path has not seen before.
+--   Also register whether the path belongs to one of Agda's builtin modules.
+--
+registerFileIdWithBuiltin :: File -> FileDictWithBuiltins -> (FileId, FileDictWithBuiltins)
+registerFileIdWithBuiltin f (FileDictWithBuiltins d b primLibDir) =
+  (fi, FileDictWithBuiltins d' b' primLibDir)
+  where
+    ((fi, new), d') = registerFileId' f d
+    b' = case classifyBuiltinModule_ primLibDir f of
+      Nothing -> b
+      Just c  -> EnumMap.insert fi c b
+
+instance MonadIO m => MonadFileId (TCMT m) where
+  fileFromId fi = useTC stFileDict <&> (`getIdFile` fi)
+  idFromFile = stateTCLens stFileDict . registerFileIdWithBuiltin
+
+-- | Does the given 'FileId' belong to one of Agda's builtin modules?
+
+isBuiltinModule :: ReadTCState m => FileId -> m (Maybe IsBuiltinModule)
+isBuiltinModule fi = EnumMap.lookup fi <$> useTC stBuiltinModuleIds
+
+-- | Does the given 'FileId' belong to one of Agda's builtin modules that only uses safe postulates?
+--
+-- Implies @isJust . 'isBuiltinModule'@.
+
+isBuiltinModuleWithSafePostulates :: ReadTCState m => FileId -> m Bool
+isBuiltinModuleWithSafePostulates fi = do
+  isBuiltinModule fi <&> \case
+    Nothing                                -> False
+    Just IsBuiltinModule                   -> False
+    Just IsBuiltinModuleWithSafePostulates -> True
+    Just IsPrimitiveModule                 -> True
+
+-- | Does the given 'FileId' belong to one of Agda's magical primitive modules?
+--
+-- Implies 'isBuiltinModuleWithSafePostulates'.
+
+isPrimitiveModule :: ReadTCState m => FileId -> m Bool
+isPrimitiveModule  fi = do
+  isBuiltinModule fi <&> \case
+    Nothing                                -> False
+    Just IsBuiltinModule                   -> False
+    Just IsBuiltinModuleWithSafePostulates -> False
+    Just IsPrimitiveModule                 -> True
+
+---------------------------------------------------------------------------
 -- * Top level module
 ---------------------------------------------------------------------------
 
@@ -351,16 +390,10 @@ topLevelModuleName raw = do
     Just hash -> return (unsafeTopLevelModuleName raw hash)
     Nothing   -> do
       let hash = hashRawTopLevelModuleName raw
-      when (hash == noModuleNameHash) $ typeError $ GenericError $
-        "The module name " ++ prettyShow raw ++ " has a reserved " ++
-        "hash (you may want to consider renaming the module with " ++
-        "this name)"
+      when (hash == noModuleNameHash) $ typeError $ ModuleNameHashCollision raw Nothing
       raw' <- BiMap.invLookup hash <$> useR stTopLevelModuleNames
       case raw' of
-        Just raw' -> typeError $ GenericError $
-          "Module name hash collision for " ++ prettyShow raw ++
-          " and " ++ prettyShow raw' ++ " (you may want to consider " ++
-          "renaming one of these modules)"
+        Just raw' -> typeError $ ModuleNameHashCollision raw (Just raw')
         Nothing -> do
           stTopLevelModuleNames `modifyTCLens'`
             BiMap.insert (killRange raw) hash
@@ -387,14 +420,9 @@ setTopLevelModule top = do
 currentTopLevelModule ::
   (MonadTCEnv m, ReadTCState m) => m (Maybe TopLevelModuleName)
 currentTopLevelModule = do
-  m <- useR stCurrentModule
-  case m of
+  useR stCurrentModule >>= \case
     Just (_, top) -> return (Just top)
-    Nothing       -> do
-      p <- asksTC envImportPath
-      return $ case p of
-        top : _ -> Just top
-        []      -> Nothing
+    Nothing       -> listToMaybe <$> asksTC envImportPath
 
 -- | Use a different top-level module for a computation. Used when generating
 --   names for imported modules.
@@ -417,8 +445,29 @@ currentModuleNameHash = do
   return h
 
 ---------------------------------------------------------------------------
--- * Foreign code
+-- * Backends and foreign code
 ---------------------------------------------------------------------------
+
+-- | Look for a backend of the given name.
+
+lookupBackend :: ReadTCState m => BackendName -> m (Maybe Backend)
+lookupBackend name = useTC stBackends <&> \ backends ->
+  listToMaybe [ b | b@(Backend b') <- backends, backendName b' == name ]
+
+-- | Get the currently active backend (if any).
+
+activeBackend :: TCM (Maybe Backend)
+activeBackend = runMaybeT $ do
+  bname <- MaybeT $ asksTC envActiveBackendName
+  lift $ fromMaybe __IMPOSSIBLE__ <$> lookupBackend bname
+
+-- | Ask the active backend whether a type may be erased.
+--   See issue #3732.
+
+activeBackendMayEraseType :: QName -> TCM Bool
+activeBackendMayEraseType q = do
+  Backend b <- fromMaybe __IMPOSSIBLE__ <$> activeBackend
+  mayEraseType b q
 
 addForeignCode :: BackendName -> String -> TCM ()
 addForeignCode backend code = do
@@ -430,17 +479,18 @@ addForeignCode backend code = do
 -- * Interaction output callback
 ---------------------------------------------------------------------------
 
+{-# INLINE getInteractionOutputCallback #-}
 getInteractionOutputCallback :: ReadTCState m => m InteractionOutputCallback
 getInteractionOutputCallback
-  = getsTC $ stInteractionOutputCallback . stPersistentState
+  = useTC stInteractionOutputCallback
 
 appInteractionOutputCallback :: Response -> TCM ()
 appInteractionOutputCallback r
   = getInteractionOutputCallback >>= \ cb -> cb r
 
 setInteractionOutputCallback :: InteractionOutputCallback -> TCM ()
-setInteractionOutputCallback cb
-  = modifyPersistentState $ \ s -> s { stInteractionOutputCallback = cb }
+setInteractionOutputCallback
+  = setTCLens' stInteractionOutputCallback
 
 ---------------------------------------------------------------------------
 -- * Pattern synonyms
@@ -482,38 +532,8 @@ lookupSinglePatternSyn x = do
                 Nothing -> notInScopeError $ qnameToConcrete x
 
 ---------------------------------------------------------------------------
--- * Benchmark
----------------------------------------------------------------------------
-
--- | Lens getter for 'Benchmark' from 'TCState'.
-theBenchmark :: TCState -> Benchmark
-theBenchmark = stBenchmark . stPersistentState
-
-{-# INLINE updateBenchmark #-}
--- | Lens map for 'Benchmark'.
-updateBenchmark :: (Benchmark -> Benchmark) -> TCState -> TCState
-updateBenchmark f = updatePersistentState $ \ s -> s { stBenchmark = f (stBenchmark s) }
-
--- | Lens getter for 'Benchmark' from 'TCM'.
-getBenchmark :: TCM Benchmark
-getBenchmark = getsTC $ theBenchmark
-
-{-# INLINE modifyBenchmark #-}
--- | Lens modify for 'Benchmark'.
-modifyBenchmark :: (Benchmark -> Benchmark) -> TCM ()
-modifyBenchmark = modifyTC' . updateBenchmark
-
----------------------------------------------------------------------------
 -- * Instance definitions
 ---------------------------------------------------------------------------
-
--- | Look through the signature and reconstruct the instance table.
-addImportedInstances :: Signature -> TCM ()
-addImportedInstances sig = do
-  let itable = Map.fromListWith Set.union
-               [ (c, Set.singleton i)
-               | (i, Defn{ defInstance = Just c }) <- HMap.toList $ sig ^. sigDefinitions ]
-  stImportedInstanceDefs `modifyTCLens` Map.unionWith Set.union itable
 
 -- | Lens for 'stInstanceDefs'.
 updateInstanceDefs :: (TempInstanceTable -> TempInstanceTable) -> (TCState -> TCState)
@@ -524,17 +544,18 @@ modifyInstanceDefs = modifyTC . updateInstanceDefs
 
 getAllInstanceDefs :: TCM TempInstanceTable
 getAllInstanceDefs = do
-  (table,xs) <- useTC stInstanceDefs
-  itable <- useTC stImportedInstanceDefs
-  let !table' = Map.unionWith Set.union itable table
+  (table, xs) <- useTC stInstanceDefs
+  itable <- useTC (stImports . sigInstances)
+  let table' = table <> itable
+  () <- liftIO $ evaluate (rnf table')
   return (table', xs)
 
 getAnonInstanceDefs :: TCM (Set QName)
 getAnonInstanceDefs = snd <$> getAllInstanceDefs
 
--- | Remove all instances whose type is still unresolved.
-clearAnonInstanceDefs :: TCM ()
-clearAnonInstanceDefs = modifyInstanceDefs $ mapSnd $ const Set.empty
+-- | Remove an instance from the set of unresolved instances.
+clearUnknownInstance :: QName -> TCM ()
+clearUnknownInstance q = modifyInstanceDefs $ mapSnd $ Set.delete q
 
 -- | Add an instance whose type is still unresolved.
 addUnknownInstance :: QName -> TCM ()
@@ -543,16 +564,3 @@ addUnknownInstance x = do
     "adding definition " ++ prettyShow x ++
     " to the instance table (the type is not yet known)"
   modifyInstanceDefs $ mapSnd $ Set.insert x
-
--- | Add instance to some ``class''.
-addNamedInstance
-  :: QName  -- ^ Name of the instance.
-  -> QName  -- ^ Name of the class.
-  -> TCM ()
-addNamedInstance x n = do
-  reportSLn "tc.decl.instance" 10 $
-    "adding definition " ++ prettyShow x ++ " to instance table for " ++ prettyShow n
-  -- Mark x as instance for n.
-  modifySignature $ updateDefinition x $ \ d -> d { defInstance = Just n }
-  -- Add x to n's instances.
-  modifyInstanceDefs $ mapFst $ Map.insertWith Set.union n $ Set.singleton x

@@ -3,9 +3,9 @@
 
 module Agda.Interaction.Base where
 
+import           Control.Applicative          ( liftA3 )
 import           Control.Concurrent.STM.TChan
 import           Control.Concurrent.STM.TVar
-
 import           Control.Monad                ( mplus, liftM2, liftM4 )
 import           Control.Monad.Except
 import           Control.Monad.Identity
@@ -15,12 +15,13 @@ import qualified Data.List                    as List
 import           Data.Map                     (Map)
 import qualified Data.Map                     as Map
 import           Data.Maybe                   (listToMaybe)
+import qualified Data.Text                    as T
 
-import {-# SOURCE #-} Agda.TypeChecking.Monad.Base
-  (HighlightingLevel, HighlightingMethod, TCM, Comparison, Polarity, TCErr)
+import Agda.TypeChecking.Monad.Base.Types
+  (HighlightingLevel, HighlightingMethod, Comparison, Polarity)
 
 import           Agda.Syntax.Abstract         (QName)
-import           Agda.Syntax.Common           (InteractionId (..), Modality)
+import           Agda.Syntax.Common           (BackendName, InteractionId (..), Modality)
 import           Agda.Syntax.Internal         (ProblemId, Blocker)
 import           Agda.Syntax.Position
 import           Agda.Syntax.Scope.Base       (ScopeInfo)
@@ -76,12 +77,6 @@ initCommandState commandQueue =
     , commandQueue         = commandQueue
     }
 
--- | Monad for computing answers to interactive commands.
---
---   'CommandM' is 'TCM' extended with state 'CommandState'.
-
-type CommandM = StateT CommandState TCM
-
 -- | Information about the current main module.
 data CurrentFile = CurrentFile
   { currentFilePath  :: AbsolutePath
@@ -93,6 +88,8 @@ data CurrentFile = CurrentFile
   , currentFileStamp :: ClockTime
       -- ^ The modification time stamp of the file when it was loaded.
   } deriving (Show)
+
+type CommandM' = StateT CommandState
 
 ------------------------------------------------------------------------
 -- Command queues
@@ -143,28 +140,24 @@ type Interaction = Interaction' Range
 data Interaction' range
     -- | @cmd_load m argv@ loads the module in file @m@, using
     -- @argv@ as the command-line options.
-  = Cmd_load            FilePath [String]
+  = Cmd_load FilePath [String]
 
-    -- | @cmd_compile b m argv@ compiles the module in file @m@ using
-    -- the backend @b@, using @argv@ as the command-line options.
-  | Cmd_compile         CompilerBackend FilePath [String]
-
-  | Cmd_constraints
+    -- | Show constraints on goals.
+  | Cmd_constraints Rewrite
 
     -- | Show unsolved metas. If there are no unsolved metas but unsolved constraints
     -- show those instead.
   | Cmd_metas Rewrite
 
-    -- | A command that fails if there are any unsolved
+    -- | Load a file and fail if there are any unsolved
     -- meta-variables. By default no output is generated if the
     -- command is successful.
-  | Cmd_no_metas
+    -- (This command was previously used in Agda's installation script (Setup.hs)).
+  | Cmd_load_no_metas FilePath
 
     -- | Shows all the top-level names in the given module, along with
     -- their types. Uses the top-level scope.
-  | Cmd_show_module_contents_toplevel
-                        Rewrite
-                        String
+  | Cmd_show_module_contents_toplevel Rewrite String
 
     -- | Shows all the top-level names in scope which mention all the given
     -- identifiers in their type.
@@ -175,20 +168,38 @@ data Interaction' range
   | Cmd_solveAll Rewrite
   | Cmd_solveOne Rewrite InteractionId range String
 
-    -- | Solve (all goals / the goal at point) by using Auto.
-  | Cmd_autoOne            InteractionId range String
-  | Cmd_autoAll
+    -- | Solve (all goals / the goal at point) by using Mimer proof search.
+  | Cmd_autoOne  Rewrite   InteractionId range String
+  | Cmd_autoAll  Rewrite
 
     -- | Parse the given expression (as if it were defined at the
     -- top-level of the current module) and infer its type.
-  | Cmd_infer_toplevel  Rewrite  -- Normalise the type?
-                        String
-
+  | Cmd_infer_toplevel Rewrite -- Normalise the type?
+                       String
 
     -- | Parse and type check the given expression (as if it were defined
     -- at the top-level of the current module) and normalise it.
-  | Cmd_compute_toplevel ComputeMode
-                         String
+  | Cmd_compute_toplevel ComputeMode String
+
+    ------------------------------------------------------------------------
+    -- Backend commands
+
+    -- | @cmd_compile b m argv@ compiles the module in file @m@ using
+    -- the backend @b@, using @argv@ as the command-line options.
+  | Cmd_compile CompilerBackend FilePath [String]
+
+    -- | Custom top-level command for backends.
+  | Cmd_backend_top
+      CompilerBackend -- ^ which backend
+      String          -- ^ arbitrary user payload
+
+    -- | Custom hole-level command for backends.
+  | Cmd_backend_hole
+      InteractionId   -- ^ the hole's ID
+      range           -- ^ range of the hole
+      String          -- ^ text inside the hole
+      CompilerBackend -- ^ which backend
+      String          -- ^ arbitrary payload
 
     ------------------------------------------------------------------------
     -- Syntax highlighting
@@ -232,7 +243,7 @@ data Interaction' range
     -- Implicit arguments
 
     -- | Tells Agda whether or not to show implicit arguments.
-  | ShowImplicitArgs    Bool -- Show them?
+  | ShowImplicitArgs Bool-- Show them?
 
 
     -- | Toggle display of implicit arguments.
@@ -242,8 +253,7 @@ data Interaction' range
     -- Irrelevant arguments
 
     -- | Tells Agda whether or not to show irrelevant arguments.
-  | ShowIrrelevantArgs    Bool -- Show them?
-
+  | ShowIrrelevantArgs Bool -- Show them?
 
     -- | Toggle display of irrelevant arguments.
   | ToggleIrrelevantArgs
@@ -405,7 +415,7 @@ instance Read a => Read (Range' a) where
 instance Read a => Read (Interval' a) where
     readsPrec = parseToReadsPrec $ do
         exact "Interval"
-        liftM2 Interval readParse readParse
+        liftA3 Interval readParse readParse readParse
 
 instance Read AbsolutePath where
     readsPrec = parseToReadsPrec $ do
@@ -428,7 +438,7 @@ instance Read a => Read (Position' a) where
 ---------------------------------------------------------
 -- | Available backends.
 
-data CompilerBackend = LaTeX | QuickLaTeX | OtherBackend String
+data CompilerBackend = LaTeX | QuickLaTeX | OtherBackend BackendName
     deriving (Eq)
 
 -- TODO 2021-08-25 get rid of custom Show instance
@@ -439,7 +449,7 @@ instance Pretty CompilerBackend where
   pretty = \case
     LaTeX          -> "LaTeX"
     QuickLaTeX     -> "QuickLaTeX"
-    OtherBackend s -> text s
+    OtherBackend s -> pretty s
 
 instance Read CompilerBackend where
   readsPrec _ s = do
@@ -447,14 +457,25 @@ instance Read CompilerBackend where
     let b = case t of
               "LaTeX"      -> LaTeX
               "QuickLaTeX" -> QuickLaTeX
-              _            -> OtherBackend t
+              _            -> OtherBackend $ T.pack t
     return (b, s)
 
 -- | Ordered ascendingly by degree of normalization.
-data Rewrite =  AsIs | Instantiated | HeadNormal | Simplified | Normalised
+data Rewrite = AsIs | Instantiated | HeadNormal | Simplified | Normalised
     deriving (Show, Read, Eq, Ord)
 
-data ComputeMode = DefaultCompute | HeadCompute | IgnoreAbstract | UseShowInstance
+-- | Modifier for the interactive computation command,
+--   specifying the mode of computation and result display.
+--
+data ComputeMode
+  = DefaultCompute
+      -- ^ Fully 'normalise'.
+  | HeadCompute
+      -- ^ 'reduce' to weak head normal form.
+  | IgnoreAbstract
+      -- ^ 'normalise', unfolding even @abstract@ and @NON_TERMINATING@ definitions.
+  | UseShowInstance
+      -- ^ 'normalise' to a string literal and wrap it in a @show@.
   deriving (Show, Read, Eq)
 
 data UseForce
@@ -462,10 +483,10 @@ data UseForce
   | WithoutForce  -- ^ Don't ignore any checks.
   deriving (Eq, Read, Show)
 
-data OutputForm a b = OutputForm Range [ProblemId] Blocker (OutputConstraint a b)
+data OutputForm_boot tcErr a b = OutputForm Range [ProblemId] Blocker (OutputConstraint_boot tcErr a b)
   deriving (Functor)
 
-data OutputConstraint a b
+data OutputConstraint_boot tcErr a b
       = OfType b a | CmpInType Comparison a b b
                    | CmpElim [Polarity] a [b] [b]
       | JustType b | CmpTypes Comparison b b
@@ -476,8 +497,9 @@ data OutputConstraint a b
       | IsEmptyType a
       | SizeLtSat a
       | FindInstanceOF b a [(a,a,a)]
+      | ResolveInstanceOF QName
       | PTSInstance b b
-      | PostponedCheckFunDef QName a TCErr
+      | PostponedCheckFunDef QName a tcErr
       | CheckLock b b
       | DataSort QName b
       | UsableAtMod Modality b

@@ -1,0 +1,2 @@
+Issue2782.agda:33.3-132: error: [SafeFlagPostulate]
+Cannot postulate Iseg with safe flag

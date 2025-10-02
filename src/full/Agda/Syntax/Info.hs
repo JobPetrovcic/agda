@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -Wunused-imports #-}
+{-# OPTIONS_GHC -Wunused-matches #-}
 
 {-| An info object contains additional information about a piece of abstract
     syntax that isn't part of the actual syntax. For instance, it might contain
@@ -11,8 +13,6 @@ import Prelude hiding (null)
 
 import Control.DeepSeq
 
-import Data.Semigroup (Semigroup)
-
 import GHC.Generics (Generic)
 
 import qualified Agda.Syntax.Concrete.Name as C
@@ -20,7 +20,7 @@ import Agda.Syntax.Common
 import Agda.Syntax.Position
 import Agda.Syntax.Concrete
 import Agda.Syntax.Fixity
-import Agda.Syntax.Scope.Base (ScopeInfo, emptyScopeInfo)
+import Agda.Syntax.Scope.Base (ScopeInfo)
 
 import Agda.Utils.Functor
 import Agda.Utils.Null
@@ -29,21 +29,51 @@ import Agda.Utils.Null
     Meta information
  --------------------------------------------------------------------------}
 
+-- | Kind of a meta: the method how to solve it.
+--
+data MetaKind
+  = InstanceMeta     -- ^ Meta variable solved by instance search.
+  | UnificationMeta  -- ^ Meta variable solved by unification (default).
+  deriving (Show, Eq, Generic)
+
+instance Null MetaKind where
+  empty = UnificationMeta
+
+instance NFData MetaKind
+
+-- | Default meta kind from its 'Hiding' context.
+--
+hidingToMetaKind :: Hiding -> MetaKind
+hidingToMetaKind = \case
+  Instance{} -> InstanceMeta
+  Hidden     -> UnificationMeta
+  NotHidden  -> UnificationMeta
+
+-- | Name suggestion for meta variable.  Empty string means no suggestion.
+type MetaNameSuggestion = String
+
+-- | Information associated to a meta variable in the abstract syntax.
+--
 data MetaInfo = MetaInfo
   { metaRange          :: Range
   , metaScope          :: ScopeInfo
   , metaNumber         :: Maybe MetaId
-  , metaNameSuggestion :: String
+  , metaNameSuggestion :: MetaNameSuggestion
+  , metaKind           :: MetaKind
   }
   deriving (Show, Eq, Generic)
 
 emptyMetaInfo :: MetaInfo
 emptyMetaInfo = MetaInfo
   { metaRange          = noRange
-  , metaScope          = emptyScopeInfo
+  , metaScope          = empty
   , metaNumber         = Nothing
   , metaNameSuggestion = ""
+  , metaKind           = empty
   }
+
+instance Null MetaInfo where
+  empty = emptyMetaInfo
 
 instance HasRange MetaInfo where
   getRange = metaRange
@@ -51,7 +81,8 @@ instance HasRange MetaInfo where
 instance KillRange MetaInfo where
   killRange m = m { metaRange = noRange }
 
-instance NFData MetaInfo
+instance NFData MetaInfo where
+  rnf (MetaInfo _ a b c d) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d
 
 {--------------------------------------------------------------------------
     General expression information
@@ -67,7 +98,7 @@ instance HasRange ExprInfo where
   getRange (ExprRange r) = r
 
 instance KillRange ExprInfo where
-  killRange (ExprRange r) = exprNoRange
+  killRange (ExprRange _) = exprNoRange
 
 {--------------------------------------------------------------------------
     Application information
@@ -88,6 +119,9 @@ defaultAppInfo r = AppInfo{ appRange = r, appOrigin = Inserted, appParens = Pref
 -- | `AppInfo` with no range information.
 defaultAppInfo_ :: AppInfo
 defaultAppInfo_ = defaultAppInfo noRange
+
+instance Null AppInfo where
+  empty = defaultAppInfo_
 
 instance HasRange AppInfo where
   getRange = appRange
@@ -140,7 +174,7 @@ instance HasRange LetInfo where
   getRange (LetRange r)   = r
 
 instance KillRange LetInfo where
-  killRange (LetRange r) = LetRange noRange
+  killRange (LetRange _) = LetRange noRange
 
 {--------------------------------------------------------------------------
     Definition information (declarations that actually define something)
@@ -154,7 +188,7 @@ data DefInfo' t = DefInfo
   , defInstance :: IsInstance
   , defMacro    :: IsMacro
   , defInfo     :: DeclInfo
-  , defTactic   :: Maybe (Ranged t)
+  , defTactic   :: TacticAttribute' t
   }
   deriving (Show, Eq, Generic)
 
@@ -163,7 +197,7 @@ mkDefInfo x f a ab r = mkDefInfoInstance x f a ab NotInstanceDef NotMacroDef r
 
 -- | Same as @mkDefInfo@ but where we can also give the @IsInstance@
 mkDefInfoInstance :: Name -> Fixity' -> Access -> IsAbstract -> IsInstance -> IsMacro -> Range -> DefInfo' t
-mkDefInfoInstance x f a ab i m r = DefInfo f a ab TransparentDef i m (DeclInfo x r) Nothing
+mkDefInfoInstance x f a ab i m r = DefInfo f a ab TransparentDef i m (DeclInfo x r) empty
 
 instance HasRange (DefInfo' t) where
   getRange = getRange . defInfo
@@ -247,7 +281,7 @@ instance HasRange LHSInfo where
   getRange (LHSInfo r _) = r
 
 instance KillRange LHSInfo where
-  killRange (LHSInfo r ell) = LHSInfo noRange ell
+  killRange (LHSInfo _ ell) = LHSInfo noRange ell
 
 instance Null LHSInfo where
   null i = null (lhsRange i) && null (lhsEllipsis i)
@@ -286,7 +320,7 @@ instance KillRange ConPatInfo where
   killRange (ConPatInfo b i l) = ConPatInfo b (killRange i) l
 
 instance SetRange ConPatInfo where
-  setRange r (ConPatInfo b i l) = ConPatInfo b (PatRange r) l
+  setRange r (ConPatInfo b _ l) = ConPatInfo b (PatRange r) l
 
 instance NFData ConPatInfo
 

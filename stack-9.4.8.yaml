@@ -5,10 +5,14 @@ compiler-check: match-exact
 # Local packages specified by relative directory name.
 packages:
 - '.'
-- 'src/size-solver'
 
 flags:
   mintty:
     win32-2-13-1: false
   ansi-terminal:
     win32-2-13-1: false
+
+extra-deps:
+- infinite-list-0.1.2
+- pqueue-1.5.0.0
+- vector-hashtables-0.1.2.1

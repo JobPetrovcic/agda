@@ -15,14 +15,18 @@ data ℕ : Set where
   zero : ℕ
   suc  : ℕ → ℕ
 
+{-# CATCHALL #-}  -- InvalidCatchallPragma, ignored
 _+_ : ℕ → ℕ → ℕ
 zero    + n    = zero
 (suc m) + n    = suc (m + n)
+{-# CATCHALL #-}  -- InvalidCatchallPragma, ignored
 
 eq : ℕ → ℕ → Bool
 eq zero    zero    = true
+{-# CATCHALL #-}  -- UselessPragma
 eq (suc m) (suc n) = eq m n
 {-# CATCHALL #-}
+{-# CATCHALL #-}  -- InvalidCatchallPragma, ignored
 eq _       _       = false
 
 -- See also fail/ExactSplitMin.agda

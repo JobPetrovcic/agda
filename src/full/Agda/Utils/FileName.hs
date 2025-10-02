@@ -11,10 +11,9 @@ module Agda.Utils.FileName
   , doesFileExistCaseSensitive
   , isNewerThan
   , relativizeAbsolutePath
+  , makeRelativeCanonical
+  , stripAnyOfExtensions
   ) where
-
-import System.Directory
-import System.FilePath
 
 import Control.Applicative ( liftA2 )
 import Control.DeepSeq
@@ -25,8 +24,12 @@ import System.Win32        ( findFirstFile, findClose, getFindDataFileName )
 
 import Data.Function (on)
 import Data.Hashable       ( Hashable )
+import Data.Maybe          ( catMaybes, listToMaybe )
 import Data.Text           ( Text )
 import qualified Data.Text as Text
+
+import System.Directory
+import System.FilePath
 
 import Agda.Utils.Monad
 
@@ -126,7 +129,7 @@ isNewerThan new old = do
 --   returning 'Nothing' if the given path cannot be relativized to the given @root@.
 relativizeAbsolutePath ::
      AbsolutePath
-       -- ^ The absolute path we see to relativize.
+       -- ^ The absolute path we seek to relativize.
   -> AbsolutePath
        -- ^ The root for relativization.
   -> Maybe FilePath
@@ -146,3 +149,21 @@ relativizeAbsolutePath apath aroot
     -- In our case, the @root@ is absolute, so we should expect @rest@ to
     -- always be different from @path@ if @path@ is relative to @root@.
     -- In the extreme case, @root = "/"@ and @path == "/" ++ rest@.
+
+-- -- Andreas, 2024-11-10, extracted from 'stripPrimitiveLibDir':
+-- -- This is a simple implementation of 'relativizeAbsolutePath' using 'splitDirectories'.
+-- stripDir :: AbsolutePath -> AbsolutePath -> Maybe FilePath
+-- stripDir dir file =
+--   joinPath <$> List.stripPrefix (split dir) (split file)
+--   where
+--     split = splitDirectories . filePath
+
+-- | Makes a path relative to a root without assuming that either path is
+-- canonical.
+
+makeRelativeCanonical :: FilePath -> FilePath -> IO FilePath
+makeRelativeCanonical = liftA2 makeRelative `on` canonicalizePath
+
+-- | Generalizes 'stripExtension'.
+stripAnyOfExtensions :: [String] -> FilePath -> Maybe FilePath
+stripAnyOfExtensions exts p = listToMaybe $ catMaybes $ map (`stripExtension` p) exts
