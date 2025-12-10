@@ -943,6 +943,10 @@ library
   other-modules:
       Paths_Agda
       -- Need not export submodules if parent module reexports them.
+      Agda.Interaction.Highlighting.Sexp
+      Agda.Interaction.Highlighting.Sexp.Backend
+      Agda.Interaction.Highlighting.Sexp.Base
+      Agda.Interaction.Highlighting.Sexp.Sexp
       Agda.Interaction.Options.Base
       Agda.Interaction.Options.HasOptions
       Agda.Interaction.Options.Types
