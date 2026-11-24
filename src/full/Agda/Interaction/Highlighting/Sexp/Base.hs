@@ -56,7 +56,7 @@ import Agda.Syntax.Abstract.Name
     Suffix(..)
   )
 
-import Agda.TypeChecking.Monad as TCM
+import Agda.TypeChecking.Monad as TCM hiding (SourceFile(..))
 
 import Agda.Utils.Function
 import qualified Agda.Utils.IO.UTF8 as UTF8
@@ -73,6 +73,7 @@ dumpFileExt ft =
     TexFileType  -> "tex-sexp"
     OrgFileType  -> "org-sexp"
     TypstFileType  -> "typst-sexp"
+    TreeFileType   -> "tree-sexp"
 
 -- | Options for AST dump
 
@@ -260,7 +261,7 @@ instance Sexpable TCM.BuiltinSort where
 instance Sexpable TCM.Defn where
     toSexp (TCM.Axiom {}) = constr "axiom" []
     toSexp (TCM.DataOrRecSig {}) = constr "data-or-record" []
-    toSexp (TCM.GeneralizableVar) = constr "generalizable-var" []
+    toSexp (TCM.GeneralizableVar {}) = constr "generalizable-var" []
     toSexp (TCM.AbstractDefn d) = constr "abstract" [toSexp d]
     toSexp (TCM.Function {funClauses=cls}) = constr "function" (map toSexp cls)
     toSexp (TCM.Datatype {dataCons=cns, dataSort=srt}) = constr "data" (toSexp srt : map toSexp cns)
@@ -305,4 +306,4 @@ instance Sexpable AI.Telescope where
               telescopeToList (AI.ExtendTel t (NoAbs n tel)) = (constr "anonymous" [toSexp n, toSexp t]) : telescopeToList tel
 
 instance Sexpable TopLevelModuleName where
-    toSexp (TopLevelModuleName _ _ ps) = constr "module-name" [toSexp $ T.intercalate (T.singleton '.') $ map T.fromStrict $ toList ps]
+    toSexp (TopLevelModuleName _ _ ps _) = constr "module-name" [toSexp $ T.intercalate (T.singleton '.') $ map T.fromStrict $ toList ps]
